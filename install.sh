@@ -82,15 +82,30 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
+      dashboard-api: { condition: service_started }
     environment:
       - DATABASE_URL=postgres://coderaft:${POSTGRES_PASSWORD}@postgres:5432/coderaft
       - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
       - DASHBOARD_SECRET=${DASHBOARD_SECRET}
       - LICENSE_SERVER_URL=https://license.coderaft.io
-      - DOCKER_HOST=unix:///var/run/docker.sock
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+
+  dashboard-api:
+    image: ghcr.io/liamj74/coderaft-dashboard-api:latest
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    environment:
+      - LICENSE_SERVER_URL=https://license.coderaft.io
+      - DATABASE_URL=postgres://coderaft:${POSTGRES_PASSWORD}@postgres:5432/coderaft
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - COMPOSE_BASE=/compose/docker-compose.yml
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/run/docker.sock:/var/run/docker.sock
       - dashboard_data:/data
+      - ./docker-compose.yml:/compose/docker-compose.yml:ro
+      - ./.env:/compose/.env:ro
     security_opt: [no-new-privileges:true]
     restart: unless-stopped
 
