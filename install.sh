@@ -100,12 +100,11 @@ services:
       - LICENSE_SERVER_URL=https://license.coderaft.io
       - DATABASE_URL=postgres://coderaft:${POSTGRES_PASSWORD}@postgres:5432/coderaft
       - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
-      - COMPOSE_BASE=/compose/docker-compose.yml
+      - HOST_COMPOSE_DIR=/host-compose
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - dashboard_data:/data
-      - ./docker-compose.yml:/compose/docker-compose.yml:ro
-      - ./.env:/compose/.env:ro
+      - .:/host-compose
     security_opt: [no-new-privileges:true]
     restart: unless-stopped
 
