@@ -1,0 +1,11 @@
+name = "coderaft-installer"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+[triggers]
+crons = []
+
+[env.production]
+routes = [
+  { pattern = "install.coderaft.io/*", zone_name = "coderaft.io" }
+]
