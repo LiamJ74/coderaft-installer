@@ -49,7 +49,11 @@ cd "${INSTALL_DIR}"
 # Generate secrets on first install
 gen_hex() { openssl rand -hex "$1" 2>/dev/null || head -c "$1" /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 
+ABSOLUTE_INSTALL_DIR="$(pwd)"
+
 if [ -f ".env" ] && grep -q '^POSTGRES_PASSWORD=' .env 2>/dev/null; then
+    # Update HOST_PROJECT_DIR in case install location changed
+    grep -q '^HOST_PROJECT_DIR=' .env 2>/dev/null || echo "HOST_PROJECT_DIR=${ABSOLUTE_INSTALL_DIR}" >> .env
     echo "  ✓ Existing config preserved"
 else
     echo "  Generating secrets..."
@@ -58,6 +62,7 @@ else
 POSTGRES_PASSWORD=$(gen_hex 24)
 REDIS_PASSWORD=$(gen_hex 24)
 DASHBOARD_SECRET=$(gen_hex 32)
+HOST_PROJECT_DIR=${ABSOLUTE_INSTALL_DIR}
 ENVFILE
     chmod 600 .env
     echo "  ✓ Secrets generated"
@@ -100,7 +105,9 @@ services:
       - LICENSE_SERVER_URL=https://license.coderaft.io
       - DATABASE_URL=postgres://coderaft:${POSTGRES_PASSWORD}@postgres:5432/coderaft
       - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
-      - HOST_COMPOSE_DIR=/host-compose
+      - CONTAINER_COMPOSE_DIR=/host-compose
+      - HOST_PROJECT_DIR=${HOST_PROJECT_DIR}
+      - COMPOSE_PROJECT_NAME=coderaft
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - dashboard_data:/data
