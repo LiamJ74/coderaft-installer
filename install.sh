@@ -133,20 +133,28 @@ volumes:
 COMPOSE
 
 # Helper scripts
-for script in start stop update; do
-    case $script in
-        start) CMD='docker compose up -d'; MSG="Dashboard: http://localhost:3000" ;;
-        stop)  CMD='docker compose down'; MSG="Done." ;;
-        update) CMD='docker compose pull && docker compose up -d --remove-orphans'; MSG="Updated!" ;;
-    esac
-    cat > "${script}.sh" << SCRIPT
+cat > start.sh << 'EOF'
 #!/bin/bash
-echo "${script^}ing CodeRaft..."
-${CMD}
-echo "  ${MSG}"
-SCRIPT
-    chmod +x "${script}.sh"
-done
+echo "Starting CodeRaft..."
+docker compose up -d
+echo "  Dashboard: http://localhost:3000"
+EOF
+
+cat > stop.sh << 'EOF'
+#!/bin/bash
+echo "Stopping CodeRaft..."
+docker compose down
+echo "  Done."
+EOF
+
+cat > update.sh << 'EOF'
+#!/bin/bash
+echo "Updating CodeRaft..."
+docker compose pull && docker compose up -d --remove-orphans
+echo "  Updated!"
+EOF
+
+chmod +x start.sh stop.sh update.sh
 
 # ── Pull & Start ─────────────────────────────────────────────────────────────
 
