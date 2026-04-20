@@ -137,15 +137,12 @@ services:
 
   redis:
     image: redis:7-alpine
-    command: redis-server --requirepass ${REDIS_PASSWORD} --maxmemory 128mb --appendonly yes
+    command: redis-server --requirepass ${REDIS_PASSWORD} --maxmemory 128mb
     healthcheck:
       test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
       interval: 5s
       timeout: 5s
       retries: 5
-    security_opt: [no-new-privileges:true]
-    cap_drop: [ALL]
-    cap_add: [SETGID, SETUID]
     restart: unless-stopped
 
 volumes:
