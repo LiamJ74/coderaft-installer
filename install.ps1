@@ -50,7 +50,12 @@ function New-HexSecret($length) {
     return ($bytes | ForEach-Object { '{0:x2}' -f $_ }) -join ''
 }
 
+$AbsoluteInstallDir = (Get-Location).Path
+
 if ((Test-Path '.env') -and (Select-String -Path '.env' -Pattern '^POSTGRES_PASSWORD=' -Quiet)) {
+    if (-not (Select-String -Path '.env' -Pattern '^HOST_PROJECT_DIR=' -Quiet)) {
+        Add-Content -Path '.env' -Value "HOST_PROJECT_DIR=$AbsoluteInstallDir"
+    }
     Write-Host "  ✓ Existing config preserved" -ForegroundColor Green
 } else {
     Write-Host "  Generating secrets..."
@@ -59,6 +64,7 @@ if ((Test-Path '.env') -and (Select-String -Path '.env' -Pattern '^POSTGRES_PASS
 POSTGRES_PASSWORD=$(New-HexSecret 24)
 REDIS_PASSWORD=$(New-HexSecret 24)
 DASHBOARD_SECRET=$(New-HexSecret 32)
+HOST_PROJECT_DIR=$AbsoluteInstallDir
 "@
     Set-Content -Path '.env' -Value $Env -Encoding UTF8
     Write-Host "  ✓ Secrets generated" -ForegroundColor Green
@@ -81,15 +87,31 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
+      dashboard-api: { condition: service_started }
     environment:
       - DATABASE_URL=postgres://coderaft:${POSTGRES_PASSWORD}@postgres:5432/coderaft
       - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
       - DASHBOARD_SECRET=${DASHBOARD_SECRET}
       - LICENSE_SERVER_URL=https://license.coderaft.io
-      - DOCKER_HOST=unix:///var/run/docker.sock
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+
+  dashboard-api:
+    image: ghcr.io/liamj74/coderaft-dashboard-api:latest
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    environment:
+      - LICENSE_SERVER_URL=https://license.coderaft.io
+      - DATABASE_URL=postgres://coderaft:${POSTGRES_PASSWORD}@postgres:5432/coderaft
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - CONTAINER_COMPOSE_DIR=/host-compose
+      - HOST_PROJECT_DIR=${HOST_PROJECT_DIR}
+      - COMPOSE_PROJECT_NAME=coderaft
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/run/docker.sock:/var/run/docker.sock
       - dashboard_data:/data
+      - .:/host-compose
     security_opt: [no-new-privileges:true]
     restart: unless-stopped
 
@@ -109,6 +131,8 @@ services:
       timeout: 5s
       retries: 5
     security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     restart: unless-stopped
 
   redis:
@@ -120,6 +144,8 @@ services:
       timeout: 5s
       retries: 5
     security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [SETGID, SETUID]
     restart: unless-stopped
 
 volumes:
