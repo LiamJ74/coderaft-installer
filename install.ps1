@@ -53,8 +53,16 @@ function New-HexSecret($length) {
 $AbsoluteInstallDir = (Get-Location).Path
 
 if ((Test-Path '.env') -and (Select-String -Path '.env' -Pattern '^POSTGRES_PASSWORD=' -Quiet)) {
+    # Fix UTF-8 BOM if present (older installers wrote BOM which breaks Docker Compose)
+    $envBytes = [System.IO.File]::ReadAllBytes("$(Get-Location)\.env")
+    if ($envBytes.Length -ge 3 -and $envBytes[0] -eq 0xEF -and $envBytes[1] -eq 0xBB -and $envBytes[2] -eq 0xBF) {
+        Write-Host "  ⚠ Fixing UTF-8 BOM in .env..." -ForegroundColor Yellow
+        $envContent = [System.Text.Encoding]::UTF8.GetString($envBytes, 3, $envBytes.Length - 3)
+        [System.IO.File]::WriteAllText("$(Get-Location)\.env", $envContent, [System.Text.UTF8Encoding]::new($false))
+    }
     if (-not (Select-String -Path '.env' -Pattern '^HOST_PROJECT_DIR=' -Quiet)) {
-        Add-Content -Path '.env' -Value "HOST_PROJECT_DIR=$AbsoluteInstallDir"
+        $line = "`nHOST_PROJECT_DIR=$AbsoluteInstallDir"
+        [System.IO.File]::AppendAllText("$(Get-Location)\.env", $line, [System.Text.UTF8Encoding]::new($false))
     }
     Write-Host "  ✓ Existing config preserved" -ForegroundColor Green
 } else {
