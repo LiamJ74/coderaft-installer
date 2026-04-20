@@ -114,6 +114,7 @@ services:
       - LICENSE_SERVER_URL=https://license.coderaft.io
       - DATABASE_URL=postgres://coderaft:${POSTGRES_PASSWORD}@postgres:5432/coderaft
       - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - DASHBOARD_SECRET=${DASHBOARD_SECRET}
       - CONTAINER_COMPOSE_DIR=/host-compose
       - HOST_PROJECT_DIR=${HOST_PROJECT_DIR}
       - COMPOSE_PROJECT_NAME=coderaft
