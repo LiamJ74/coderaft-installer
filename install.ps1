@@ -66,12 +66,13 @@ REDIS_PASSWORD=$(New-HexSecret 24)
 DASHBOARD_SECRET=$(New-HexSecret 32)
 HOST_PROJECT_DIR=$AbsoluteInstallDir
 "@
-    Set-Content -Path '.env' -Value $Env -Encoding UTF8
+    # Write without BOM — Docker Compose .env parser chokes on UTF-8 BOM
+    [System.IO.File]::WriteAllText("$(Get-Location)\.env", $Env, [System.Text.UTF8Encoding]::new($false))
     Write-Host "  ✓ Secrets generated" -ForegroundColor Green
 }
 
 # Init DB
-Set-Content -Path 'init-db.sql' -Value '-- Product databases are created by the dashboard on demand' -Encoding UTF8
+[System.IO.File]::WriteAllText("$(Get-Location)\init-db.sql", '-- Product databases are created by the dashboard on demand', [System.Text.UTF8Encoding]::new($false))
 
 # Docker compose
 Write-Host "  Writing docker-compose.yml..."
@@ -152,7 +153,7 @@ volumes:
   postgres_data:
   dashboard_data:
 '@
-Set-Content -Path 'docker-compose.yml' -Value $Compose -Encoding UTF8
+[System.IO.File]::WriteAllText("$(Get-Location)\docker-compose.yml", $Compose, [System.Text.UTF8Encoding]::new($false))
 
 # Helper scripts
 Set-Content -Path 'start.ps1' -Value @'
