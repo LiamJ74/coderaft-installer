@@ -166,7 +166,7 @@ docker compose down
 echo "  Done."
 EOF
 
-cat > update.sh << 'EOF'
+curl -fsSL "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/update.sh" -o update.sh 2>/dev/null || cat > update.sh << 'EOF'
 #!/bin/bash
 echo "Updating CodeRaft..."
 docker compose pull && docker compose up -d --force-recreate --remove-orphans
