@@ -178,7 +178,7 @@ Write-Host "Done."
 Set-Content -Path 'update.ps1' -Value @'
 Write-Host "Updating CodeRaft..."
 docker compose pull
-docker compose up -d --remove-orphans
+docker compose up -d --force-recreate --remove-orphans
 Write-Host "  Updated! Dashboard: http://localhost:3000"
 '@ -Encoding UTF8
 

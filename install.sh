@@ -169,8 +169,8 @@ EOF
 cat > update.sh << 'EOF'
 #!/bin/bash
 echo "Updating CodeRaft..."
-docker compose pull && docker compose up -d --remove-orphans
-echo "  Updated!"
+docker compose pull && docker compose up -d --force-recreate --remove-orphans
+echo "  Updated! Dashboard: http://localhost:3000"
 EOF
 
 chmod +x start.sh stop.sh update.sh
