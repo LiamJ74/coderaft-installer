@@ -11,6 +11,8 @@ export default {
       const scripts = {
         '/install': 'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/install.sh',
         '/win':     'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/install.ps1',
+        '/update':     'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/update.sh',
+        '/update.ps1': 'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/update.ps1',
       };
 
       const isBrowser = request.headers.get('accept')?.includes('text/html');
@@ -28,6 +30,13 @@ export default {
 <p>Windows:</p>
 <pre>irm https://install.coderaft.io/win | iex</pre>
 
+<h2>Update</h2>
+<p>Linux/macOS:</p>
+<pre>curl -fsSL https://install.coderaft.io/update | bash</pre>
+
+<p>Windows:</p>
+<pre>irm https://install.coderaft.io/update.ps1 | iex</pre>
+
 </body></html>`, {
           headers: { 'content-type': 'text/html; charset=utf-8' }
         });
@@ -42,13 +51,13 @@ export default {
 
       if (!target) {
         return new Response(
-`CodeRaft Installer
+`CodeRaft Platform
 
-Linux/macOS:
-  curl -fsSL https://install.coderaft.io/install | bash
+Install (Linux/macOS):  curl -fsSL https://install.coderaft.io | bash
+Install (Windows):      irm https://install.coderaft.io/win | iex
 
-Windows:
-  irm https://install.coderaft.io/win | iex
+Update (Linux/macOS):   curl -fsSL https://install.coderaft.io/update | bash
+Update (Windows):       irm https://install.coderaft.io/update.ps1 | iex
 `,
           {
             status: 200,
