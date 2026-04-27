@@ -202,5 +202,5 @@ echo ""
 echo "  Commands:  ./start.sh  ./stop.sh  ./update.sh"
 echo ""
 
-command -v open &>/dev/null && open http://localhost:3000
-command -v xdg-open &>/dev/null && xdg-open http://localhost:3000
+command -v open &>/dev/null && open http://localhost:3000 2>/dev/null || true
+command -v xdg-open &>/dev/null && xdg-open http://localhost:3000 2>/dev/null || true
