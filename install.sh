@@ -173,7 +173,14 @@ docker compose pull && docker compose up -d --force-recreate --remove-orphans
 echo "  Updated! Dashboard: http://localhost:3000"
 EOF
 
-chmod +x start.sh stop.sh update.sh
+curl -fsSL "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/rollback.sh" -o rollback.sh 2>/dev/null || cat > rollback.sh << 'EOF'
+#!/bin/bash
+echo "rollback.sh placeholder — fetch the real one from https://install.coderaft.io/rollback"
+echo "or run: curl -fsSL https://install.coderaft.io/rollback -o rollback.sh && chmod +x rollback.sh"
+exit 1
+EOF
+
+chmod +x start.sh stop.sh update.sh rollback.sh
 
 # ── Pull & Start ─────────────────────────────────────────────────────────────
 
@@ -199,7 +206,7 @@ echo "  ║   Open the dashboard to activate your license        ║"
 echo "  ║   and deploy your products.                          ║"
 echo "  ╚══════════════════════════════════════════════════════╝"
 echo ""
-echo "  Commands:  ./start.sh  ./stop.sh  ./update.sh"
+echo "  Commands:  ./start.sh  ./stop.sh  ./update.sh  ./rollback.sh"
 echo ""
 
 command -v open &>/dev/null && open http://localhost:3000 2>/dev/null || true

@@ -175,26 +175,28 @@ docker compose down
 Write-Host "Done."
 '@ -Encoding UTF8
 
-Set-Content -Path 'update.ps1' -Value @'
-Write-Host "  Updating CodeRaft..."
-
-# Self-update: download latest update script
-Write-Host "  Checking for script updates..."
 try {
-    $latest = Invoke-WebRequest -Uri "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/update.ps1" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
-    if ($latest.StatusCode -eq 200 -and $latest.Content.Length -gt 50) {
-        [System.IO.File]::WriteAllText("$PWD\update.ps1", $latest.Content, [System.Text.Encoding]::UTF8)
-        Write-Host "  Update script refreshed"
-    }
+    $u = Invoke-WebRequest -Uri "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/update.ps1" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+    [System.IO.File]::WriteAllText("$PWD\update.ps1", $u.Content, [System.Text.Encoding]::UTF8)
 } catch {
-    # Offline or not available — continue with current version
-}
-
-# Pull latest images and recreate containers
+    Set-Content -Path 'update.ps1' -Value @'
+Write-Host "Updating CodeRaft..."
 docker compose pull
 docker compose up -d --force-recreate --remove-orphans
 Write-Host "  Updated! Dashboard: http://localhost:3000"
 '@ -Encoding UTF8
+}
+
+try {
+    $r = Invoke-WebRequest -Uri "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/rollback.ps1" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+    [System.IO.File]::WriteAllText("$PWD\rollback.ps1", $r.Content, [System.Text.Encoding]::UTF8)
+} catch {
+    Set-Content -Path 'rollback.ps1' -Value @'
+Write-Host "rollback.ps1 placeholder — fetch the real one from https://install.coderaft.io/rollback.ps1"
+Write-Host "or run: irm https://install.coderaft.io/rollback.ps1 -OutFile rollback.ps1"
+exit 1
+'@ -Encoding UTF8
+}
 
 # ── Pull & Start ─────────────────────────────────────────────────────────────
 
@@ -220,7 +222,7 @@ Write-Host "  ║   Open the dashboard to activate your license        ║" -For
 Write-Host "  ║   and deploy your products.                          ║" -ForegroundColor Green
 Write-Host "  ╚══════════════════════════════════════════════════════╝" -ForegroundColor Green
 Write-Host ""
-Write-Host "  Commands:  .\start.ps1  .\stop.ps1  .\update.ps1"
+Write-Host "  Commands:  .\start.ps1  .\stop.ps1  .\update.ps1  .\rollback.ps1"
 Write-Host ""
 
 Start-Process "http://localhost:3000"
