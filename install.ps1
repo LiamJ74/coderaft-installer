@@ -134,12 +134,12 @@ services:
       POSTGRES_INITDB_ARGS: "--data-checksums"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      # Long-form bind — short syntax breaks on Windows hosts where the
-      # interpolated absolute path contains a drive-letter colon.
-      - type: bind
-        source: ./init-db.sql
-        target: /docker-entrypoint-initdb.d/10-init.sql
-        read_only: true
+      # init-db.sql is intentionally NOT bind-mounted — when the
+      # dashboard-api spawns docker-compose from inside a Linux container
+      # against a Windows host, the resolved Windows path contains a
+      # drive-letter colon that the daemon rejects ("too many colons").
+      # The script was a no-op anyway (just a comment); product databases
+      # are created on demand by the dashboard.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U coderaft"]
       interval: 5s
