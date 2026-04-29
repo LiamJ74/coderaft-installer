@@ -43,7 +43,18 @@ else
 fi
 
 # ── Pull and recreate ──────────────────────────────────────────────────────
-docker compose pull && docker compose up -d --force-recreate --remove-orphans
+# Include docker-compose.override.yml when it exists so product containers
+# (entraguard-*, neo4j, ravenscan, redfox-*) are within scope. Without it,
+# --remove-orphans treats every product as an orphan and silently nukes
+# them, which is exactly what broke scans for users who had previously
+# activated a Suite license.
+COMPOSE_ARGS=()
+if [ -f "./docker-compose.override.yml" ]; then
+    COMPOSE_ARGS=(-f ./docker-compose.yml -f ./docker-compose.override.yml)
+fi
+
+docker compose "${COMPOSE_ARGS[@]}" pull \
+    && docker compose "${COMPOSE_ARGS[@]}" up -d --force-recreate --remove-orphans
 echo ""
 echo "  Updated! Dashboard: http://localhost:3000"
 echo "  If something is broken: ./rollback.sh (or curl -fsSL https://install.coderaft.io/rollback | bash)"

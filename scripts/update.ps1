@@ -45,8 +45,18 @@ if ($ADMIN_TOKEN) {
 }
 
 # ── Pull and recreate ──────────────────────────────────────────────────────
-docker compose pull
-docker compose up -d --force-recreate --remove-orphans
+# Include docker-compose.override.yml when it exists so product containers
+# (entraguard-*, neo4j, ravenscan, redfox-*) are within scope. Without it,
+# `--remove-orphans` treats every product as an orphan and silently nukes
+# them, which is exactly what broke scans for users who had previously
+# activated a Suite license.
+$ComposeArgs = @("compose")
+if (Test-Path ".\docker-compose.override.yml") {
+    $ComposeArgs += @("-f", ".\docker-compose.yml", "-f", ".\docker-compose.override.yml")
+}
+
+& docker @ComposeArgs pull
+& docker @ComposeArgs up -d --force-recreate --remove-orphans
 Write-Host ""
 Write-Host "  Updated! Dashboard: http://localhost:3000"
 Write-Host "  If something is broken: irm https://install.coderaft.io/rollback.ps1 | iex"
