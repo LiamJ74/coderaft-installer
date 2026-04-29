@@ -125,7 +125,12 @@ services:
       POSTGRES_INITDB_ARGS: "--data-checksums"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./init-db.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+      # Long-form bind — short syntax breaks on Windows hosts where the
+      # interpolated absolute path contains a drive-letter colon.
+      - type: bind
+        source: ./init-db.sql
+        target: /docker-entrypoint-initdb.d/10-init.sql
+        read_only: true
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U coderaft"]
       interval: 5s
