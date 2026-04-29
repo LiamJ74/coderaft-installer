@@ -10,18 +10,33 @@ $ADMIN_TOKEN   = if ($env:ADMIN_TOKEN)   { $env:ADMIN_TOKEN }   else { "" }
 
 Write-Host "  Updating CodeRaft..."
 
-# ── Self-update update.ps1 + rollback.ps1 ──────────────────────────────────
-Write-Host "  Checking for script updates..."
-foreach ($name in @("update.ps1", "rollback.ps1")) {
-    try {
-        $url = "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/$name"
-        $latest = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
-        if ($latest.StatusCode -eq 200 -and $latest.Content.Length -gt 50) {
-            [System.IO.File]::WriteAllText("$PWD\$name", $latest.Content, [System.Text.Encoding]::UTF8)
-            Write-Host "  $name refreshed"
+# ── Self-update update.ps1 + rollback.ps1 (with re-exec) ───────────────────
+# The in-memory script keeps running with its OLD logic after we overwrite
+# the file on disk. Without re-exec, the freshly downloaded fixes (e.g.
+# "include override in compose up") would only take effect on the NEXT
+# run. We solve it by re-launching the now-fresh script and exiting the
+# stale one. CODERAFT_UPDATE_REEXEC guards against infinite loops.
+if (-not $env:CODERAFT_UPDATE_REEXEC) {
+    Write-Host "  Checking for script updates..."
+    $refreshed = $false
+    foreach ($name in @("update.ps1", "rollback.ps1")) {
+        try {
+            $url = "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/$name"
+            $latest = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+            if ($latest.StatusCode -eq 200 -and $latest.Content.Length -gt 50) {
+                [System.IO.File]::WriteAllText("$PWD\$name", $latest.Content, [System.Text.Encoding]::UTF8)
+                Write-Host "  $name refreshed"
+                if ($name -eq "update.ps1") { $refreshed = $true }
+            }
+        } catch {
+            # Offline or upstream missing — keep the local copy
         }
-    } catch {
-        # Offline or upstream missing — keep the local copy
+    }
+    if ($refreshed -and (Test-Path ".\update.ps1")) {
+        Write-Host "  Re-executing the refreshed update script..."
+        $env:CODERAFT_UPDATE_REEXEC = "1"
+        & powershell -NoProfile -ExecutionPolicy Bypass -File ".\update.ps1"
+        exit $LASTEXITCODE
     }
 }
 

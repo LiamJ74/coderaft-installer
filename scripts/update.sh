@@ -12,20 +12,33 @@ ADMIN_TOKEN="${ADMIN_TOKEN:-}"
 
 echo "  Updating CodeRaft..."
 
-# ── Self-update both update.sh and rollback.sh ─────────────────────────────
-echo "  Checking for script updates..."
-for name in update.sh rollback.sh; do
-    LATEST=$(curl -fsSL "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/$name" 2>/dev/null)
-    if [ -n "$LATEST" ] && [ ${#LATEST} -gt 50 ]; then
-        echo "$LATEST" > "$name.tmp"
-        if ! cmp -s "$name" "$name.tmp" 2>/dev/null; then
-            mv "$name.tmp" "$name" && chmod +x "$name"
-            echo "  $name refreshed"
-        else
-            rm -f "$name.tmp"
+# ── Self-update both update.sh and rollback.sh (with re-exec) ──────────────
+# The running shell loaded the OLD script into memory before we overwrote
+# the file on disk. Without re-exec, freshly downloaded fixes wouldn't
+# take effect until the NEXT run. CODERAFT_UPDATE_REEXEC guards against
+# infinite loops.
+if [ -z "$CODERAFT_UPDATE_REEXEC" ]; then
+    echo "  Checking for script updates..."
+    REFRESHED=0
+    for name in update.sh rollback.sh; do
+        LATEST=$(curl -fsSL "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/$name" 2>/dev/null)
+        if [ -n "$LATEST" ] && [ ${#LATEST} -gt 50 ]; then
+            echo "$LATEST" > "$name.tmp"
+            if ! cmp -s "$name" "$name.tmp" 2>/dev/null; then
+                mv "$name.tmp" "$name" && chmod +x "$name"
+                echo "  $name refreshed"
+                [ "$name" = "update.sh" ] && REFRESHED=1
+            else
+                rm -f "$name.tmp"
+            fi
         fi
+    done
+    if [ "$REFRESHED" = "1" ] && [ -x "./update.sh" ]; then
+        echo "  Re-executing the refreshed update script..."
+        export CODERAFT_UPDATE_REEXEC=1
+        exec bash ./update.sh
     fi
-done
+fi
 
 # ── Pre-update recovery snapshot ───────────────────────────────────────────
 # The dashboard-api auto-snapshots on every deploy, but a manual snapshot
