@@ -278,7 +278,9 @@ if [ "${CODERAFT_NEEDS_NATIVE_CAPTURE}" = "1" ] && [ "${SKIP_NATIVE_CAPTURE:-0}"
     # release artifacts live in the matching public installer repo).
     # Bumping the tag here is a deliberate release decision.
     CAPTURE_BASE_URL="${CAPTURE_BASE_URL:-https://github.com/LiamJ74/ravenscan-installer/releases/download/capture-v0.1.0}"
-    CAPTURE_BIN_NAME="ravenscan-capture-host-${CODERAFT_OS}-${CODERAFT_ARCH}"
+    # Release uses Go convention (darwin/linux/windows) — map macos → darwin
+    CAPTURE_OS_NAME="${CODERAFT_OS/macos/darwin}"
+    CAPTURE_BIN_NAME="ravenscan-capture-host-${CAPTURE_OS_NAME}-${CODERAFT_ARCH}"
 
     CAPTURE_TMP_DIR="$(mktemp -d)"
     trap 'rm -rf "$CAPTURE_TMP_DIR"' EXIT
