@@ -18,6 +18,18 @@ Write-Host "  ║   Security. Identity. Access. Unified.   ║"
 Write-Host "  ╚══════════════════════════════════════════╝"
 Write-Host ""
 
+# ── OS detection ─────────────────────────────────────────────────────────────
+# Coderaft itself runs in Docker on every OS. The native capture daemon
+# (Ravenscan live packet inspection) is the exception: on Docker Desktop
+# (Windows here) containers cannot see the host's real NICs, so we
+# install a Windows Service on the host instead. On Linux servers the
+# Docker sidecar with network_mode: host works natively.
+$CoderaftOS   = "windows"
+$CoderaftArch = if ([Environment]::Is64BitOperatingSystem) { "amd64" } else { "386" }
+$CoderaftNeedsNativeCapture = $true
+Write-Host "  Detected: $CoderaftOS/$CoderaftArch"
+Write-Host ""
+
 # ── Prerequisites ────────────────────────────────────────────────────────────
 
 function Test-Command($name) {
@@ -73,10 +85,21 @@ POSTGRES_PASSWORD=$(New-HexSecret 24)
 REDIS_PASSWORD=$(New-HexSecret 24)
 DASHBOARD_SECRET=$(New-HexSecret 32)
 HOST_PROJECT_DIR=$AbsoluteInstallDir
+RAVENSCAN_CAPTURE_TOKEN=$(New-HexSecret 32)
+CODERAFT_HOST_OS=$CoderaftOS
+CODERAFT_HOST_ARCH=$CoderaftArch
 "@
     # Write without BOM — Docker Compose .env parser chokes on UTF-8 BOM
     [System.IO.File]::WriteAllText("$(Get-Location)\.env", $Env, [System.Text.UTF8Encoding]::new($false))
     Write-Host "  ✓ Secrets generated" -ForegroundColor Green
+}
+
+# Read the capture token back so we can hand it to the native daemon installer.
+$RavenscanCaptureToken = (Select-String -Path '.env' -Pattern '^RAVENSCAN_CAPTURE_TOKEN=' -Quiet) `
+    | ForEach-Object { (Select-String -Path '.env' -Pattern '^RAVENSCAN_CAPTURE_TOKEN=(.+)$').Matches.Groups[1].Value }
+if (-not $RavenscanCaptureToken) {
+    $match = Select-String -Path '.env' -Pattern '^RAVENSCAN_CAPTURE_TOKEN=(.+)$'
+    if ($match) { $RavenscanCaptureToken = $match.Matches.Groups[1].Value }
 }
 
 # Init DB
@@ -216,6 +239,90 @@ docker compose up -d
 Write-Host ""
 Write-Host "  Waiting for dashboard to be ready..."
 Start-Sleep -Seconds 10
+
+
+# ── Native capture daemon (Windows Service) ───────────────────────────────────
+if ($CoderaftNeedsNativeCapture -and $env:SKIP_NATIVE_CAPTURE -ne "1") {
+    Write-Host ""
+    Write-Host "  ── Live capture daemon (native Windows Service) ────"
+    Write-Host "  Coderaft runs in Docker but live packet capture needs"
+    Write-Host "  a native service that can see your real Wi-Fi and"
+    Write-Host "  Ethernet interfaces (Docker Desktop hides them)."
+    Write-Host ""
+
+    # Public ravenscan-installer repo — same pattern as the other
+    # Coderaft products (private source repo, public installer repo
+    # holds release artifacts). Pinned to a deliberate tag.
+    $CaptureBaseUrl = if ($env:CAPTURE_BASE_URL) { $env:CAPTURE_BASE_URL } `
+                      else { "https://github.com/LiamJ74/ravenscan-installer/releases/download/capture-v0.1.0" }
+    $CaptureBin     = "ravenscan-capture-host-windows-$CoderaftArch.exe"
+    $CaptureTmp     = Join-Path $env:TEMP ("coderaft-capture-{0}" -f (Get-Random))
+    New-Item -ItemType Directory -Force -Path $CaptureTmp | Out-Null
+
+    try {
+        Write-Host "  Downloading $CaptureBin from $CaptureBaseUrl…"
+        $files = @($CaptureBin, "install-windows.ps1", "uninstall-windows.ps1", "SHA256SUMS")
+        foreach ($f in $files) {
+            try {
+                Invoke-WebRequest -Uri "$CaptureBaseUrl/$f" `
+                    -OutFile (Join-Path $CaptureTmp $f) -UseBasicParsing
+            } catch {
+                if ($f -eq "SHA256SUMS") { continue }  # optional
+                throw
+            }
+        }
+
+        # Optional checksum verification.
+        $sumsPath = Join-Path $CaptureTmp "SHA256SUMS"
+        if (Test-Path $sumsPath) {
+            foreach ($line in Get-Content $sumsPath) {
+                if ($line -match '^([0-9a-f]{64})\s+(\S+)$') {
+                    $expected = $Matches[1]
+                    $name     = $Matches[2]
+                    $localPath = Join-Path $CaptureTmp $name
+                    if (Test-Path $localPath) {
+                        $actual = (Get-FileHash -Algorithm SHA256 $localPath).Hash.ToLower()
+                        if ($actual -ne $expected) {
+                            throw "Checksum mismatch for ${name}: expected $expected, got $actual"
+                        }
+                    }
+                }
+            }
+            Write-Host "  ✓ Checksums verified"
+        }
+
+        # Self-elevate to install the Windows Service if not already admin.
+        $isAdmin = ([Security.Principal.WindowsPrincipal] `
+            [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+                [Security.Principal.WindowsBuiltInRole]::Administrator)
+
+        $installScript = Join-Path $CaptureTmp "install-windows.ps1"
+        if ($isAdmin) {
+            Write-Host "  Running install-windows.ps1 as administrator…"
+            & $installScript -Token $RavenscanCaptureToken
+        } else {
+            Write-Host "  Re-launching capture installer with elevated privileges…"
+            $args = "-NoProfile -ExecutionPolicy Bypass -File `"$installScript`" -Token `"$RavenscanCaptureToken`""
+            Start-Process powershell -ArgumentList $args -Verb RunAs -Wait
+        }
+
+        # Tell the platform to talk to the host daemon instead of the
+        # Docker sidecar (Docker Desktop on Windows can only see the
+        # bridge network from inside containers).
+        if (-not (Select-String -Path '.env' -Pattern '^RAVENSCAN_CAPTURE_SIDECAR_URL=' -Quiet)) {
+            $line = "`nRAVENSCAN_CAPTURE_SIDECAR_URL=http://host.docker.internal:7777"
+            [System.IO.File]::AppendAllText("$(Get-Location)\.env", $line, [System.Text.UTF8Encoding]::new($false))
+        }
+        Write-Host "  ✓ Native capture daemon installed and running on 127.0.0.1:7777" -ForegroundColor Green
+    } catch {
+        Write-Host "  ⚠ Could not install the native capture daemon: $_" -ForegroundColor Yellow
+        Write-Host "    Live capture will be limited to the Docker bridge until you"
+        Write-Host "    install the daemon manually from the Settings page."
+    } finally {
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $CaptureTmp
+    }
+    Write-Host ""
+}
 
 Write-Host ""
 Write-Host "  ╔══════════════════════════════════════════════════════╗" -ForegroundColor Green

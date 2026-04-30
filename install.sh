@@ -20,6 +20,26 @@ echo "  ║   Security. Identity. Access. Unified.   ║"
 echo "  ╚══════════════════════════════════════════╝"
 echo ""
 
+# ── OS detection ─────────────────────────────────────────────────────────────
+# Coderaft itself runs in Docker on every OS. The native capture daemon
+# (live packet inspection for Ravenscan) is the exception: on Docker
+# Desktop (macOS/Windows) containers cannot see the host's real NICs,
+# so we install a native binary on the host instead. On Linux the
+# Docker sidecar with network_mode: host works natively — no extra
+# binary needed.
+case "$(uname -s)" in
+    Darwin)  CODERAFT_OS="macos"   ; CODERAFT_NEEDS_NATIVE_CAPTURE=1 ;;
+    Linux)   CODERAFT_OS="linux"   ; CODERAFT_NEEDS_NATIVE_CAPTURE=0 ;;
+    *)       CODERAFT_OS="unknown" ; CODERAFT_NEEDS_NATIVE_CAPTURE=0 ;;
+esac
+case "$(uname -m)" in
+    arm64|aarch64) CODERAFT_ARCH="arm64" ;;
+    x86_64|amd64)  CODERAFT_ARCH="amd64" ;;
+    *)             CODERAFT_ARCH="unknown" ;;
+esac
+echo "  Detected: ${CODERAFT_OS}/${CODERAFT_ARCH}"
+echo ""
+
 # ── Prerequisites ────────────────────────────────────────────────────────────
 
 check_command() {
@@ -63,10 +83,17 @@ POSTGRES_PASSWORD=$(gen_hex 24)
 REDIS_PASSWORD=$(gen_hex 24)
 DASHBOARD_SECRET=$(gen_hex 32)
 HOST_PROJECT_DIR=${ABSOLUTE_INSTALL_DIR}
+RAVENSCAN_CAPTURE_TOKEN=$(gen_hex 32)
+CODERAFT_HOST_OS=${CODERAFT_OS}
+CODERAFT_HOST_ARCH=${CODERAFT_ARCH}
 ENVFILE
     chmod 600 .env
     echo "  ✓ Secrets generated"
 fi
+
+# Read the capture token back so we can pass it to the native daemon
+# install step (only relevant on macOS).
+RAVENSCAN_CAPTURE_TOKEN_VALUE="$(grep '^RAVENSCAN_CAPTURE_TOKEN=' .env | cut -d= -f2)"
 
 # Init DB
 cat > init-db.sql << 'SQL'
@@ -190,6 +217,40 @@ chmod +x start.sh stop.sh update.sh rollback.sh
 # ── Pull & Start ─────────────────────────────────────────────────────────────
 
 echo ""
+echo "  Verifying image signatures..."
+verify_coderaft_image() {
+    local image="$1"
+    if [ "${SKIP_COSIGN_VERIFY:-}" = "1" ]; then
+        return 0
+    fi
+    if ! command -v cosign &> /dev/null; then
+        if [ "${STRICT_COSIGN_VERIFY:-}" = "1" ]; then
+            echo "  ✗ cosign required (STRICT_COSIGN_VERIFY=1). Install: https://docs.sigstore.dev/cosign/installation"
+            exit 1
+        fi
+        echo "  ⚠ cosign not installed — skipping signature verification"
+        return 0
+    fi
+    if cosign verify \
+        --certificate-identity-regexp="^https://github.com/LiamJ74/" \
+        --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+        "${image}" > /dev/null 2>&1; then
+        echo "  ✓ Signature valid: ${image}"
+    else
+        if [ "${STRICT_COSIGN_VERIFY:-}" = "1" ]; then
+            echo "  ✗ Signature verification FAILED for ${image} (STRICT_COSIGN_VERIFY=1)"
+            exit 1
+        fi
+        echo "  ⚠ Signature missing or invalid: ${image} (continuing — set STRICT_COSIGN_VERIFY=1 to enforce)"
+    fi
+}
+for img in \
+    "ghcr.io/liamj74/coderaft-dashboard:latest" \
+    "ghcr.io/liamj74/coderaft-dashboard-api:latest"; do
+    verify_coderaft_image "${img}"
+done
+
+echo ""
 echo "  Pulling dashboard image..."
 docker compose pull
 
@@ -200,6 +261,69 @@ docker compose up -d
 echo ""
 echo "  Waiting for dashboard to be ready..."
 sleep 10
+
+
+# ── Native capture daemon install (macOS only — Linux uses Docker, Windows handled by install.ps1) ──
+if [ "${CODERAFT_NEEDS_NATIVE_CAPTURE}" = "1" ] && [ "${SKIP_NATIVE_CAPTURE:-0}" != "1" ]; then
+    echo ""
+    echo "  ── Live capture daemon (native) ─────────────────────"
+    echo "  Detected ${CODERAFT_OS} — installing the native capture daemon"
+    echo "  so Ravenscan can see your real Wi-Fi/Ethernet interfaces."
+    echo "  (Set SKIP_NATIVE_CAPTURE=1 to skip — capture will be limited"
+    echo "   to the Docker bridge until the daemon is installed manually.)"
+    echo ""
+
+    # Source: public ravenscan-installer repo (mirrors the same pattern
+    # used for the other Coderaft installers — source repos are private,
+    # release artifacts live in the matching public installer repo).
+    # Bumping the tag here is a deliberate release decision.
+    CAPTURE_BASE_URL="${CAPTURE_BASE_URL:-https://github.com/LiamJ74/ravenscan-installer/releases/download/capture-v0.1.0}"
+    CAPTURE_BIN_NAME="ravenscan-capture-host-${CODERAFT_OS}-${CODERAFT_ARCH}"
+
+    CAPTURE_TMP_DIR="$(mktemp -d)"
+    trap 'rm -rf "$CAPTURE_TMP_DIR"' EXIT
+
+    echo "  Downloading ${CAPTURE_BIN_NAME} from ${CAPTURE_BASE_URL}…"
+    if curl -fsSL -o "${CAPTURE_TMP_DIR}/${CAPTURE_BIN_NAME}" \
+            "${CAPTURE_BASE_URL}/${CAPTURE_BIN_NAME}" \
+       && curl -fsSL -o "${CAPTURE_TMP_DIR}/install-macos.sh" \
+            "${CAPTURE_BASE_URL}/install-macos.sh" \
+       && curl -fsSL -o "${CAPTURE_TMP_DIR}/io.coderaft.ravenscan-capture.plist" \
+            "${CAPTURE_BASE_URL}/io.coderaft.ravenscan-capture.plist"; then
+
+        # Optional checksum verification when SHA256SUMS is published.
+        if curl -fsSL -o "${CAPTURE_TMP_DIR}/SHA256SUMS" \
+                "${CAPTURE_BASE_URL}/SHA256SUMS" 2>/dev/null; then
+            ( cd "${CAPTURE_TMP_DIR}" && \
+              shasum -a 256 -c --ignore-missing SHA256SUMS >/dev/null 2>&1 ) \
+              || { echo "  ✗ Capture daemon checksum mismatch — aborting"; exit 1; }
+            echo "  ✓ Checksum verified"
+        fi
+
+        chmod +x "${CAPTURE_TMP_DIR}/install-macos.sh" "${CAPTURE_TMP_DIR}/${CAPTURE_BIN_NAME}"
+        echo "  Installing daemon (sudo required for raw socket access)…"
+        if sudo -n true 2>/dev/null; then
+            sudo RAVENSCAN_CAPTURE_TOKEN="${RAVENSCAN_CAPTURE_TOKEN_VALUE}" \
+                bash -c "cd '${CAPTURE_TMP_DIR}' && ./install-macos.sh"
+        else
+            echo "  (you will be prompted for your password)"
+            sudo RAVENSCAN_CAPTURE_TOKEN="${RAVENSCAN_CAPTURE_TOKEN_VALUE}" \
+                bash -c "cd '${CAPTURE_TMP_DIR}' && ./install-macos.sh"
+        fi
+
+        # Tell the platform to talk to the host daemon instead of the
+        # Docker sidecar (which would only see the bridge network on Mac).
+        if ! grep -q '^RAVENSCAN_CAPTURE_SIDECAR_URL=' .env 2>/dev/null; then
+            echo "RAVENSCAN_CAPTURE_SIDECAR_URL=http://host.docker.internal:7777" >> .env
+        fi
+        echo "  ✓ Native capture daemon installed and running on 127.0.0.1:7777"
+    else
+        echo "  ⚠ Could not download the native capture daemon."
+        echo "    Live capture will work on the Docker bridge only until you"
+        echo "    install the daemon manually from the Settings page."
+    fi
+    echo ""
+fi
 
 echo ""
 echo "  ╔══════════════════════════════════════════════════════╗"
