@@ -1,23 +1,26 @@
 # CodeRaft updater (Windows / PowerShell)
 #
-# Self-updates from the installer repo, then captures a pre-update recovery
-# snapshot before pulling new images. If something breaks, run rollback.ps1.
+# Self-updates from the installer repo, captures a pre-update recovery
+# snapshot, pulls new images, runs a post-update healthcheck and triggers
+# rollback.ps1 automatically if the dashboard API doesn't come back up.
+# Mirror logique du update.sh (Linux) avec adaptations Windows.
 
 $ErrorActionPreference = "Stop"
 
-$DASHBOARD_API = if ($env:DASHBOARD_API) { $env:DASHBOARD_API } else { "http://localhost:3001" }
-$ADMIN_TOKEN   = if ($env:ADMIN_TOKEN)   { $env:ADMIN_TOKEN }   else { "" }
+$DASHBOARD_API       = if ($env:DASHBOARD_API)       { $env:DASHBOARD_API }       else { "http://localhost:3001" }
+$ADMIN_TOKEN         = if ($env:ADMIN_TOKEN)         { $env:ADMIN_TOKEN }         else { "" }
+$BACKUP_DIR          = if ($env:BACKUP_DIR)          { $env:BACKUP_DIR }          else { ".\dashboard_data\backups" }
+$HEALTHCHECK_RETRIES = if ($env:HEALTHCHECK_RETRIES) { [int]$env:HEALTHCHECK_RETRIES } else { 10 }
+$HEALTHCHECK_DELAY   = if ($env:HEALTHCHECK_DELAY)   { [int]$env:HEALTHCHECK_DELAY }   else { 3 }
 
 Write-Host "  Updating CodeRaft..."
 
 # ── Self-update update.ps1 + rollback.ps1 (with re-exec) ───────────────────
 # The in-memory script keeps running with its OLD logic after we overwrite
-# the file on disk. Without re-exec, the freshly downloaded fixes (e.g.
-# "include override in compose up") would only take effect on the NEXT
-# run. We solve it by re-launching the now-fresh script and exiting the
-# stale one. CODERAFT_UPDATE_REEXEC guards against infinite loops.
+# the file on disk. Without re-exec, the freshly downloaded fixes would only
+# take effect on the NEXT run. CODERAFT_UPDATE_REEXEC guards against loops.
 if (-not $env:CODERAFT_UPDATE_REEXEC) {
-    Write-Host "  Checking for script updates..."
+    Write-Host "  Vérification des mises à jour du script..."
     $refreshed = $false
     foreach ($name in @("update.ps1", "rollback.ps1")) {
         try {
@@ -25,41 +28,77 @@ if (-not $env:CODERAFT_UPDATE_REEXEC) {
             $latest = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
             if ($latest.StatusCode -eq 200 -and $latest.Content.Length -gt 50) {
                 [System.IO.File]::WriteAllText("$PWD\$name", $latest.Content, [System.Text.Encoding]::UTF8)
-                Write-Host "  $name refreshed"
+                Write-Host "  $name rafraîchi"
                 if ($name -eq "update.ps1") { $refreshed = $true }
             }
         } catch {
-            # Offline or upstream missing — keep the local copy
+            # Offline ou upstream KO — on garde la copie locale
         }
     }
     if ($refreshed -and (Test-Path ".\update.ps1")) {
-        Write-Host "  Re-executing the refreshed update script..."
+        Write-Host "  Re-exec du script mis à jour..."
         $env:CODERAFT_UPDATE_REEXEC = "1"
         & powershell -NoProfile -ExecutionPolicy Bypass -File ".\update.ps1"
         exit $LASTEXITCODE
     }
 }
 
-# ── Pre-update recovery snapshot ───────────────────────────────────────────
-Write-Host "  Capturing pre-update recovery snapshot..."
+# ── Backup pré-update obligatoire ─────────────────────────────────────────
+# Si pg_dumpall échoue → on bloque l'update (pas de backup = pas d'update).
+Write-Host ""
+Write-Host "  Sauvegarde pré-update..."
+New-Item -ItemType Directory -Path $BACKUP_DIR -Force | Out-Null
+$timestamp   = Get-Date -Format "yyyyMMdd_HHmmss"
+$BACKUP_FILE = Join-Path $BACKUP_DIR "preupdate-$timestamp.sql"
+
+$postgresRunning = $false
+try {
+    $psOutput = & docker compose ps postgres --quiet 2>$null
+    if ($psOutput) { $postgresRunning = $true }
+} catch { }
+
+if ($postgresRunning) {
+    try {
+        # Start-Process redirige stdout proprement (sans encoding issues PS)
+        $proc = Start-Process -FilePath "docker" `
+            -ArgumentList @("compose", "exec", "-T", "postgres", "pg_dumpall", "-U", "coderaft") `
+            -RedirectStandardOutput $BACKUP_FILE `
+            -NoNewWindow -PassThru -Wait
+
+        if ($proc.ExitCode -eq 0 -and (Get-Item $BACKUP_FILE).Length -gt 0) {
+            Write-Host "  Backup enregistré : $BACKUP_FILE"
+        } else {
+            Write-Host "  ERREUR : pg_dumpall échoué (exit $($proc.ExitCode)). Mise à jour annulée."
+            Write-Host "  Vérifiez que le container postgres est sain : docker compose ps"
+            exit 1
+        }
+    } catch {
+        Write-Host "  ERREUR : pg_dumpall échoué — $($_.Exception.Message)"
+        exit 1
+    }
+} else {
+    Write-Host "  PostgreSQL non détecté — backup ignoré (dashboard sans DB)."
+}
+
+# ── Capture du snapshot de recovery via dashboard-api ─────────────────────
+Write-Host "  Capture du snapshot de recovery..."
 if ($ADMIN_TOKEN) {
     try {
         $headers = @{
             "Content-Type"  = "application/json"
             "Authorization" = "Bearer $ADMIN_TOKEN"
         }
-        $body = '{"reason":"pre-update"}'
         Invoke-RestMethod -Method Post -Uri "$DASHBOARD_API/api/dashboard/recovery/snapshots" `
-            -Headers $headers -Body $body -TimeoutSec 10 | Out-Null
-        Write-Host "    snapshot saved"
+            -Headers $headers -Body '{"reason":"pre-update"}' -TimeoutSec 10 | Out-Null
+        Write-Host "    Snapshot sauvegardé."
     } catch {
-        Write-Host "    snapshot failed (continuing — auto-snapshot still runs on next deploy)"
+        Write-Host "    Snapshot échoué (l'auto-snapshot reste actif au prochain deploy)."
     }
 } else {
-    Write-Host "    skipped (set `$env:ADMIN_TOKEN to enable; auto-snapshot still runs on next deploy)"
+    Write-Host "    Ignoré (définir `$env:ADMIN_TOKEN pour activer)."
 }
 
-# ── Pull and recreate ──────────────────────────────────────────────────────
+# ── Pull et récréation ────────────────────────────────────────────────────
 # Include docker-compose.override.yml when it exists so product containers
 # (entraguard-*, neo4j, ravenscan, redfox-*) are within scope. Without it,
 # `--remove-orphans` treats every product as an orphan and silently nukes
@@ -70,8 +109,69 @@ if (Test-Path ".\docker-compose.override.yml") {
     $ComposeArgs += @("-f", ".\docker-compose.yml", "-f", ".\docker-compose.override.yml")
 }
 
-& docker @ComposeArgs pull
-& docker @ComposeArgs up -d --force-recreate --remove-orphans
 Write-Host ""
-Write-Host "  Updated! Dashboard: http://localhost:3000"
-Write-Host "  If something is broken: irm https://install.coderaft.io/rollback.ps1 | iex"
+Write-Host "  Téléchargement des nouvelles images..."
+& docker @ComposeArgs pull
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "  ERREUR : docker compose pull échoué."
+    exit 1
+}
+
+& docker @ComposeArgs up -d --force-recreate --remove-orphans
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "  ERREUR : docker compose up échoué."
+    exit 1
+}
+
+# ── Healthcheck post-update ───────────────────────────────────────────────
+Write-Host ""
+Write-Host "  Vérification de santé post-update..."
+$healthOk  = $false
+$healthUrl = "$DASHBOARD_API/api/health"
+
+for ($i = 1; $i -le $HEALTHCHECK_RETRIES; $i++) {
+    try {
+        $resp = Invoke-WebRequest -Uri $healthUrl -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+        if ($resp.StatusCode -lt 500 -and $resp.StatusCode -ne 0) {
+            Write-Host "  Dashboard API healthy (HTTP $($resp.StatusCode)) après $i tentative(s)."
+            $healthOk = $true
+            break
+        }
+    } catch {
+        # Continue retry
+    }
+    Write-Host "  Tentative $i/$HEALTHCHECK_RETRIES — attente ${HEALTHCHECK_DELAY}s..."
+    Start-Sleep -Seconds $HEALTHCHECK_DELAY
+}
+
+if (-not $healthOk) {
+    Write-Host ""
+    Write-Host "  ERREUR : healthcheck échoué après $HEALTHCHECK_RETRIES tentatives."
+    Write-Host "  Déclenchement du rollback automatique..."
+    if (Test-Path ".\rollback.ps1") {
+        & powershell -NoProfile -ExecutionPolicy Bypass -File ".\rollback.ps1"
+    } else {
+        Write-Host "  rollback.ps1 introuvable. Rollback manuel requis."
+        Write-Host "  Commande : docker compose down; docker compose up -d"
+    }
+    exit 1
+}
+
+# ── Notification post-update ──────────────────────────────────────────────
+if ($ADMIN_TOKEN) {
+    try {
+        $headers = @{
+            "Content-Type"  = "application/json"
+            "Authorization" = "Bearer $ADMIN_TOKEN"
+        }
+        Invoke-RestMethod -Method Post -Uri "$DASHBOARD_API/api/platform/update/notify" `
+            -Headers $headers -Body '{"status":"done","source":"update.ps1"}' -TimeoutSec 5 | Out-Null
+    } catch {
+        # Non-critique
+    }
+}
+
+Write-Host ""
+Write-Host "  Mise à jour réussie ! Dashboard : http://localhost:3000"
+Write-Host "  En cas de problème : .\rollback.ps1"
+Write-Host "  (ou : irm https://install.coderaft.io/rollback.ps1 | iex)"
