@@ -13,6 +13,14 @@ $BACKUP_DIR          = if ($env:BACKUP_DIR)          { $env:BACKUP_DIR }        
 $HEALTHCHECK_RETRIES = if ($env:HEALTHCHECK_RETRIES) { [int]$env:HEALTHCHECK_RETRIES } else { 10 }
 $HEALTHCHECK_DELAY   = if ($env:HEALTHCHECK_DELAY)   { [int]$env:HEALTHCHECK_DELAY }   else { 3 }
 
+# Détection du binaire PowerShell courant (compat PS5 'powershell.exe' + PS7 'pwsh.exe')
+$PSBin = (Get-Process -Id $PID).Path
+if (-not $PSBin -or -not (Test-Path $PSBin)) {
+    if (Get-Command pwsh -ErrorAction SilentlyContinue)       { $PSBin = "pwsh" }
+    elseif (Get-Command powershell -ErrorAction SilentlyContinue) { $PSBin = "powershell" }
+    else { $PSBin = "powershell" }
+}
+
 Write-Host "  Updating CodeRaft..."
 
 # ── Self-update update.ps1 + rollback.ps1 (with re-exec) ───────────────────
@@ -38,7 +46,7 @@ if (-not $env:CODERAFT_UPDATE_REEXEC) {
     if ($refreshed -and (Test-Path ".\update.ps1")) {
         Write-Host "  Re-exec du script mis à jour..."
         $env:CODERAFT_UPDATE_REEXEC = "1"
-        & powershell -NoProfile -ExecutionPolicy Bypass -File ".\update.ps1"
+        & $PSBin -NoProfile -ExecutionPolicy Bypass -File ".\update.ps1"
         exit $LASTEXITCODE
     }
 }
@@ -149,7 +157,7 @@ if (-not $healthOk) {
     Write-Host "  ERREUR : healthcheck échoué après $HEALTHCHECK_RETRIES tentatives."
     Write-Host "  Déclenchement du rollback automatique..."
     if (Test-Path ".\rollback.ps1") {
-        & powershell -NoProfile -ExecutionPolicy Bypass -File ".\rollback.ps1"
+        & $PSBin -NoProfile -ExecutionPolicy Bypass -File ".\rollback.ps1"
     } else {
         Write-Host "  rollback.ps1 introuvable. Rollback manuel requis."
         Write-Host "  Commande : docker compose down; docker compose up -d"
