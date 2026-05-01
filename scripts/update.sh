@@ -7,7 +7,7 @@
 #
 set -e
 
-DASHBOARD_API="${DASHBOARD_API:-http://localhost:3001}"
+DASHBOARD_API="${DASHBOARD_API:-http://localhost:3000}"
 ADMIN_TOKEN="${ADMIN_TOKEN:-}"
 BACKUP_DIR="${BACKUP_DIR:-./dashboard_data/backups}"
 HEALTHCHECK_RETRIES="${HEALTHCHECK_RETRIES:-10}"

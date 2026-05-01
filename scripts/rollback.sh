@@ -15,7 +15,7 @@
 #
 set -e
 
-DASHBOARD_API="${DASHBOARD_API:-http://localhost:3001}"
+DASHBOARD_API="${DASHBOARD_API:-http://localhost:3000}"
 ADMIN_TOKEN="${ADMIN_TOKEN:-}"
 
 if [ -z "$ADMIN_TOKEN" ]; then
