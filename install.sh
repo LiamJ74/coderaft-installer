@@ -66,6 +66,54 @@ echo "  Installing to: ${INSTALL_DIR}"
 mkdir -p "${INSTALL_DIR}"
 cd "${INSTALL_DIR}"
 
+# ── age key setup (SOPS Phase 2 secrets management) ─────────────────────────
+AGE_KEY_DIR="/etc/coderaft"
+AGE_KEY_PATH="${AGE_KEY_DIR}/age.key"
+
+setup_age_key() {
+    if [ -f "${AGE_KEY_PATH}" ]; then
+        echo "  ✓ age key already exists at ${AGE_KEY_PATH}"
+        return 0
+    fi
+
+    # Install age-keygen if not present
+    if ! command -v age-keygen &>/dev/null; then
+        echo "  Downloading age-keygen..."
+        AGE_VERSION="v1.2.1"
+        AGE_OS="${CODERAFT_OS/macos/darwin}"
+        AGE_TMP="$(mktemp -d)"
+        trap 'rm -rf "$AGE_TMP"' EXIT
+        curl -fsSL "https://github.com/FiloSottile/age/releases/download/${AGE_VERSION}/age-${AGE_VERSION}-${AGE_OS}-${CODERAFT_ARCH}.tar.gz" \
+            -o "${AGE_TMP}/age.tar.gz" 2>/dev/null || {
+            echo "  ⚠ Could not download age-keygen. SOPS encryption will be set up by the dashboard."
+            return 1
+        }
+        tar -xzf "${AGE_TMP}/age.tar.gz" -C "${AGE_TMP}" 2>/dev/null
+        sudo install -m 755 "${AGE_TMP}/age/age-keygen" /usr/local/bin/age-keygen 2>/dev/null || {
+            echo "  ⚠ Could not install age-keygen (no sudo?). SOPS encryption skipped."
+            return 1
+        }
+        echo "  ✓ age-keygen installed"
+    fi
+
+    echo "  Generating age key at ${AGE_KEY_PATH} (sudo required)..."
+    sudo mkdir -p "${AGE_KEY_DIR}"
+    sudo age-keygen -o "${AGE_KEY_PATH}" 2>/dev/null
+    sudo chmod 400 "${AGE_KEY_PATH}"
+    sudo chown root:root "${AGE_KEY_PATH}" 2>/dev/null || true
+    echo "  ✓ age key generated"
+    echo ""
+    echo "  IMPORTANT: Back up ${AGE_KEY_PATH} to an encrypted USB or secure vault."
+    echo "  If this key is lost, all encrypted .env.enc secrets are unrecoverable."
+    echo ""
+}
+
+# Only attempt age setup on Linux (where /etc/coderaft is writable with sudo).
+# On macOS the dashboard-api handles it at first boot.
+if [ "${CODERAFT_OS}" = "linux" ]; then
+    setup_age_key || true
+fi
+
 # Generate secrets on first install
 gen_hex() { openssl rand -hex "$1" 2>/dev/null || head -c "$1" /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 
@@ -74,6 +122,12 @@ ABSOLUTE_INSTALL_DIR="$(pwd)"
 if [ -f ".env" ] && grep -q '^POSTGRES_PASSWORD=' .env 2>/dev/null; then
     # Update HOST_PROJECT_DIR in case install location changed
     grep -q '^HOST_PROJECT_DIR=' .env 2>/dev/null || echo "HOST_PROJECT_DIR=${ABSOLUTE_INSTALL_DIR}" >> .env
+    # Backward compat: legacy install without .env.enc — show warning in dashboard
+    if [ ! -f "${AGE_KEY_PATH}" ]; then
+        echo "  ⚠ Legacy install detected: no age key found."
+        echo "    Secrets are currently stored as plaintext in .env."
+        echo "    Run the Setup Wizard to migrate to encrypted .env.enc."
+    fi
     echo "  ✓ Existing config preserved"
 else
     echo "  Generating secrets..."
