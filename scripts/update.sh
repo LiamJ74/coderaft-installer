@@ -123,8 +123,11 @@ echo "  ${#IMAGES_TO_UPDATE[@]} image(s) à mettre à jour."
 
 # ── Pull et récréation ────────────────────────────────────────────────────
 echo "  Téléchargement des nouvelles images..."
+# --pull always force la résolution du manifest distant à chaque up,
+# contournant le bug Docker Desktop où le tag :latest reste sur un
+# Image ID en cache même après un pull réussi.
 docker compose "${COMPOSE_ARGS[@]}" pull \
-    && docker compose "${COMPOSE_ARGS[@]}" up -d --force-recreate --remove-orphans
+    && docker compose "${COMPOSE_ARGS[@]}" up -d --force-recreate --remove-orphans --pull always
 
 # ── Healthcheck post-update ───────────────────────────────────────────────
 echo ""

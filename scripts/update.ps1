@@ -125,7 +125,10 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-& docker @ComposeArgs up -d --force-recreate --remove-orphans
+# --pull always force la résolution du manifest distant à chaque up,
+# contournant le bug Docker Desktop Windows où le tag :latest reste
+# sur un Image ID en cache même après un pull réussi.
+& docker @ComposeArgs up -d --force-recreate --remove-orphans --pull always
 if ($LASTEXITCODE -ne 0) {
     Write-Host "  ERREUR : docker compose up échoué."
     exit 1
