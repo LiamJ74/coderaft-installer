@@ -151,9 +151,13 @@ for img in "${IMAGES_TO_UPDATE[@]}"; do
 done
 
 # ── Pull et récréation ────────────────────────────────────────────────────
+# NB : `--pull always` sur le `up` retentait un manifest check GHCR par service
+# au moment du redéploiement, ce qui faisait timeout en cas de connexion lente.
+# Désormais on s'appuie sur le `docker rmi -f` + `docker compose pull` ci-dessus
+# pour garantir que le tag :latest pointe bien sur la nouvelle image avant `up`.
 echo "  Téléchargement des nouvelles images..."
 docker compose "${COMPOSE_ARGS[@]}" pull \
-    && docker compose "${COMPOSE_ARGS[@]}" up -d --force-recreate --remove-orphans --pull always
+    && docker compose "${COMPOSE_ARGS[@]}" up -d --force-recreate --remove-orphans
 
 # ── Healthcheck post-update ───────────────────────────────────────────────
 echo ""

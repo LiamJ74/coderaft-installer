@@ -148,10 +148,11 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-# --pull always force la résolution du manifest distant à chaque up,
-# contournant le bug Docker Desktop Windows où le tag :latest reste
-# sur un Image ID en cache même après un pull réussi.
-& docker @ComposeArgs up -d --force-recreate --remove-orphans --pull always
+# NB : `--pull always` retentait un manifest check GHCR par service au moment
+# du redéploiement (timeout intermittent sur connexions lentes). Le bug Docker
+# Desktop tag-cache est déjà couvert par le `docker rmi -f` + `docker compose
+# pull` ci-dessus, donc on laisse `up` réutiliser les images locales fraîches.
+& docker @ComposeArgs up -d --force-recreate --remove-orphans
 if ($LASTEXITCODE -ne 0) {
     Write-Host "  ERREUR : docker compose up échoué."
     exit 1
