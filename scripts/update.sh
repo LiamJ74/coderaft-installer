@@ -13,6 +13,19 @@ BACKUP_DIR="${BACKUP_DIR:-./dashboard_data/backups}"
 HEALTHCHECK_RETRIES="${HEALTHCHECK_RETRIES:-10}"
 HEALTHCHECK_DELAY="${HEALTHCHECK_DELAY:-3}"
 
+# ── Détection plateforme Docker ────────────────────────────────────────────
+# Docker Desktop Mac M-series résout strictement linux/arm64/v8 par défaut,
+# ce qui échoue sur les manifests qui exposent juste linux/arm64. Idem
+# diverses versions Docker Engine. On force DOCKER_DEFAULT_PLATFORM en
+# fonction de l'arch hôte pour court-circuiter ce bug.
+if [ -z "$DOCKER_DEFAULT_PLATFORM" ]; then
+    HOST_ARCH=$(uname -m 2>/dev/null || echo "")
+    case "$HOST_ARCH" in
+        arm64|aarch64) export DOCKER_DEFAULT_PLATFORM="linux/arm64" ;;
+        x86_64|amd64)  export DOCKER_DEFAULT_PLATFORM="linux/amd64" ;;
+    esac
+fi
+
 # ── Self-update both update.sh and rollback.sh (with re-exec) ──────────────
 if [ -z "$CODERAFT_UPDATE_REEXEC" ]; then
     echo "  Vérification des mises à jour du script..."

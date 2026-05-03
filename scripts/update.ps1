@@ -21,6 +21,15 @@ if (-not $PSBin -or -not (Test-Path $PSBin)) {
     else { $PSBin = "powershell" }
 }
 
+# Détection plateforme Docker — Docker Desktop résout parfois strictement
+# linux/arm64/v8 ou linux/amd64/v3 par défaut, ce qui échoue sur les manifests
+# qui exposent juste linux/arm64 ou linux/amd64. On force la plateforme.
+if (-not $env:DOCKER_DEFAULT_PLATFORM) {
+    $hostArch = $env:PROCESSOR_ARCHITECTURE
+    if ($hostArch -eq "ARM64")        { $env:DOCKER_DEFAULT_PLATFORM = "linux/arm64" }
+    elseif ($hostArch -eq "AMD64")    { $env:DOCKER_DEFAULT_PLATFORM = "linux/amd64" }
+}
+
 Write-Host "  Updating CodeRaft..."
 
 # ── Self-update update.ps1 + rollback.ps1 (with re-exec) ───────────────────
