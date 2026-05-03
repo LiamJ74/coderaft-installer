@@ -134,11 +134,24 @@ fi
 echo ""
 echo "  ${#IMAGES_TO_UPDATE[@]} image(s) à mettre à jour."
 
+# ── Invalidation du cache de tag Docker ───────────────────────────────────
+# Bug Docker Desktop : `docker compose pull` télécharge la nouvelle image
+# mais le tag :latest reste sur l'Image ID en cache local. `up --pull always`
+# ne suffit pas toujours. On force l'untag des images Coderaft avant pull
+# pour que le pull suivant écrive vraiment la nouvelle image sous le tag.
+echo "  Invalidation du cache de tag local pour les images Coderaft..."
+for img in "${IMAGES_TO_UPDATE[@]}"; do
+    case "$img" in
+        ghcr.io/liamj74/*)
+            # -f permet le untag même si un container running utilise l'image
+            # (l'image reste tant que le container tourne ; le tag est juste libéré)
+            docker rmi -f "$img" >/dev/null 2>&1 || true
+            ;;
+    esac
+done
+
 # ── Pull et récréation ────────────────────────────────────────────────────
 echo "  Téléchargement des nouvelles images..."
-# --pull always force la résolution du manifest distant à chaque up,
-# contournant le bug Docker Desktop où le tag :latest reste sur un
-# Image ID en cache même après un pull réussi.
 docker compose "${COMPOSE_ARGS[@]}" pull \
     && docker compose "${COMPOSE_ARGS[@]}" up -d --force-recreate --remove-orphans --pull always
 

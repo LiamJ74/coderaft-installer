@@ -126,6 +126,20 @@ if (Test-Path ".\docker-compose.override.yml") {
     $ComposeArgs += @("-f", ".\docker-compose.yml", "-f", ".\docker-compose.override.yml")
 }
 
+# ── Invalidation du cache de tag Docker ───────────────────────────────────
+# Bug Docker Desktop : `docker compose pull` télécharge la nouvelle image
+# mais le tag :latest reste sur l'Image ID en cache local. On force l'untag
+# des images Coderaft avant pull pour que le pull suivant écrive vraiment
+# la nouvelle image sous le tag.
+Write-Host ""
+Write-Host "  Invalidation du cache de tag local pour les images Coderaft..."
+$ComposeImages = & docker @ComposeArgs config --images 2>$null
+foreach ($img in $ComposeImages) {
+    if ($img -like "ghcr.io/liamj74/*") {
+        & docker rmi -f $img 2>$null | Out-Null
+    }
+}
+
 Write-Host ""
 Write-Host "  Téléchargement des nouvelles images..."
 & docker @ComposeArgs pull
