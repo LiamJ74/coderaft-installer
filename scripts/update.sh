@@ -10,7 +10,7 @@ set -e
 DASHBOARD_API="${DASHBOARD_API:-http://localhost:3000}"
 ADMIN_TOKEN="${ADMIN_TOKEN:-}"
 BACKUP_DIR="${BACKUP_DIR:-./dashboard_data/backups}"
-HEALTHCHECK_RETRIES="${HEALTHCHECK_RETRIES:-10}"
+HEALTHCHECK_RETRIES="${HEALTHCHECK_RETRIES:-30}"
 HEALTHCHECK_DELAY="${HEALTHCHECK_DELAY:-3}"
 
 # ── Détection plateforme Docker ────────────────────────────────────────────
@@ -149,8 +149,10 @@ HEALTH_OK=1
 HEALTH_URL="$DASHBOARD_API/api/health"
 
 for i in $(seq 1 "$HEALTHCHECK_RETRIES"); do
-    HTTP_CODE=$(curl -fsS -o /dev/null -w "%{http_code}" "$HEALTH_URL" 2>/dev/null || echo "0")
-    if [ "$HTTP_CODE" -lt 500 ] && [ "$HTTP_CODE" -ne 0 ]; then
+    # -sS sans -f : on capture le HTTP code même sur 4xx/5xx au lieu d'avoir
+    # un exit code !=0 qui concatène "0" derrière (donnait "5020" au lieu de "502").
+    HTTP_CODE=$(curl -sS -o /dev/null -w "%{http_code}" "$HEALTH_URL" 2>/dev/null || echo "000")
+    if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 500 ]; then
         echo "  Dashboard API healthy (HTTP $HTTP_CODE) après ${i} tentative(s)."
         HEALTH_OK=0
         break
