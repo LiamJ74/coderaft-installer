@@ -131,17 +131,98 @@ sops --rotate --add-age "$AGE_PUB_NEW" -i .env.enc
 
 ---
 
+## Migrer un install existant (legacy → SOPS)
+
+Les installs existantes **sans** `.env.enc` continuent de fonctionner avec leur `.env` en clair.  
+Le dashboard affiche un bandeau jaune tant que des secrets en clair sont détectés.
+
+### Migration automatique (recommandée)
+
+**Linux / macOS :**
+
+```bash
+# Depuis le répertoire d'install coderaft/
+curl -fsSL https://install.coderaft.io/migrate | bash
+```
+
+**Windows (PowerShell admin) :**
+
+```powershell
+# Depuis le répertoire d'install coderaft\
+irm https://install.coderaft.io/migrate.ps1 | iex
+```
+
+Le script est **idempotent** : si la première exécution échoue à mi-chemin, relancez-le sans risque.
+
+### Ce que fait le script
+
+1. Vérifie que `.env` est présent (sinon exit 0 — pas de migration nécessaire)
+2. Installe `age-keygen` et `sops` si absents
+3. Génère `/etc/coderaft/age.key` (Linux) ou `C:\ProgramData\coderaft\age.key` (Windows) si inexistant
+4. Crée un **backup chiffré GPG** du `.env` original dans `dashboard_data/migration-backup-{ts}.env.gpg`
+5. Chiffre `.env` avec `sops --age` → `.env.enc`
+6. Vérifie que le déchiffrement est identique au `.env` original (abort si différence)
+7. Supprime `.env` uniquement si la vérification est OK
+8. Migre `redfox-certs/jwt.key` vers file mount si référencé en env var
+9. Écrit un audit log dans `dashboard_data/migration.log`
+
+### Avant de migrer — checklist
+
+- [ ] Faire un snapshot VM ou backup manuel si possible
+- [ ] Avoir accès à un gestionnaire de mots de passe pour stocker la passphrase GPG
+- [ ] S'assurer que la stack est arrêtée (`docker compose down`) ou que redémarrer après migration est prévu
+
+### Backup — procédure de vérification
+
+```bash
+# Vérifier que le backup GPG est lisible
+gpg --decrypt dashboard_data/migration-backup-*.env.gpg | head -3
+# Doit afficher les premières lignes du .env original
+```
+
+### Recovery — si la migration est cassée (`.env` supprimé mais `.env.enc` illisible)
+
+Si `age.key` est accessible :
+
+```bash
+SOPS_AGE_KEY_FILE=/etc/coderaft/age.key sops --decrypt .env.enc > .env
+docker compose up -d
+```
+
+Si `age.key` est perdu mais le backup GPG existe :
+
+```bash
+gpg --decrypt dashboard_data/migration-backup-*.env.gpg > .env
+# Puis relancer la migration avec la nouvelle clé age
+```
+
+Si ni `age.key` ni backup :
+1. Secrets définitivement perdus — rotation complète requise
+2. `age-keygen -o /etc/coderaft/age.key`
+3. Re-run du Setup Wizard pour reconfigurer les produits
+
+### Variables d'environnement
+
+| Variable | Effet |
+|---|---|
+| `CODERAFT_BACKUP_PASS` | Passphrase GPG (non-interactive, CI/CD) |
+| `CODERAFT_DATA_DIR` | Répertoire pour logs et backup (défaut : `./dashboard_data`) |
+| `CODERAFT_SKIP_SELF_UPDATE` | `1` pour désactiver le self-update du script |
+
+> **Avertissement** : Passphrase GPG perdue = backup inaccessible. En cas de perte simultanée de `age.key` et de la passphrase GPG, les secrets sont **définitivement inaccessibles**. Stockez la passphrase dans un gestionnaire de mots de passe sécurisé (Bitwarden, 1Password, Vault).
+
+---
+
 ## Compatibilité backward
 
 Les installs existantes **sans** `.env.enc` continuent de fonctionner avec leur `.env` en clair.  
 Le dashboard affiche un avertissement : "Secrets non chiffrés — migrez vers SOPS via le Setup Wizard."
 
-Pour migrer une install legacy :
+Pour migrer une install legacy (méthode manuelle) :
 
 ```bash
 # Depuis le répertoire d'install
-AGE_PUB=$(curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
-  http://localhost:3001/api/setup/age-public-key | jq -r .public_key)
+AGE_PUB=$(grep "# public key:" /etc/coderaft/age.key | awk '{print $NF}')
 
 cp .env .env.bak
 sops --encrypt --age "$AGE_PUB" --output .env.enc .env
