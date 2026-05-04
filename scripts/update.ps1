@@ -126,17 +126,30 @@ if (Test-Path ".\docker-compose.override.yml") {
     $ComposeArgs += @("-f", ".\docker-compose.yml", "-f", ".\docker-compose.override.yml")
 }
 
-# ── Invalidation du cache de tag Docker ───────────────────────────────────
-# Bug Docker Desktop : `docker compose pull` télécharge la nouvelle image
-# mais le tag :latest reste sur l'Image ID en cache local. On force l'untag
-# des images Coderaft avant pull pour que le pull suivant écrive vraiment
-# la nouvelle image sous le tag.
+# ── Invalidation AGRESSIVE du cache d'image Docker ────────────────────────
+# Bug Docker Desktop multi-arch : `docker pull` peut dire "Image is up to date"
+# alors que le digest local et distant diffèrent (cache de résolution
+# tag→digest). On force la suppression complète : containers, tag, image-by-ID.
 Write-Host ""
-Write-Host "  Invalidation du cache de tag local pour les images Coderaft..."
+Write-Host "  Invalidation agressive du cache d'image Coderaft..."
 $ComposeImages = & docker @ComposeArgs config --images 2>$null
 foreach ($img in $ComposeImages) {
     if ($img -like "ghcr.io/liamj74/*") {
+        # 1. Stopper les containers qui tournent sur cette image
+        $containerIds = & docker ps -q --filter "ancestor=$img" 2>$null
+        if ($containerIds) {
+            & docker stop $containerIds 2>$null | Out-Null
+            & docker rm -f $containerIds 2>$null | Out-Null
+        }
+        # 2. Untag
         & docker rmi -f $img 2>$null | Out-Null
+        # 3. Supprimer par ID (au cas où l'image survit untagged)
+        $imageIds = & docker images --format "{{.ID}}" $img 2>$null
+        if ($imageIds) {
+            foreach ($iid in $imageIds) {
+                if ($iid) { & docker rmi -f $iid 2>$null | Out-Null }
+            }
+        }
     }
 }
 

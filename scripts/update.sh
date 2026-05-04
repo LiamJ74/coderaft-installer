@@ -139,18 +139,34 @@ fi
 echo ""
 echo "  ${#IMAGES_TO_UPDATE[@]} image(s) à mettre à jour."
 
-# ── Invalidation du cache de tag Docker ───────────────────────────────────
-# Bug Docker Desktop : `docker compose pull` télécharge la nouvelle image
-# mais le tag :latest reste sur l'Image ID en cache local. `up --pull always`
-# ne suffit pas toujours. On force l'untag des images Coderaft avant pull
-# pour que le pull suivant écrive vraiment la nouvelle image sous le tag.
-echo "  Invalidation du cache de tag local pour les images Coderaft..."
+# ── Invalidation AGRESSIVE du cache d'image Docker ────────────────────────
+# Bug Docker Desktop multi-arch : quand un nouveau manifest list est poussé
+# sur GHCR, le `docker pull` peut dire "Image is up to date" alors que le
+# digest local et le digest distant diffèrent. C'est parce que Docker Desktop
+# garde un cache de la résolution tag→digest.
+#
+# Fix : pour chaque image Coderaft, on stoppe les containers qui l'utilisent,
+# on force le untag AND on supprime l'image par ID. Le pull suivant doit
+# alors re-résoudre le manifest list distant et télécharger vraiment.
+echo "  Invalidation agressive du cache d'image Coderaft..."
 for img in "${IMAGES_TO_UPDATE[@]}"; do
     case "$img" in
         ghcr.io/liamj74/*)
-            # -f permet le untag même si un container running utilise l'image
-            # (l'image reste tant que le container tourne ; le tag est juste libéré)
+            # 1. Stopper les containers qui tournent sur cette image
+            container_ids=$(docker ps -q --filter "ancestor=$img" 2>/dev/null || true)
+            if [ -n "$container_ids" ]; then
+                docker stop $container_ids >/dev/null 2>&1 || true
+                docker rm -f $container_ids >/dev/null 2>&1 || true
+            fi
+            # 2. Untag (libère le nom :latest)
             docker rmi -f "$img" >/dev/null 2>&1 || true
+            # 3. Supprimer aussi par ID (au cas où l'image survit untagged)
+            image_ids=$(docker images --format '{{.ID}}' "$img" 2>/dev/null || true)
+            if [ -n "$image_ids" ]; then
+                echo "$image_ids" | while read -r iid; do
+                    [ -n "$iid" ] && docker rmi -f "$iid" >/dev/null 2>&1 || true
+                done
+            fi
             ;;
     esac
 done
