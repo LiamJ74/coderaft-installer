@@ -59,7 +59,12 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 BACKUP_FILE="$BACKUP_DIR/preupdate-${TIMESTAMP}.sql.gz"
 
 if docker compose ps postgres --quiet 2>/dev/null | grep -q .; then
-    if docker compose exec -T postgres pg_dumpall -U coderaft 2>/dev/null | gzip > "$BACKUP_FILE"; then
+    # `< /dev/null` est CRITIQUE : sans ça, `docker compose exec -T` hérite de
+    # stdin, et quand l'updater est lancé via `curl … | bash`, stdin = pipe
+    # contenant le reste du script que bash n'a pas encore lu. docker exec
+    # drain ces bytes → bash atteint EOF prématurément et le script exit
+    # silencieusement après "Backup enregistré" (sans erreur, sans rollback).
+    if docker compose exec -T postgres pg_dumpall -U coderaft < /dev/null 2>/dev/null | gzip > "$BACKUP_FILE"; then
         echo "  Backup enregistré : $BACKUP_FILE"
     else
         echo "  ERREUR : pg_dump échoué. Mise à jour annulée (pas de backup = pas d'update)."
