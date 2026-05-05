@@ -271,18 +271,23 @@ foreach ($img in $ComposeImages) {
         # 1. Stopper les containers qui tournent sur cette image
         $containerIds = & docker ps -q --filter "ancestor=$img" 2>$null
         if ($containerIds) {
-            & docker stop $containerIds 2>$null | Out-Null
-            & docker rm -f $containerIds 2>$null | Out-Null
+            & docker stop $containerIds 2>&1 | Out-Null
+            & docker rm -f $containerIds 2>&1 | Out-Null
         }
-        # 2. Untag
-        & docker rmi -f $img 2>$null | Out-Null
+        # 2. Untag (silencieux si l'image n'existe pas localement — premier update)
+        & docker image inspect $img 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            & docker rmi -f $img 2>&1 | Out-Null
+        }
+        $LASTEXITCODE = 0
         # 3. Supprimer par ID (au cas où l'image survit untagged)
         $imageIds = & docker images --format "{{.ID}}" $img 2>$null
         if ($imageIds) {
             foreach ($iid in $imageIds) {
-                if ($iid) { & docker rmi -f $iid 2>$null | Out-Null }
+                if ($iid) { & docker rmi -f $iid 2>&1 | Out-Null }
             }
         }
+        $LASTEXITCODE = 0
     }
 }
 
