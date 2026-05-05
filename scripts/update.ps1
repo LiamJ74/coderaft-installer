@@ -179,6 +179,86 @@ if (Test-Path ".\docker-compose.override.yml") {
     $ComposeArgs += @("-f", ".\docker-compose.yml", "-f", ".\docker-compose.override.yml")
 }
 
+# ── Refresh des clés de licence (drift "superseded") ──────────────────────
+# Quand le License Server resigne une licence (ex: ajout de feature, rotation
+# de clé), il retourne 403 "License has been superseded by a newer version"
+# pour toute requête utilisant l'ancienne clé. On rafraîchit donc la clé dans
+# docker-compose.override.yml AVANT le `docker compose up`. Backup .bak.
+# Si le License Server est injoignable, on continue silencieusement.
+function Update-License {
+    param(
+        [Parameter(Mandatory=$true)] [string] $EnvVar,
+        [Parameter(Mandatory=$true)] [string] $OverrideFile
+    )
+    if (-not (Test-Path $OverrideFile -PathType Leaf)) { return $false }
+
+    $content = Get-Content -LiteralPath $OverrideFile -ErrorAction SilentlyContinue
+    if (-not $content) { return $false }
+
+    # Cherche la première occurrence de "<EnvVar>=<value>" (avec ou sans tiret YAML).
+    $regex = "^\s*-?\s*$([Regex]::Escape($EnvVar))=(.+)$"
+    $currentKey = $null
+    foreach ($line in $content) {
+        if ($line -match $regex) {
+            $currentKey = $Matches[1].Trim().Trim('"').Trim("'")
+            break
+        }
+    }
+    if (-not $currentKey -or $currentKey -eq "UNCONFIGURED") { return $false }
+
+    $server = if ($env:LICENSE_SERVER_URL) { $env:LICENSE_SERVER_URL } else { "https://license.coderaft.io" }
+    $latest = $null
+    try {
+        $body = @{ license_key = $currentKey } | ConvertTo-Json -Compress
+        $resp = Invoke-RestMethod -Method Post -Uri "$server/api/licenses/validate" `
+            -ContentType "application/json" -Body $body -TimeoutSec 10 -ErrorAction Stop
+        if ($resp.latest_license_key) { $latest = [string]$resp.latest_license_key }
+    } catch {
+        # License Server injoignable ou erreur réseau → silencieux
+        return $false
+    }
+
+    if ($latest -and $latest -ne $currentKey) {
+        Copy-Item -LiteralPath $OverrideFile -Destination "$OverrideFile.bak" -Force
+        # Remplace TOUTES les occurrences (worker + api peuvent partager la clé)
+        $newContent = foreach ($line in $content) {
+            if ($line -match $regex) {
+                $padMatch = [Regex]::Match($line, "^(\s*-?\s*)")
+                $pad = $padMatch.Groups[1].Value
+                "$pad$EnvVar=$latest"
+            } else {
+                $line
+            }
+        }
+        # Préserve l'absence de BOM et utilise LF Unix (compose tolère CRLF mais on évite la pollution)
+        [System.IO.File]::WriteAllLines($OverrideFile, $newContent, (New-Object System.Text.UTF8Encoding($false)))
+        Write-Host "  🔄 Licence rafraîchie pour $EnvVar"
+        return $true
+    }
+    return $false
+}
+
+function Update-AllLicenses {
+    $overrideFile = Join-Path $INSTALL_DIR "docker-compose.override.yml"
+    Write-Host ""
+    Write-Host "  ▶ Vérification de la dérive de licence..."
+    $any = $false
+    foreach ($var in @("LICENSE_KEY", "RAVENSCAN_LICENSE_KEY", "REDFOX_LICENSE_KEY")) {
+        try {
+            if (Update-License -EnvVar $var -OverrideFile $overrideFile) { $any = $true }
+        } catch {
+            # On ne fail jamais le update à cause d'un refresh
+        }
+    }
+    if ($any) {
+        Write-Host "  ⚠️  Au moins une licence a été rafraîchie ; les services seront redémarrés"
+    } else {
+        Write-Host "  ✅ Toutes les licences sont à jour"
+    }
+}
+
+try { Update-AllLicenses } catch { }
+
 # ── Invalidation AGRESSIVE du cache d'image Docker ────────────────────────
 # Bug Docker Desktop multi-arch : `docker pull` peut dire "Image is up to date"
 # alors que le digest local et distant diffèrent (cache de résolution

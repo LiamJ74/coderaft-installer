@@ -184,6 +184,87 @@ fi
 echo ""
 echo "  ${#IMAGES_TO_UPDATE[@]} image(s) à mettre à jour."
 
+# ── Refresh des clés de licence (drift "superseded") ──────────────────────
+# Quand le License Server resigne une licence (ex: ajout de feature, prolongation,
+# rotation de clé), le serveur retourne 403 "License has been superseded by a
+# newer version" pour toute requête utilisant l'ancienne clé. Le fix produit
+# côté backend priorise DB > env, mais sur un déploiement frais ou après reset
+# du volume, il n'y a que la clé env. On la rafraîchit donc ici, in-place dans
+# docker-compose.override.yml, AVANT le `docker compose up`.
+#
+# Stratégie : POST /api/licenses/validate avec la clé locale ; si la réponse
+# contient `latest_license_key` différent, on l'écrit dans le override (avec
+# backup .bak). On ne fail jamais l'update à cause de ça (License Server
+# down → on continue avec la clé locale, le runtime gérera le 403).
+refresh_license() {
+    local env_var="$1"   # LICENSE_KEY / RAVENSCAN_LICENSE_KEY / REDFOX_LICENSE_KEY
+    local override_file="$INSTALL_DIR/docker-compose.override.yml"
+    [[ ! -f "$override_file" ]] && return 0
+    grep -qE "^[[:space:]]*-?[[:space:]]*${env_var}=" "$override_file" || return 0
+
+    local current_key
+    current_key=$(grep -E "^[[:space:]]*-?[[:space:]]*${env_var}=" "$override_file" \
+        | head -1 \
+        | sed -E "s/^[[:space:]]*-?[[:space:]]*${env_var}=//" \
+        | tr -d '"' | tr -d "'" | xargs)
+    [[ -z "$current_key" || "$current_key" == "UNCONFIGURED" ]] && return 0
+
+    local server="${LICENSE_SERVER_URL:-https://license.coderaft.io}"
+    local response
+    response=$(curl -s --max-time 10 -X POST "${server}/api/licenses/validate" \
+        -H "Content-Type: application/json" \
+        -d "{\"license_key\":\"$current_key\"}" 2>/dev/null) || return 0
+    [[ -z "$response" ]] && return 0
+
+    local latest=""
+    if command -v jq &>/dev/null; then
+        latest=$(echo "$response" | jq -r '.latest_license_key // empty' 2>/dev/null)
+    else
+        latest=$(echo "$response" \
+            | grep -oE '"latest_license_key"[[:space:]]*:[[:space:]]*"[^"]+"' \
+            | head -1 \
+            | sed -E 's/.*"latest_license_key"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
+    fi
+
+    if [[ -n "$latest" && "$latest" != "$current_key" ]]; then
+        cp "$override_file" "${override_file}.bak"
+        # awk : remplace TOUTES les occurrences (entraguard-api + entraguard-worker
+        # peuvent partager la même clé sur plusieurs services).
+        awk -v var="$env_var" -v key="$latest" '
+            {
+                pat = "^[[:space:]]*-?[[:space:]]*" var "="
+                if ($0 ~ pat) {
+                    match($0, /^[[:space:]]*-?[[:space:]]*/)
+                    pad = substr($0, 1, RLENGTH)
+                    print pad var "=" key
+                    next
+                }
+                print
+            }
+        ' "${override_file}.bak" > "$override_file"
+        echo "  🔄 Licence rafraîchie pour ${env_var}"
+        return 1  # signal: restart needed
+    fi
+    return 0
+}
+
+refresh_all_licenses() {
+    echo ""
+    echo "  ▶ Vérification de la dérive de licence..."
+    local restart_needed=0
+    for var in LICENSE_KEY RAVENSCAN_LICENSE_KEY REDFOX_LICENSE_KEY; do
+        refresh_license "$var" || restart_needed=1
+    done
+    if [ "$restart_needed" -eq 0 ]; then
+        echo "  ✅ Toutes les licences sont à jour"
+    else
+        echo "  ⚠️  Au moins une licence a été rafraîchie ; les services seront redémarrés"
+    fi
+    return 0
+}
+
+refresh_all_licenses || true
+
 # ── Invalidation AGRESSIVE du cache d'image Docker ────────────────────────
 # Bug Docker Desktop multi-arch : quand un nouveau manifest list est poussé
 # sur GHCR, le `docker pull` peut dire "Image is up to date" alors que le
