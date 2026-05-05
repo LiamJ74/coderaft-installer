@@ -12,6 +12,50 @@ ADMIN_TOKEN="${ADMIN_TOKEN:-}"
 BACKUP_DIR="${BACKUP_DIR:-./dashboard_data/backups}"
 HEALTHCHECK_RETRIES="${HEALTHCHECK_RETRIES:-30}"
 HEALTHCHECK_DELAY="${HEALTHCHECK_DELAY:-3}"
+INSTALL_DIR="${INSTALL_DIR:-$PWD}"
+
+# ── Auto-discovery du ADMIN_TOKEN ─────────────────────────────────────────
+# Ordre de priorité :
+#   1. Variable d'env $ADMIN_TOKEN (déjà set au-dessus)
+#   2. Fichiers .env (INSTALL_DIR, /etc/coderaft, ~/.coderaft)
+#   3. Token files plain (un seul mot)
+#   4. Docker secret monté
+# Si rien trouvé → continue, le snapshot/notify sont skip avec warning.
+# IMPORTANT : ne JAMAIS echo le token découvert.
+discover_admin_token() {
+    if [ -n "${ADMIN_TOKEN:-}" ]; then
+        printf '%s' "$ADMIN_TOKEN"
+        return 0
+    fi
+    local env_file val
+    for env_file in "$INSTALL_DIR/.env" "/etc/coderaft/.env" "$HOME/.coderaft/.env"; do
+        if [ -f "$env_file" ] && [ -r "$env_file" ]; then
+            val=$(grep -E '^[[:space:]]*ADMIN_TOKEN=' "$env_file" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '[:space:]')
+            if [ -n "$val" ]; then
+                printf '%s' "$val"
+                return 0
+            fi
+        fi
+    done
+    local token_file
+    for token_file in "/etc/coderaft/admin_token" "$HOME/.coderaft/admin_token" "/run/secrets/admin_token"; do
+        if [ -f "$token_file" ] && [ -r "$token_file" ]; then
+            val=$(tr -d '[:space:]' < "$token_file" 2>/dev/null)
+            if [ -n "$val" ]; then
+                printf '%s' "$val"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+if [ -z "$ADMIN_TOKEN" ]; then
+    if discovered=$(discover_admin_token); then
+        ADMIN_TOKEN="$discovered"
+    fi
+    unset discovered
+fi
 
 # ── Détection plateforme Docker ────────────────────────────────────────────
 # Docker Desktop Mac M-series résout strictement linux/arm64/v8 par défaut,
@@ -85,7 +129,8 @@ if [ -n "$ADMIN_TOKEN" ]; then
         && echo "    Snapshot sauvegardé." \
         || echo "    Snapshot échoué (l'auto-snapshot reste actif au prochain deploy)."
 else
-    echo "    Ignoré (définir ADMIN_TOKEN pour activer)."
+    echo "    [warn] ADMIN_TOKEN introuvable — snapshot skipped."
+    echo "    (set ADMIN_TOKEN env, or place token in $INSTALL_DIR/.env, /etc/coderaft/admin_token, ~/.coderaft/admin_token, or /run/secrets/admin_token)"
 fi
 
 # ── Comparaison des digests avant de pull ─────────────────────────────────

@@ -12,6 +12,58 @@ $ADMIN_TOKEN         = if ($env:ADMIN_TOKEN)         { $env:ADMIN_TOKEN }       
 $BACKUP_DIR          = if ($env:BACKUP_DIR)          { $env:BACKUP_DIR }          else { ".\dashboard_data\backups" }
 $HEALTHCHECK_RETRIES = if ($env:HEALTHCHECK_RETRIES) { [int]$env:HEALTHCHECK_RETRIES } else { 30 }
 $HEALTHCHECK_DELAY   = if ($env:HEALTHCHECK_DELAY)   { [int]$env:HEALTHCHECK_DELAY }   else { 3 }
+$INSTALL_DIR         = if ($env:INSTALL_DIR)         { $env:INSTALL_DIR }         else { (Get-Location).Path }
+
+# ── Auto-discovery du ADMIN_TOKEN ─────────────────────────────────────────
+# Ordre de priorité :
+#   1. $env:ADMIN_TOKEN
+#   2. Fichiers .env (INSTALL_DIR, C:\ProgramData\coderaft, ~/.coderaft)
+#   3. Token files plain (un seul mot)
+# Si rien trouvé → continue, snapshot/notify skip avec warning.
+# IMPORTANT : ne JAMAIS écrire le token découvert dans la console.
+function Find-AdminToken {
+    if ($ADMIN_TOKEN) { return $ADMIN_TOKEN }
+
+    $envCandidates = @(
+        (Join-Path $INSTALL_DIR ".env"),
+        "C:\ProgramData\coderaft\.env",
+        (Join-Path $HOME ".coderaft\.env")
+    )
+    foreach ($envFile in $envCandidates) {
+        if ($envFile -and (Test-Path $envFile -PathType Leaf)) {
+            try {
+                $lines = Get-Content -LiteralPath $envFile -ErrorAction Stop
+                foreach ($line in $lines) {
+                    if ($line -match '^\s*ADMIN_TOKEN\s*=\s*(.+)$') {
+                        $val = $Matches[1].Trim().Trim('"').Trim("'")
+                        if ($val) { return $val }
+                    }
+                }
+            } catch { }
+        }
+    }
+
+    $tokenCandidates = @(
+        "C:\ProgramData\coderaft\admin_token",
+        (Join-Path $HOME ".coderaft\admin_token"),
+        "\\.\pipe\coderaft_admin_token"  # placeholder; ignored if absent
+    )
+    foreach ($tokenFile in $tokenCandidates) {
+        if ($tokenFile -and (Test-Path $tokenFile -PathType Leaf)) {
+            try {
+                $val = (Get-Content -LiteralPath $tokenFile -Raw -ErrorAction Stop).Trim()
+                if ($val) { return $val }
+            } catch { }
+        }
+    }
+    return ""
+}
+
+if (-not $ADMIN_TOKEN) {
+    $discovered = Find-AdminToken
+    if ($discovered) { $ADMIN_TOKEN = $discovered }
+    Remove-Variable -Name discovered -ErrorAction SilentlyContinue
+}
 
 # Détection du binaire PowerShell courant (compat PS5 'powershell.exe' + PS7 'pwsh.exe')
 $PSBin = (Get-Process -Id $PID).Path
@@ -112,7 +164,8 @@ if ($ADMIN_TOKEN) {
         Write-Host "    Snapshot échoué (l'auto-snapshot reste actif au prochain deploy)."
     }
 } else {
-    Write-Host "    Ignoré (définir `$env:ADMIN_TOKEN pour activer)."
+    Write-Host "    [warn] ADMIN_TOKEN introuvable — snapshot skipped."
+    Write-Host "    (set `$env:ADMIN_TOKEN, or place token in $INSTALL_DIR\.env, C:\ProgramData\coderaft\admin_token, ou ~/.coderaft/admin_token)"
 }
 
 # ── Pull et récréation ────────────────────────────────────────────────────
