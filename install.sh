@@ -168,9 +168,35 @@ cat > docker-compose.yml << 'COMPOSE'
 # Products are deployed by the dashboard after license activation.
 
 services:
+  # Caddy local HTTPS reverse proxy.
+  # Terminates TLS using mkcert-generated certs (trusted locally) and forwards
+  # to the nginx SPA inside the `dashboard` container. Falls back to plain
+  # HTTP on :3000 if no certs are mounted (compat retrograde).
+  caddy:
+    image: caddy:2-alpine
+    depends_on:
+      dashboard: { condition: service_started }
+    ports:
+      - "127.0.0.1:443:443"
+      - "127.0.0.1:80:80"
+    volumes:
+      - ./caddy_certs:/certs:ro
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:2019/config/", "||", "exit", "0"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+
   dashboard:
     image: ghcr.io/liamj74/coderaft-dashboard:latest
     ports:
+      # Plain HTTP kept on 3000 (loopback only) for fallback when caddy is off
+      # and for the dashboard-api healthchecks/internal helpers.
       - "127.0.0.1:3000:3000"
     depends_on:
       postgres: { condition: service_healthy }
@@ -242,14 +268,172 @@ services:
 volumes:
   postgres_data:
   dashboard_data:
+  caddy_data:
+  caddy_config:
 COMPOSE
+
+# ── Caddyfile (local HTTPS) ──────────────────────────────────────────────────
+# If mkcert-generated certs exist in ./caddy_certs, Caddy will serve HTTPS
+# on https://coderaft.local (trusted, no browser warning). Otherwise it
+# silently no-ops and the user keeps using http://localhost:3000.
+if [ ! -f Caddyfile ]; then
+    cat > Caddyfile << 'CADDY'
+{
+    # Disable Caddy's automatic public ACME issuance — we use mkcert for local trust.
+    auto_https off
+    admin off
+}
+
+# Local HTTPS via mkcert. Add to /etc/hosts:
+#   127.0.0.1 coderaft.local entraguard.coderaft.local ravenscan.coderaft.local redfox.coderaft.local
+(coderaft_tls) {
+    tls /certs/coderaft.local.pem /certs/coderaft.local-key.pem
+}
+
+https://coderaft.local, https://*.coderaft.local {
+    import coderaft_tls
+    reverse_proxy dashboard:3000 {
+        header_up X-Forwarded-Proto https
+        header_up X-Forwarded-Host {host}
+    }
+}
+
+# HTTP → HTTPS redirect for the same hosts
+http://coderaft.local, http://*.coderaft.local {
+    redir https://{host}{uri} permanent
+}
+
+# Fallback: anything else (IP access, localhost) stays on plain HTTP and
+# proxies to the dashboard. This keeps `http://localhost:3000` working
+# transparently and avoids breaking existing flows.
+:80 {
+    reverse_proxy dashboard:3000
+}
+CADDY
+    echo "  ✓ Caddyfile generated"
+fi
+
+# ── mkcert local HTTPS setup ────────────────────────────────────────────────
+# We generate a locally-trusted cert for coderaft.local + wildcard. mkcert
+# installs a root CA into the OS / browser trust stores (one-time per machine).
+# Failure is non-fatal: the platform stays usable on http://localhost:3000.
+setup_local_https() {
+    if [ "${CODERAFT_SKIP_HTTPS:-0}" = "1" ]; then
+        echo "  CODERAFT_SKIP_HTTPS=1 — skipping local HTTPS setup"
+        return 0
+    fi
+
+    mkdir -p caddy_certs
+
+    # Reuse certs if already present and < 80 days old (mkcert default 825d, we
+    # rotate generously well before expiry).
+    if [ -f caddy_certs/coderaft.local.pem ] && [ -f caddy_certs/coderaft.local-key.pem ]; then
+        if find caddy_certs/coderaft.local.pem -mtime -80 2>/dev/null | grep -q .; then
+            echo "  ✓ Local HTTPS certs already present (caddy_certs/)"
+            return 0
+        fi
+        echo "  Local HTTPS certs older than 80 days — regenerating"
+    fi
+
+    if ! command -v mkcert &>/dev/null; then
+        echo "  mkcert not found."
+        case "${CODERAFT_OS}" in
+            macos)
+                if command -v brew &>/dev/null; then
+                    echo "  Installing mkcert via Homebrew (brew install mkcert nss)…"
+                    brew install mkcert nss >/dev/null 2>&1 || {
+                        echo "  ⚠ brew install mkcert failed — fallback to http://localhost:3000"
+                        return 1
+                    }
+                else
+                    echo "  ⚠ Homebrew not installed — install mkcert manually:"
+                    echo "      https://github.com/FiloSottile/mkcert#installation"
+                    echo "    Continuing in HTTP-only mode (http://localhost:3000)."
+                    return 1
+                fi
+                ;;
+            linux)
+                if command -v apt-get &>/dev/null; then
+                    echo "  Installing mkcert via apt…"
+                    sudo apt-get update -qq >/dev/null 2>&1 || true
+                    sudo apt-get install -y libnss3-tools mkcert >/dev/null 2>&1 || {
+                        echo "  ⚠ apt install mkcert failed — fallback to http://localhost:3000"
+                        return 1
+                    }
+                else
+                    echo "  ⚠ Auto-install mkcert only supported via apt — install manually:"
+                    echo "      https://github.com/FiloSottile/mkcert#installation"
+                    echo "    Continuing in HTTP-only mode (http://localhost:3000)."
+                    return 1
+                fi
+                ;;
+            *)
+                echo "  ⚠ Unsupported OS for mkcert auto-install — HTTP-only mode."
+                return 1
+                ;;
+        esac
+    fi
+
+    echo "  Installing mkcert local CA (one-time, may prompt for sudo)…"
+    mkcert -install >/dev/null 2>&1 || {
+        echo "  ⚠ mkcert -install failed — local HTTPS will not be trusted."
+    }
+
+    echo "  Generating local cert for coderaft.local…"
+    mkcert \
+        -cert-file caddy_certs/coderaft.local.pem \
+        -key-file  caddy_certs/coderaft.local-key.pem \
+        coderaft.local "*.coderaft.local" localhost 127.0.0.1 ::1 >/dev/null 2>&1 || {
+        echo "  ⚠ mkcert cert generation failed — fallback to http://localhost:3000"
+        rm -f caddy_certs/coderaft.local.pem caddy_certs/coderaft.local-key.pem
+        return 1
+    }
+    chmod 600 caddy_certs/coderaft.local-key.pem
+    echo "  ✓ Local HTTPS cert generated (valid 825d)"
+}
+
+# ── /etc/hosts entries ──────────────────────────────────────────────────────
+# Best-effort: add coderaft.local and product subdomains. Skipped if already
+# present or if sudo is unavailable.
+ensure_hosts_entry() {
+    local hosts_file="/etc/hosts"
+    local marker="# coderaft-platform"
+    local entry="127.0.0.1 coderaft.local entraguard.coderaft.local ravenscan.coderaft.local redfox.coderaft.local ${marker}"
+
+    if grep -q "coderaft.local" "$hosts_file" 2>/dev/null; then
+        echo "  ✓ /etc/hosts already contains coderaft.local"
+        return 0
+    fi
+
+    if [ "${CODERAFT_SKIP_HOSTS:-0}" = "1" ]; then
+        echo "  CODERAFT_SKIP_HOSTS=1 — skipping /etc/hosts update"
+        return 0
+    fi
+
+    echo "  Adding coderaft.local entries to /etc/hosts (sudo required)…"
+    if echo "$entry" | sudo tee -a "$hosts_file" >/dev/null 2>&1; then
+        echo "  ✓ /etc/hosts updated"
+    else
+        echo "  ⚠ Could not update /etc/hosts — add manually:"
+        echo "      $entry"
+    fi
+}
+
+setup_local_https || true
+if [ -f caddy_certs/coderaft.local.pem ]; then
+    ensure_hosts_entry || true
+fi
 
 # Helper scripts
 cat > start.sh << 'EOF'
 #!/bin/bash
 echo "Starting CodeRaft..."
 docker compose up -d
-echo "  Dashboard: http://localhost:3000"
+if [ -f caddy_certs/coderaft.local.pem ] && grep -q "coderaft.local" /etc/hosts 2>/dev/null; then
+    echo "  Dashboard: https://coderaft.local"
+else
+    echo "  Dashboard: http://localhost:3000"
+fi
 EOF
 
 cat > stop.sh << 'EOF'
@@ -388,11 +572,16 @@ if [ "${CODERAFT_NEEDS_NATIVE_CAPTURE}" = "1" ] && [ "${SKIP_NATIVE_CAPTURE:-0}"
     echo ""
 fi
 
+DASHBOARD_URL="http://localhost:3000"
+if [ -f caddy_certs/coderaft.local.pem ] && grep -q "coderaft.local" /etc/hosts 2>/dev/null; then
+    DASHBOARD_URL="https://coderaft.local"
+fi
+
 echo ""
 echo "  ╔══════════════════════════════════════════════════════╗"
 echo "  ║            Installation complete!                    ║"
 echo "  ║                                                      ║"
-echo "  ║   Dashboard: http://localhost:3000                   ║"
+printf  "  ║   Dashboard: %-39s ║\n" "$DASHBOARD_URL"
 echo "  ║                                                      ║"
 echo "  ║   Open the dashboard to activate your license        ║"
 echo "  ║   and deploy your products.                          ║"
@@ -401,5 +590,5 @@ echo ""
 echo "  Commands:  ./start.sh  ./stop.sh  ./update.sh  ./rollback.sh"
 echo ""
 
-command -v open &>/dev/null && open http://localhost:3000 2>/dev/null || true
-command -v xdg-open &>/dev/null && xdg-open http://localhost:3000 2>/dev/null || true
+command -v open &>/dev/null && open "$DASHBOARD_URL" 2>/dev/null || true
+command -v xdg-open &>/dev/null && xdg-open "$DASHBOARD_URL" 2>/dev/null || true

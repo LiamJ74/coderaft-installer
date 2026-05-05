@@ -275,6 +275,32 @@ function Update-AllLicenses {
 
 try { Update-AllLicenses } catch { }
 
+# ── Renew local HTTPS certs if older than 80 days ─────────────────────────
+# Preserve user-provided certs untouched. Only auto-renew the ones we
+# generated (mkcert) before they hit mkcert's 825d expiry. Failure is
+# non-fatal — the dashboard remains reachable on http://localhost:3000.
+function Update-LocalHttpsCerts {
+    $cert = Join-Path $INSTALL_DIR "caddy_certs\coderaft.local.pem"
+    $key  = Join-Path $INSTALL_DIR "caddy_certs\coderaft.local-key.pem"
+    if (-not (Test-Path $cert) -or -not (Test-Path $key)) { return }
+    $age = (Get-Date) - (Get-Item $cert).LastWriteTime
+    if ($age.TotalDays -lt 80) { return }
+    if (-not (Get-Command mkcert -ErrorAction SilentlyContinue)) {
+        Write-Host "  ⚠ mkcert absent — cannot renew local HTTPS certs (still valid until mkcert default 825d)."
+        return
+    }
+    Write-Host "  Renewing local HTTPS cert (>80d old)…"
+    try {
+        & mkcert -cert-file $cert -key-file $key `
+            "coderaft.local" "*.coderaft.local" "localhost" "127.0.0.1" "::1" *> $null
+        Write-Host "  ✓ Local HTTPS cert renewed"
+    } catch {
+        Write-Host "  ⚠ Cert renewal failed — keeping previous cert"
+    }
+}
+
+try { Update-LocalHttpsCerts } catch { }
+
 # ── Invalidation AGRESSIVE du cache d'image Docker ────────────────────────
 # Bug Docker Desktop multi-arch : `docker pull` peut dire "Image is up to date"
 # alors que le digest local et distant diffèrent (cache de résolution

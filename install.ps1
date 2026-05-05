@@ -112,6 +112,25 @@ $Compose = @'
 # Products are deployed by the dashboard after license activation.
 
 services:
+  # Caddy local HTTPS reverse proxy.
+  # Terminates TLS using mkcert-generated certs (trusted locally) and forwards
+  # to the nginx SPA inside the `dashboard` container. Falls back to plain
+  # HTTP on :3000 if no certs are mounted (compat retrograde).
+  caddy:
+    image: caddy:2-alpine
+    depends_on:
+      dashboard: { condition: service_started }
+    ports:
+      - "127.0.0.1:443:443"
+      - "127.0.0.1:80:80"
+    volumes:
+      - ./caddy_certs:/certs:ro
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+
   dashboard:
     image: ghcr.io/liamj74/coderaft-dashboard:latest
     ports:
@@ -186,15 +205,164 @@ services:
 volumes:
   postgres_data:
   dashboard_data:
+  caddy_data:
+  caddy_config:
 '@
 [System.IO.File]::WriteAllText("$(Get-Location)\docker-compose.yml", $Compose, [System.Text.UTF8Encoding]::new($false))
+
+# ── Caddyfile (local HTTPS) ──────────────────────────────────────────────────
+$Caddyfile = @'
+{
+    auto_https off
+    admin off
+}
+
+(coderaft_tls) {
+    tls /certs/coderaft.local.pem /certs/coderaft.local-key.pem
+}
+
+https://coderaft.local, https://*.coderaft.local {
+    import coderaft_tls
+    reverse_proxy dashboard:3000 {
+        header_up X-Forwarded-Proto https
+        header_up X-Forwarded-Host {host}
+    }
+}
+
+http://coderaft.local, http://*.coderaft.local {
+    redir https://{host}{uri} permanent
+}
+
+:80 {
+    reverse_proxy dashboard:3000
+}
+'@
+if (-not (Test-Path "$(Get-Location)\Caddyfile")) {
+    [System.IO.File]::WriteAllText("$(Get-Location)\Caddyfile", $Caddyfile, [System.Text.UTF8Encoding]::new($false))
+    Write-Host "  ✓ Caddyfile generated"
+}
+
+# ── Local HTTPS via mkcert ───────────────────────────────────────────────────
+function Setup-LocalHttps {
+    if ($env:CODERAFT_SKIP_HTTPS -eq "1") {
+        Write-Host "  CODERAFT_SKIP_HTTPS=1 — skipping local HTTPS setup"
+        return $false
+    }
+
+    New-Item -ItemType Directory -Force -Path "caddy_certs" | Out-Null
+
+    $certPath = "caddy_certs\coderaft.local.pem"
+    $keyPath  = "caddy_certs\coderaft.local-key.pem"
+    if ((Test-Path $certPath) -and (Test-Path $keyPath)) {
+        $age = (Get-Date) - (Get-Item $certPath).LastWriteTime
+        if ($age.TotalDays -lt 80) {
+            Write-Host "  ✓ Local HTTPS certs already present (caddy_certs\)" -ForegroundColor Green
+            return $true
+        }
+        Write-Host "  Local HTTPS certs older than 80 days — regenerating"
+    }
+
+    if (-not (Get-Command mkcert -ErrorAction SilentlyContinue)) {
+        Write-Host "  mkcert not found."
+        if (Get-Command choco -ErrorAction SilentlyContinue) {
+            Write-Host "  Installing mkcert via Chocolatey (choco install mkcert)…"
+            try {
+                choco install mkcert -y --no-progress *> $null
+            } catch {
+                Write-Host "  ⚠ choco install mkcert failed — fallback to http://localhost:3000" -ForegroundColor Yellow
+                return $false
+            }
+        } elseif (Get-Command scoop -ErrorAction SilentlyContinue) {
+            Write-Host "  Installing mkcert via Scoop (scoop install mkcert)…"
+            try {
+                scoop install mkcert *> $null
+            } catch {
+                Write-Host "  ⚠ scoop install mkcert failed — fallback to http://localhost:3000" -ForegroundColor Yellow
+                return $false
+            }
+        } else {
+            Write-Host "  ⚠ Neither Chocolatey nor Scoop found — install mkcert manually:" -ForegroundColor Yellow
+            Write-Host "      https://github.com/FiloSottile/mkcert#installation"
+            Write-Host "    Continuing in HTTP-only mode (http://localhost:3000)."
+            return $false
+        }
+    }
+
+    Write-Host "  Installing mkcert local CA (one-time)…"
+    try {
+        & mkcert -install *> $null
+    } catch {
+        Write-Host "  ⚠ mkcert -install failed — local HTTPS will not be trusted." -ForegroundColor Yellow
+    }
+
+    Write-Host "  Generating local cert for coderaft.local…"
+    try {
+        & mkcert -cert-file $certPath -key-file $keyPath `
+            "coderaft.local" "*.coderaft.local" "localhost" "127.0.0.1" "::1" *> $null
+    } catch {
+        Write-Host "  ⚠ mkcert cert generation failed — fallback to http://localhost:3000" -ForegroundColor Yellow
+        Remove-Item -ErrorAction SilentlyContinue $certPath, $keyPath
+        return $false
+    }
+    Write-Host "  ✓ Local HTTPS cert generated (valid 825d)" -ForegroundColor Green
+    return $true
+}
+
+# ── hosts file entries ──────────────────────────────────────────────────────
+function Ensure-HostsEntry {
+    $hostsFile = "$env:WINDIR\System32\drivers\etc\hosts"
+    $marker    = "# coderaft-platform"
+    $entry     = "127.0.0.1 coderaft.local entraguard.coderaft.local ravenscan.coderaft.local redfox.coderaft.local $marker"
+
+    if (Test-Path $hostsFile) {
+        $existing = Get-Content $hostsFile -ErrorAction SilentlyContinue
+        if ($existing -match "coderaft\.local") {
+            Write-Host "  ✓ hosts file already contains coderaft.local"
+            return
+        }
+    }
+
+    if ($env:CODERAFT_SKIP_HOSTS -eq "1") {
+        Write-Host "  CODERAFT_SKIP_HOSTS=1 — skipping hosts update"
+        return
+    }
+
+    $isAdmin = ([Security.Principal.WindowsPrincipal] `
+        [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator)
+
+    if ($isAdmin) {
+        try {
+            Add-Content -Path $hostsFile -Value $entry -ErrorAction Stop
+            Write-Host "  ✓ hosts file updated"
+        } catch {
+            Write-Host "  ⚠ Could not update hosts file: $_" -ForegroundColor Yellow
+            Write-Host "    Add manually to ${hostsFile}:"
+            Write-Host "      $entry"
+        }
+    } else {
+        Write-Host "  ⚠ Not running as Administrator — cannot update hosts file." -ForegroundColor Yellow
+        Write-Host "    Add the following line to ${hostsFile} (run as admin):"
+        Write-Host "      $entry"
+    }
+}
+
+$httpsReady = Setup-LocalHttps
+if ($httpsReady) {
+    Ensure-HostsEntry
+}
 
 # Helper scripts
 Set-Content -Path 'start.ps1' -Value @'
 Write-Host "Starting CodeRaft..."
 docker compose up -d
-Write-Host "  Dashboard: http://localhost:3000"
-Start-Process "http://localhost:3000"
+$Url = "http://localhost:3000"
+if ((Test-Path "caddy_certs\coderaft.local.pem") -and `
+    ((Get-Content "$env:WINDIR\System32\drivers\etc\hosts" -ErrorAction SilentlyContinue) -match "coderaft\.local")) {
+    $Url = "https://coderaft.local"
+}
+Write-Host "  Dashboard: $Url"
+Start-Process $Url
 '@ -Encoding UTF8
 
 Set-Content -Path 'stop.ps1' -Value @'
@@ -324,11 +492,17 @@ if ($CoderaftNeedsNativeCapture -and $env:SKIP_NATIVE_CAPTURE -ne "1") {
     Write-Host ""
 }
 
+$DashboardUrl = "http://localhost:3000"
+if ((Test-Path "caddy_certs\coderaft.local.pem") -and `
+    ((Get-Content "$env:WINDIR\System32\drivers\etc\hosts" -ErrorAction SilentlyContinue) -match "coderaft\.local")) {
+    $DashboardUrl = "https://coderaft.local"
+}
+
 Write-Host ""
 Write-Host "  ╔══════════════════════════════════════════════════════╗" -ForegroundColor Green
 Write-Host "  ║            Installation complete!                    ║" -ForegroundColor Green
 Write-Host "  ║                                                      ║" -ForegroundColor Green
-Write-Host "  ║   Dashboard: http://localhost:3000                   ║" -ForegroundColor Green
+Write-Host ("  ║   Dashboard: {0,-39} ║" -f $DashboardUrl) -ForegroundColor Green
 Write-Host "  ║                                                      ║" -ForegroundColor Green
 Write-Host "  ║   Open the dashboard to activate your license        ║" -ForegroundColor Green
 Write-Host "  ║   and deploy your products.                          ║" -ForegroundColor Green
@@ -337,4 +511,4 @@ Write-Host ""
 Write-Host "  Commands:  .\start.ps1  .\stop.ps1  .\update.ps1  .\rollback.ps1"
 Write-Host ""
 
-Start-Process "http://localhost:3000"
+Start-Process $DashboardUrl

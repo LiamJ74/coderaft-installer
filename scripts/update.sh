@@ -275,6 +275,34 @@ refresh_all_licenses() {
 
 refresh_all_licenses || true
 
+# ── Renew local HTTPS certs if older than 80 days ─────────────────────────
+# Preserve user-provided certs untouched. Only auto-renew the ones we
+# generated (mkcert) before they hit mkcert's 825d expiry. Failure is
+# non-fatal — the dashboard remains reachable on http://localhost:3000.
+renew_local_https() {
+    local cert="$INSTALL_DIR/caddy_certs/coderaft.local.pem"
+    local key="$INSTALL_DIR/caddy_certs/coderaft.local-key.pem"
+    [ -f "$cert" ] || return 0
+    [ -f "$key" ]  || return 0
+    if find "$cert" -mtime -80 2>/dev/null | grep -q .; then
+        return 0
+    fi
+    if ! command -v mkcert &>/dev/null; then
+        echo "  ⚠ mkcert absent — cannot renew local HTTPS certs (still valid until mkcert default 825d)."
+        return 0
+    fi
+    echo "  Renewing local HTTPS cert (>80d old)…"
+    mkcert \
+        -cert-file "$cert" \
+        -key-file  "$key" \
+        coderaft.local "*.coderaft.local" localhost 127.0.0.1 ::1 >/dev/null 2>&1 \
+        && chmod 600 "$key" \
+        && echo "  ✓ Local HTTPS cert renewed" \
+        || echo "  ⚠ Cert renewal failed — keeping previous cert"
+}
+
+renew_local_https || true
+
 # ── Invalidation AGRESSIVE du cache d'image Docker ────────────────────────
 # Bug Docker Desktop multi-arch : quand un nouveau manifest list est poussé
 # sur GHCR, le `docker pull` peut dire "Image is up to date" alors que le
