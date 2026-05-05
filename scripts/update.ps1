@@ -56,6 +56,22 @@ function Find-AdminToken {
             } catch { }
         }
     }
+    # 5. Auto-discovery from running dashboard-api container (preferred,
+    #    avoids any manual setup — dashboard-api auto-generates the token
+    #    at boot and persists it to /data/admin_token).
+    try {
+        Push-Location $INSTALL_DIR -ErrorAction SilentlyContinue
+        $services = & docker compose ps --services 2>$null
+        if ($services -match '(?m)^dashboard-api$') {
+            $val = & docker compose exec -T dashboard-api cat /data/admin_token 2>$null
+            if ($val) {
+                $val = ($val -join "`n").Trim()
+                if ($val) { return $val }
+            }
+        }
+    } catch { }
+    finally { Pop-Location -ErrorAction SilentlyContinue }
+    $LASTEXITCODE = 0
     return ""
 }
 

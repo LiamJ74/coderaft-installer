@@ -47,6 +47,16 @@ discover_admin_token() {
             fi
         fi
     done
+    # 5. Auto-discovery from running dashboard-api container (preferred,
+    #    avoids any manual setup — dashboard-api auto-generates the token
+    #    at boot and persists it to /data/admin_token).
+    if (cd "$INSTALL_DIR" 2>/dev/null && docker compose ps --services 2>/dev/null | grep -q '^dashboard-api$'); then
+        val=$(cd "$INSTALL_DIR" && docker compose exec -T dashboard-api cat /data/admin_token 2>/dev/null < /dev/null | tr -d '[:space:]')
+        if [ -n "$val" ]; then
+            printf '%s' "$val"
+            return 0
+        fi
+    fi
     return 1
 }
 
