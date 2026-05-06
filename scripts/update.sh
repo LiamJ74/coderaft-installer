@@ -104,6 +104,39 @@ if [ -z "$CODERAFT_UPDATE_REEXEC" ]; then
     fi
 fi
 
+# ── Self-heal compose YAML ────────────────────────────────────────────────
+# Détecte un docker-compose.override.yml généré par une ancienne version
+# du dashboard-api avec un sérialiseur YAML cassé. Sans ça, tout `docker
+# compose ps/up/down` échoue avec "yaml: line N: ..." et l'oneliner ne
+# peut plus rien faire. Recovery : sauvegarder l'override cassé, pull la
+# dernière dashboard-api, la lancer seule (avec postgres+redis), elle
+# régénère un override propre, puis on continue normalement.
+echo ""
+echo "  Vérification de l'intégrité du compose..."
+if ! docker compose ps >/dev/null 2>&1; then
+    echo "  ⚠ docker-compose.override.yml semble corrompu — auto-recovery..."
+    if [ -f "docker-compose.override.yml" ]; then
+        cp docker-compose.override.yml "docker-compose.override.yml.broken-$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+        rm -f docker-compose.override.yml
+        echo "    ✓ override sauvegardé + supprimé"
+    fi
+    docker pull ghcr.io/liamj74/coderaft-dashboard-api:latest >/dev/null 2>&1 || true
+    if docker compose up -d postgres redis dashboard-api >/dev/null 2>&1; then
+        sleep 6
+        if docker compose ps >/dev/null 2>&1; then
+            echo "    ✓ compose réparé"
+        else
+            echo "  ERREUR : self-heal échoué. Inspectez docker-compose.override.yml manuellement."
+            exit 1
+        fi
+    else
+        echo "  ERREUR : impossible de relancer dashboard-api. Vérifiez Docker Engine."
+        exit 1
+    fi
+else
+    echo "  ✓ compose OK"
+fi
+
 # ── Backup pré-update obligatoire ─────────────────────────────────────────
 # Si pg_dump échoue → on bloque l'update (pas de backup = pas d'update).
 echo ""
