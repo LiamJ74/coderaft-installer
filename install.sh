@@ -40,9 +40,9 @@ esac
 echo "  Detected: ${CODERAFT_OS}/${CODERAFT_ARCH}"
 echo ""
 
-# Force DOCKER_DEFAULT_PLATFORM pour court-circuiter le bug Docker Desktop
-# qui résout strict linux/arm64/v8 ou linux/amd64/v3 et fait échouer le pull
-# sur les manifests qui exposent juste linux/arm64 ou linux/amd64.
+# Force DOCKER_DEFAULT_PLATFORM to work around the Docker Desktop bug that
+# resolves strict linux/arm64/v8 or linux/amd64/v3 and fails the pull on
+# manifests that only expose linux/arm64 or linux/amd64.
 if [ -z "$DOCKER_DEFAULT_PLATFORM" ] && [ "$CODERAFT_ARCH" != "unknown" ]; then
     export DOCKER_DEFAULT_PLATFORM="linux/${CODERAFT_ARCH}"
 fi
