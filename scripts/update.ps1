@@ -167,6 +167,47 @@ if (-not $composeOK) {
     Write-Host "  ✓ compose OK"
 }
 
+# ── Host capture sanity check (Live Capture / Frame Analyzer) ─────────────
+# Mirrors update.sh: when CODERAFT_HOST_OS=windows|macos the Frame Analyzer
+# expects a native daemon on 127.0.0.1:7777. We probe via an alpine curl
+# image (Docker Desktop maps host.docker.internal automatically). Failure is
+# a *warning* — the host may be unreachable during the update window, or
+# the operator may not have run the Setup Wizard's Live Capture step yet.
+Write-Host ""
+Write-Host "  Live Capture sanity check..."
+$hostOsValue = ""
+if (Test-Path ".env") {
+    $envLine = Get-Content ".env" | Where-Object { $_ -match '^\s*CODERAFT_HOST_OS\s*=' } | Select-Object -Last 1
+    if ($envLine) {
+        $hostOsValue = ($envLine -replace '^\s*CODERAFT_HOST_OS\s*=', '').Trim().Trim('"').Trim("'").ToLower()
+    }
+}
+switch ($hostOsValue) {
+    { @("windows", "macos") -contains $_ } {
+        try {
+            & docker run --rm --add-host=host.docker.internal:host-gateway `
+                curlimages/curl:8.10.1 -fsS --connect-timeout 3 --max-time 4 `
+                "http://host.docker.internal:7777/health" 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "  ✓ Native capture daemon reachable (CODERAFT_HOST_OS=$hostOsValue)"
+            } else {
+                Write-Host "  ⚠ CODERAFT_HOST_OS=$hostOsValue but the native daemon is not answering on 127.0.0.1:7777."
+                Write-Host "     Frame Analyzer may show empty captures. Open the dashboard → Setup → Live Capture"
+                Write-Host "     to (re)install the host daemon. Continuing the update."
+            }
+        } catch {
+            Write-Host "  ⚠ Could not probe the native capture daemon ($($_.Exception.Message)). Continuing."
+        }
+        $LASTEXITCODE = 0
+    }
+    { @("linux", "") -contains $_ } {
+        # No-op: Linux uses the in-Docker sidecar; missing var = default behaviour.
+    }
+    default {
+        Write-Host "  ⚠ CODERAFT_HOST_OS='$hostOsValue' is not a recognised value (windows|macos|linux). Ignored."
+    }
+}
+
 # ── Mandatory pre-update backup ───────────────────────────────────────────
 # If pg_dumpall fails → block the update (no backup = no update).
 Write-Host ""

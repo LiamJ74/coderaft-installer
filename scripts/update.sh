@@ -137,6 +137,40 @@ else
     echo "  ✓ compose OK"
 fi
 
+# ── Host capture sanity check (Live Capture / Frame Analyzer) ─────────────
+# When the operator picked native capture (CODERAFT_HOST_OS=windows|macos),
+# Ravenscan expects a host daemon on 127.0.0.1:7777 reachable via
+# host.docker.internal. We probe it from inside an alpine one-shot — if the
+# probe fails we *warn* (never block: the host may simply be powered off
+# during the update window, or the operator may not have run the wizard
+# yet). The user can fix this from the dashboard's Setup → Live Capture tab.
+echo ""
+echo "  Live Capture sanity check..."
+HOST_OS_VALUE=""
+if [ -f .env ]; then
+    HOST_OS_VALUE=$(grep -E '^\s*CODERAFT_HOST_OS\s*=' .env 2>/dev/null | tail -1 | cut -d= -f2 | tr -d '"' | tr -d "'" | tr '[:upper:]' '[:lower:]' | xargs)
+fi
+case "$HOST_OS_VALUE" in
+    windows|macos)
+        # Curl --connect-timeout keeps the probe under 4s on offline hosts.
+        if docker run --rm --add-host=host.docker.internal:host-gateway \
+            curlimages/curl:8.10.1 -fsS --connect-timeout 3 --max-time 4 \
+            "http://host.docker.internal:7777/health" >/dev/null 2>&1; then
+            echo "  ✓ Native capture daemon reachable (CODERAFT_HOST_OS=$HOST_OS_VALUE)"
+        else
+            echo "  ⚠ CODERAFT_HOST_OS=$HOST_OS_VALUE but the native daemon is not answering on 127.0.0.1:7777."
+            echo "     Frame Analyzer may show empty captures. Open the dashboard → Setup → Live Capture"
+            echo "     to (re)install the host daemon. Continuing the update."
+        fi
+        ;;
+    linux|"")
+        # No-op: Linux uses the in-Docker sidecar; missing var = default behaviour.
+        ;;
+    *)
+        echo "  ⚠ CODERAFT_HOST_OS='$HOST_OS_VALUE' is not a recognised value (windows|macos|linux). Ignored."
+        ;;
+esac
+
 # ── Mandatory pre-update backup ───────────────────────────────────────────
 # If pg_dump fails → block the update (no backup = no update).
 echo ""
