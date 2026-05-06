@@ -128,6 +128,45 @@ if (-not $env:CODERAFT_UPDATE_REEXEC) {
     }
 }
 
+# ── Self-heal compose YAML ────────────────────────────────────────────────
+# Détecte un docker-compose.override.yml cassé (générateur YAML buggé) et
+# recovery automatique : backup timestampé, suppression, pull dashboard-api,
+# relance postgres+redis+dashboard-api → l'API régénère un override propre.
+Write-Host ""
+Write-Host "  Vérification de l'intégrité du compose..."
+$composeOK = $false
+try {
+    & docker compose ps 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) { $composeOK = $true }
+} catch { }
+if (-not $composeOK) {
+    Write-Host "  ⚠ docker-compose.override.yml semble corrompu — auto-recovery..."
+    if (Test-Path "docker-compose.override.yml") {
+        $brokenBak = "docker-compose.override.yml.broken-" + (Get-Date -Format "yyyyMMdd_HHmmss")
+        try { Copy-Item "docker-compose.override.yml" $brokenBak -ErrorAction SilentlyContinue } catch { }
+        try { Remove-Item "docker-compose.override.yml" -ErrorAction SilentlyContinue } catch { }
+        Write-Host "    ✓ override sauvegardé + supprimé"
+    }
+    try { & docker pull ghcr.io/liamj74/coderaft-dashboard-api:latest *>$null } catch { }
+    try {
+        & docker compose up -d postgres redis dashboard-api 2>&1 | Out-Null
+        Start-Sleep -Seconds 6
+        & docker compose ps 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "    ✓ compose réparé"
+        } else {
+            Write-Host "  ERREUR : self-heal échoué. Inspectez docker-compose.override.yml manuellement."
+            exit 1
+        }
+    } catch {
+        Write-Host "  ERREUR : impossible de relancer dashboard-api — $($_.Exception.Message)"
+        exit 1
+    }
+    $LASTEXITCODE = 0
+} else {
+    Write-Host "  ✓ compose OK"
+}
+
 # ── Backup pré-update obligatoire ─────────────────────────────────────────
 # Si pg_dumpall échoue → on bloque l'update (pas de backup = pas d'update).
 Write-Host ""
