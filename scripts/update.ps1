@@ -516,7 +516,8 @@ if ((Test-Path $envEnc) -and (Test-Path $envPlain)) {
     if (-not (Test-Path $ageKey) -and (Test-Path "C:\ProgramData\coderaft\age.key")) {
         $ageKey = "C:\ProgramData\coderaft\age.key"
     }
-    $sops = (Get-Command sops -ErrorAction SilentlyContinue)?.Path
+    $sopsCmd = Get-Command sops -ErrorAction SilentlyContinue
+    $sops = if ($sopsCmd) { $sopsCmd.Path } else { $null }
     if (-not (Test-Path $ageKey)) {
         Write-Host "  [!] .env + .env.enc coexist but age key not found at $ageKey" -ForegroundColor Yellow
         Write-Host "      Plaintext .env left in place; investigate before next run." -ForegroundColor Yellow
