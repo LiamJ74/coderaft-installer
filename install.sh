@@ -363,46 +363,52 @@ vault_bootstrap() {
 }
 
 vault_bootstrap_tls() {
-    # Require openssl
-    if ! command -v openssl &>/dev/null; then
-        echo "  ✗ openssl is required for vault mTLS bootstrap but was not found."
-        echo "    Install openssl (brew install openssl on macOS, apt-get install"
-        echo "    openssl on Debian/Ubuntu) then re-run the installer."
-        exit 1
+    # B12 fix: correct cert filenames: vault.crt / vault.key / client-ca.crt
+    # B11 fix: correct ACL field names: name, cert_san, permissions (NOT san/role/allow)
+    # B7  fix: server cert SAN includes localhost + 127.0.0.1 for mTLS hostname verification
+    # Prefer host openssl if available; otherwise use an alpine container (no host dep).
+    if command -v openssl &>/dev/null; then
+        _vault_bootstrap_tls_host
+    else
+        _vault_bootstrap_tls_alpine
     fi
+}
 
-    # Skip if CA already exists (re-run safety)
-    if [ -f vault-tls/ca.crt ] && [ -f vault-tls/ca.key ]; then
+_vault_bootstrap_tls_host() {
+    # Skip if already generated (re-run safety)
+    if [ -f vault-tls/client-ca.crt ] && [ -f vault-tls/vault.crt ]; then
         echo "  ✓ Vault mTLS PKI already exists — skipping cert generation"
         return 0
     fi
 
-    echo "  Generating vault mTLS PKI..."
+    echo "  Generating vault mTLS PKI (host openssl)..."
     chmod 700 vault-tls
 
-    # CA
+    # CA (client-ca.crt — not ca.crt, the vault config.yaml expects this exact name)
     openssl req -x509 -newkey rsa:4096 -days 3650 -nodes -sha256 \
-        -keyout vault-tls/ca.key \
-        -out vault-tls/ca.crt \
+        -keyout vault-tls/client-ca.key \
+        -out vault-tls/client-ca.crt \
         -subj "/CN=coderaft-vault-ca" \
         -addext "basicConstraints=critical,CA:TRUE" \
         2>/dev/null
-    chmod 600 vault-tls/ca.key vault-tls/ca.crt
+    chmod 600 vault-tls/client-ca.key vault-tls/client-ca.crt
 
-    # Server cert (SAN = coderaft-vault)
+    # Server cert — SAN must include coderaft-vault, localhost, 127.0.0.1
+    # so the curlimages/curl sidecar can verify --cacert client-ca.crt against
+    # https://coderaft-vault:8200 (hostname check fails without the DNS SAN).
     openssl req -newkey rsa:2048 -nodes -sha256 \
-        -keyout vault-tls/server.key \
-        -out vault-tls/server.csr \
+        -keyout vault-tls/vault.key \
+        -out vault-tls/vault.csr \
         -subj "/CN=coderaft-vault" \
         2>/dev/null
     openssl x509 -req -days 3650 -sha256 \
-        -in vault-tls/server.csr \
-        -CA vault-tls/ca.crt -CAkey vault-tls/ca.key -CAcreateserial \
-        -out vault-tls/server.crt \
-        -extfile <(printf "subjectAltName=DNS:coderaft-vault\nbasicConstraints=CA:FALSE") \
+        -in vault-tls/vault.csr \
+        -CA vault-tls/client-ca.crt -CAkey vault-tls/client-ca.key -CAcreateserial \
+        -out vault-tls/vault.crt \
+        -extfile <(printf "subjectAltName=DNS:coderaft-vault,DNS:localhost,IP:127.0.0.1\nbasicConstraints=CA:FALSE") \
         2>/dev/null
-    rm -f vault-tls/server.csr
-    chmod 600 vault-tls/server.crt vault-tls/server.key
+    rm -f vault-tls/vault.csr
+    chmod 600 vault-tls/vault.crt vault-tls/vault.key
 
     # Per-product client certs
     _vault_client_cert "dashboard-api"  "dashboard-api.coderaft.local"
@@ -410,39 +416,120 @@ vault_bootstrap_tls() {
     _vault_client_cert "ravenscan"      "ravenscan.coderaft.local"
     _vault_client_cert "redfox"         "redfox.coderaft.local"
 
-    # ACL config
+    _vault_write_config
+}
+
+_vault_bootstrap_tls_alpine() {
+    # Fallback: run openssl inside an alpine one-shot container (no host dep).
+    # Mirrors the approach in update.ps1 4c.2.
+    if [ -f vault-tls/client-ca.crt ] && [ -f vault-tls/vault.crt ]; then
+        echo "  ✓ Vault mTLS PKI already exists — skipping cert generation"
+        return 0
+    fi
+
+    echo "  Generating vault mTLS PKI (alpine container — host openssl absent)..."
+    chmod 700 vault-tls
+
+    local openssl_script
+    openssl_script=$(cat <<'SCRIPT'
+set -e
+apk add --no-cache openssl >/dev/null
+cd /work
+openssl req -x509 -newkey rsa:4096 -days 3650 -nodes -sha256 \
+    -keyout client-ca.key -out client-ca.crt \
+    -subj "/CN=coderaft-vault-ca" \
+    -addext "basicConstraints=critical,CA:TRUE" 2>/dev/null
+openssl req -newkey rsa:2048 -nodes -sha256 \
+    -keyout vault.key -out vault.csr \
+    -subj "/CN=coderaft-vault" 2>/dev/null
+cat > /tmp/server.ext <<EOF
+subjectAltName=DNS:coderaft-vault,DNS:localhost,IP:127.0.0.1
+basicConstraints=CA:FALSE
+EOF
+openssl x509 -req -days 3650 -sha256 \
+    -in vault.csr -CA client-ca.crt -CAkey client-ca.key -CAcreateserial \
+    -out vault.crt -extfile /tmp/server.ext 2>/dev/null
+rm -f vault.csr
+for pair in "dashboard-api:dashboard-api.coderaft.local" \
+            "entraguard:entraguard.coderaft.local" \
+            "ravenscan:ravenscan.coderaft.local" \
+            "redfox:redfox.coderaft.local"; do
+    name="${pair%%:*}"
+    san="${pair##*:}"
+    openssl req -newkey rsa:2048 -nodes -sha256 \
+        -keyout "${name}-client.key" -out "${name}-client.csr" \
+        -subj "/CN=${san}" 2>/dev/null
+    cat > /tmp/client.ext <<EOF
+subjectAltName=DNS:${san}
+basicConstraints=CA:FALSE
+EOF
+    openssl x509 -req -days 3650 -sha256 \
+        -in "${name}-client.csr" -CA client-ca.crt -CAkey client-ca.key -CAcreateserial \
+        -out "${name}-client.crt" -extfile /tmp/client.ext 2>/dev/null
+    rm -f "${name}-client.csr"
+done
+chmod 600 *.key 2>/dev/null || true
+SCRIPT
+)
+
+    local abs_tls_dir
+    abs_tls_dir="$(cd vault-tls && pwd)"
+    echo "$openssl_script" | docker run --rm -i \
+        -v "${abs_tls_dir}:/work" \
+        alpine:3.20 sh 2>&1
+
+    if [ ! -f vault-tls/vault.crt ]; then
+        echo "  ✗ Alpine openssl cert generation failed" >&2
+        exit 1
+    fi
+
+    _vault_write_config
+}
+
+_vault_write_config() {
+    # vault config.yaml — references /tls/vault.crt (not server.crt) and /tls/client-ca.crt (not ca.crt)
+    cat > vault-config/config.yaml << 'CFGEOF'
+server:
+  addr: "0.0.0.0:8200"
+  tls_cert: "/tls/vault.crt"
+  tls_key:  "/tls/vault.key"
+  client_ca: "/tls/client-ca.crt"
+storage:
+  path: "/data/vault.db"
+keys:
+  age_key_path: "/keys/age.key"
+audit:
+  log_path: "/data/audit.log"
+acl_path: "/etc/coderaft-vault/acl.yaml"
+CFGEOF
+    chmod 600 vault-config/config.yaml
+
+    # B11 fix: correct ACL field names: name, cert_san, permissions
     cat > vault-config/acl.yaml << 'ACLEOF'
 # coderaft-vault ACL — controls which client cert SAN can access which secrets.
-# Format: each client entry lists the SANs allowed and the secret-name prefixes
-# they may read/write. dashboard-api is admin (may list all).
+# Field names: name, cert_san, permissions (NOT san/role/allow).
 clients:
-  - san: "dashboard-api.coderaft.local"
-    role: admin
-    allow: ["*"]
+  - name: dashboard-api
+    cert_san: "dashboard-api.coderaft.local"
+    permissions: ["*"]
 
-  - san: "entraguard.coderaft.local"
-    role: product
-    allow:
-      - "azure_*"
-      - "license_key"
-      - "entraguard_*"
+  - name: entraguard
+    cert_san: "entraguard.coderaft.local"
+    permissions: ["read:azure_*","read:license_key","read:entraguard_*"]
 
-  - san: "ravenscan.coderaft.local"
-    role: product
-    allow:
-      - "ravenscan_*"
-      - "neo4j_*"
+  - name: ravenscan
+    cert_san: "ravenscan.coderaft.local"
+    permissions: ["read:ravenscan_*","read:neo4j_*","read:license_key"]
 
-  - san: "redfox.coderaft.local"
-    role: product
-    allow:
-      - "redfox_*"
+  - name: redfox
+    cert_san: "redfox.coderaft.local"
+    permissions: ["read:redfox_*","read:license_key"]
 ACLEOF
     chmod 600 vault-config/acl.yaml
 
-    echo "  ✓ Vault mTLS PKI generated (CA + server cert + 4 client certs)"
-    echo "    CA:      vault-tls/ca.crt"
-    echo "    Server:  vault-tls/server.{crt,key}"
+    echo "  ✓ Vault mTLS PKI generated"
+    echo "    CA:      vault-tls/client-ca.crt"
+    echo "    Server:  vault-tls/vault.{crt,key}"
     echo "    Clients: vault-tls/{dashboard-api,entraguard,ravenscan,redfox}-client.{crt,key}"
 }
 
@@ -455,7 +542,7 @@ _vault_client_cert() {
         2>/dev/null
     openssl x509 -req -days 3650 -sha256 \
         -in "vault-tls/${name}-client.csr" \
-        -CA vault-tls/ca.crt -CAkey vault-tls/ca.key -CAcreateserial \
+        -CA vault-tls/client-ca.crt -CAkey vault-tls/client-ca.key -CAcreateserial \
         -out "vault-tls/${name}-client.crt" \
         -extfile <(printf "subjectAltName=DNS:%s\nbasicConstraints=CA:FALSE" "$san") \
         2>/dev/null
@@ -556,7 +643,8 @@ services:
       - SOPS_AGE_KEY_FILE=/keys/age.key
       # Vault integration (Phase 0.5 — products read secrets from the vault)
       - CODERAFT_VAULT_URL=https://coderaft-vault:8200
-      - CODERAFT_VAULT_TLS_CA=/vault-tls/ca.crt
+      # B12 fix: correct vault TLS filenames (client-ca.crt, not ca.crt)
+      - CODERAFT_VAULT_TLS_CA=/vault-tls/client-ca.crt
       - CODERAFT_VAULT_TLS_CERT=/vault-tls/dashboard-api-client.crt
       - CODERAFT_VAULT_TLS_KEY=/vault-tls/dashboard-api-client.key
     volumes:
@@ -566,8 +654,8 @@ services:
       # Age private key for SOPS decryption (legacy — kept for backward compat).
       # The installer creates the host file at .coderaft-age.key on first run.
       - ./.coderaft-age.key:/keys/age.key:ro
-      # Vault mTLS client cert for dashboard-api
-      - ./vault-tls/ca.crt:/vault-tls/ca.crt:ro
+      # Vault mTLS client cert for dashboard-api (B12: correct filenames)
+      - ./vault-tls/client-ca.crt:/vault-tls/client-ca.crt:ro
       - ./vault-tls/dashboard-api-client.crt:/vault-tls/dashboard-api-client.crt:ro
       - ./vault-tls/dashboard-api-client.key:/vault-tls/dashboard-api-client.key:ro
     security_opt: [no-new-privileges:true]
@@ -579,6 +667,12 @@ services:
   # Phase 0.5: deployed from fresh install; existing installs migrate on update.
   coderaft-vault:
     image: ghcr.io/liamj74/coderaft-vault:latest
+    # B8 fix: Run as root so the container can write to the Docker-managed
+    # /data volume (SQLite + audit log) and read /tls/*.key files (mode 0600).
+    # Effective security stays equivalent to nonroot because we drop ALL
+    # capabilities AND set no-new-privileges. This is a standard hardening
+    # pattern (root-with-no-caps), not a security regression.
+    user: "0:0"
     networks:
       - coderaft-vault-net
     volumes:
@@ -868,6 +962,100 @@ for img in \
     verify_coderaft_image "${img}"
 done
 
+# ── Vault unseal helper (fresh install) ──────────────────────────────────────
+# B6/B7 fix: vault image is distroless — no shell, no wget. NEVER use
+# `docker compose exec coderaft-vault sh -c`. Use a curlimages/curl sidecar
+# on the coderaft-vault-net network with the dashboard-api client cert.
+# B10 fix: vault starts sealed — must POST /v1/unseal after container is up.
+vault_unseal_fresh() {
+    local vault_age_key="vault-keys/age.key"
+    if [ ! -f "$vault_age_key" ]; then
+        echo "  ✗ vault-keys/age.key not found — cannot unseal" >&2
+        return 1
+    fi
+
+    # Detect compose project name (determines Docker network name)
+    local vault_project
+    vault_project=$(docker inspect coderaft-coderaft-vault-1 \
+        --format '{{ index .Config.Labels "com.docker.compose.project" }}' 2>/dev/null || true)
+    [ -z "$vault_project" ] && vault_project="coderaft"
+    local vault_network="${vault_project}_coderaft-vault-net"
+
+    local abs_tls_dir
+    abs_tls_dir="$(cd vault-tls && pwd)"
+
+    _vault_curl_fresh() {
+        local method="$1" path="$2" body="${3:-}"
+        local curl_args=(
+            "run" "--rm"
+            "--user" "0:0"
+            "--network" "$vault_network"
+            "-v" "${abs_tls_dir}:/tls:ro"
+            "curlimages/curl:latest"
+            "--cert" "/tls/dashboard-api-client.crt"
+            "--key"  "/tls/dashboard-api-client.key"
+            "--cacert" "/tls/client-ca.crt"
+            "-sS" "-X" "$method"
+            "https://coderaft-vault:8200${path}"
+        )
+        if [ -n "$body" ]; then
+            curl_args+=("-H" "Content-Type: application/json" "-d" "$body")
+        fi
+        docker "${curl_args[@]}" 2>&1
+    }
+
+    echo "  Waiting for vault to be reachable..."
+    local vault_reachable=0
+    local last_sealed=""
+    local i
+    for i in $(seq 1 20); do
+        local health
+        health=$(_vault_curl_fresh "GET" "/v1/health" 2>/dev/null || true)
+        if echo "$health" | grep -q '"sealed":'; then
+            vault_reachable=1
+            if echo "$health" | grep -q '"sealed":true'; then
+                last_sealed="true"
+            else
+                last_sealed="false"
+            fi
+            break
+        fi
+        [ $((i % 3)) -eq 0 ] && echo "    ... still waiting (attempt $i/20)"
+        sleep 3
+    done
+
+    if [ "$vault_reachable" = "0" ]; then
+        echo "  ✗ coderaft-vault did not respond to TLS probes" >&2
+        return 1
+    fi
+
+    # B10 fix: unseal if sealed (1 share = base64-encoded age key file bytes)
+    if [ "$last_sealed" = "true" ]; then
+        echo "  Vault is sealed — sending unseal request..."
+        local share_b64
+        share_b64=$(base64 < "$vault_age_key" | tr -d '\n')
+        local unseal_body="{\"shares\":[\"${share_b64}\"]}"
+        local unseal_resp
+        unseal_resp=$(_vault_curl_fresh "POST" "/v1/unseal" "$unseal_body" 2>/dev/null || true)
+        if ! echo "$unseal_resp" | grep -qE '"ok"\s*:\s*true|"sealed"\s*:\s*false'; then
+            echo "  Unseal response: $unseal_resp" >&2
+            echo "  ✗ Vault unseal failed" >&2
+            return 1
+        fi
+        echo "  ✓ Vault unsealed"
+    fi
+
+    # Final health check — must say sealed:false
+    local final_health
+    final_health=$(_vault_curl_fresh "GET" "/v1/health" 2>/dev/null || true)
+    if ! echo "$final_health" | grep -q '"sealed":false'; then
+        echo "  Final health: $final_health" >&2
+        echo "  ✗ Vault still sealed after unseal call" >&2
+        return 1
+    fi
+    echo "  ✓ coderaft-vault is healthy (sealed:false)"
+}
+
 if [ "${CODERAFT_TEST_MODE:-0}" = "1" ]; then
     echo ""
     echo "  [CODERAFT_TEST_MODE] Skipping docker compose pull and up"
@@ -879,7 +1067,19 @@ else
 
     echo ""
     echo "  Starting dashboard..."
+    # B9 fix: explicit stop+rm for vault container before up so fresh certs
+    # are picked up from bind mounts (--force-recreate alone can leave a
+    # Running container with stale certs in Docker Desktop memory).
+    docker compose stop coderaft-vault 2>/dev/null || true
+    docker compose rm -f coderaft-vault 2>/dev/null || true
     docker compose up -d
+
+    echo ""
+    echo "  Unsealing vault..."
+    vault_unseal_fresh || {
+        echo "  ⚠ Vault unseal failed — dashboard may show 'vault unavailable'."
+        echo "    Re-run the installer or run: docker compose restart coderaft-vault"
+    }
 
     echo ""
     echo "  Waiting for dashboard to be ready..."
