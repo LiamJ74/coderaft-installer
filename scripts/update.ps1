@@ -330,20 +330,37 @@ function Update-License {
         [Parameter(Mandatory=$true)] [string] $EnvVar,
         [Parameter(Mandatory=$true)] [string] $OverrideFile
     )
-    if (-not (Test-Path $OverrideFile -PathType Leaf)) { return $false }
 
-    $content = Get-Content -LiteralPath $OverrideFile -ErrorAction SilentlyContinue
-    if (-not $content) { return $false }
+    $content = if (Test-Path $OverrideFile -PathType Leaf) {
+        Get-Content -LiteralPath $OverrideFile -ErrorAction SilentlyContinue
+    } else { @() }
 
-    # Look for the first occurrence of "<EnvVar>=<value>" (with or without YAML dash).
-    $regex = "^\s*-?\s*$([Regex]::Escape($EnvVar))=(.+)$"
+    # Read current key from .env first (source of truth read by
+    # dashboard-api), fall back to override.yml. Ensures we always validate
+    # the OLDEST stale key still on disk and propagate the refreshed value
+    # to all stores — even when override.yml was rotated by a previous run
+    # but .env wasn't.
     $currentKey = $null
-    foreach ($line in $content) {
-        if ($line -match $regex) {
-            $currentKey = $Matches[1].Trim().Trim('"').Trim("'")
-            break
+    $envFile = Join-Path $INSTALL_DIR ".env"
+    if (Test-Path $envFile -PathType Leaf) {
+        $envLines = Get-Content -LiteralPath $envFile
+        foreach ($line in $envLines) {
+            if ($line -match "^\s*$([Regex]::Escape($EnvVar))=(.+)$") {
+                $currentKey = $Matches[1].Trim().Trim('"').Trim("'")
+                break
+            }
         }
     }
+    if (-not $currentKey) {
+        $regex = "^\s*-?\s*$([Regex]::Escape($EnvVar))=(.+)$"
+        foreach ($line in $content) {
+            if ($line -match $regex) {
+                $currentKey = $Matches[1].Trim().Trim('"').Trim("'")
+                break
+            }
+        }
+    }
+    $regex = "^\s*-?\s*$([Regex]::Escape($EnvVar))=(.+)$"
     if (-not $currentKey -or $currentKey -eq "UNCONFIGURED") { return $false }
 
     $server = if ($env:LICENSE_SERVER_URL) { $env:LICENSE_SERVER_URL } else { "https://license.coderaft.io" }

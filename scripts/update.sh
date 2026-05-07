@@ -319,14 +319,26 @@ echo "  ${#IMAGES_TO_UPDATE[@]} image(s) to update."
 refresh_license() {
     local env_var="$1"   # LICENSE_KEY / RAVENSCAN_LICENSE_KEY / REDFOX_LICENSE_KEY
     local override_file="$INSTALL_DIR/docker-compose.override.yml"
-    [[ ! -f "$override_file" ]] && return 0
-    grep -qE "^[[:space:]]*-?[[:space:]]*${env_var}=" "$override_file" || return 0
+    local env_file="$INSTALL_DIR/.env"
 
-    local current_key
-    current_key=$(grep -E "^[[:space:]]*-?[[:space:]]*${env_var}=" "$override_file" \
-        | head -1 \
-        | sed -E "s/^[[:space:]]*-?[[:space:]]*${env_var}=//" \
-        | tr -d '"' | tr -d "'" | xargs)
+    # Read current key from .env first (source of truth read by
+    # dashboard-api), fall back to override.yml. This ensures we always
+    # validate the OLDEST stale key that's still on disk and propagate the
+    # refreshed value to all stores — even when override.yml was already
+    # rotated by a previous run but .env wasn't.
+    local current_key=""
+    if [ -f "$env_file" ] && grep -qE "^[[:space:]]*${env_var}=" "$env_file"; then
+        current_key=$(grep -E "^[[:space:]]*${env_var}=" "$env_file" \
+            | head -1 \
+            | sed -E "s/^[[:space:]]*${env_var}=//" \
+            | tr -d '"' | tr -d "'" | xargs)
+    fi
+    if [ -z "$current_key" ] && [ -f "$override_file" ] && grep -qE "^[[:space:]]*-?[[:space:]]*${env_var}=" "$override_file"; then
+        current_key=$(grep -E "^[[:space:]]*-?[[:space:]]*${env_var}=" "$override_file" \
+            | head -1 \
+            | sed -E "s/^[[:space:]]*-?[[:space:]]*${env_var}=//" \
+            | tr -d '"' | tr -d "'" | xargs)
+    fi
     [[ -z "$current_key" || "$current_key" == "UNCONFIGURED" ]] && return 0
 
     local server="${LICENSE_SERVER_URL:-https://license.coderaft.io}"
