@@ -128,6 +128,34 @@ if (-not $env:CODERAFT_UPDATE_REEXEC) {
     }
 }
 
+# ── Self-heal HOST_PROJECT_DIR in .env ────────────────────────────────────
+# Older oneliners (and any install where the dir was renamed/moved) leave
+# .env without HOST_PROJECT_DIR, which causes:
+#   - docker compose warning "HOST_PROJECT_DIR not set" on every command
+#   - dashboard-api boots with empty HOST_PROJECT_DIR → cannot reach
+#     /host-compose paths → license.json invisible → fake "first run" UX
+# Always (re)write the line with the resolved current install dir.
+$envPath = Join-Path $INSTALL_DIR ".env"
+if (Test-Path $envPath) {
+    $absoluteInstallDir = (Resolve-Path -LiteralPath $INSTALL_DIR).Path
+    if ($absoluteInstallDir) {
+        $envText = [System.IO.File]::ReadAllText($envPath, [System.Text.UTF8Encoding]::new($false))
+        $existingMatch = [regex]::Match($envText, '(?m)^HOST_PROJECT_DIR=(.*)$')
+        $needsRewrite = $false
+        if ($existingMatch.Success) {
+            if ($existingMatch.Groups[1].Value -ne $absoluteInstallDir) { $needsRewrite = $true }
+        } else {
+            $needsRewrite = $true
+        }
+        if ($needsRewrite) {
+            $lines = $envText -split "`r?`n" | Where-Object { $_ -notmatch '^HOST_PROJECT_DIR=' }
+            $newText = (($lines -join "`n").TrimEnd()) + "`nHOST_PROJECT_DIR=$absoluteInstallDir`n"
+            [System.IO.File]::WriteAllText($envPath, $newText, [System.Text.UTF8Encoding]::new($false))
+            Write-Host "  ✓ HOST_PROJECT_DIR refreshed ($absoluteInstallDir)"
+        }
+    }
+}
+
 # ── Self-heal compose YAML ────────────────────────────────────────────────
 # Detects a broken docker-compose.override.yml (buggy YAML generator) and
 # auto-recovers: timestamped backup, deletion, pull dashboard-api, restart

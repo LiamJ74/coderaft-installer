@@ -72,11 +72,15 @@ if ((Test-Path '.env') -and (Select-String -Path '.env' -Pattern '^POSTGRES_PASS
         $envContent = [System.Text.Encoding]::UTF8.GetString($envBytes, 3, $envBytes.Length - 3)
         [System.IO.File]::WriteAllText("$(Get-Location)\.env", $envContent, [System.Text.UTF8Encoding]::new($false))
     }
-    if (-not (Select-String -Path '.env' -Pattern '^HOST_PROJECT_DIR=' -Quiet)) {
-        $line = "`nHOST_PROJECT_DIR=$AbsoluteInstallDir"
-        [System.IO.File]::AppendAllText("$(Get-Location)\.env", $line, [System.Text.UTF8Encoding]::new($false))
-    }
-    Write-Host "  ✓ Existing config preserved" -ForegroundColor Green
+    # Always (re)write HOST_PROJECT_DIR with the current install dir — the
+    # location may have changed since the previous install, and a stale or
+    # missing value breaks docker-compose interpolation (warning + empty
+    # bind-mount path → dashboard-api cannot reach .env.enc → fake "first run").
+    $envText = [System.IO.File]::ReadAllText("$(Get-Location)\.env", [System.Text.UTF8Encoding]::new($false))
+    $envLines = $envText -split "`r?`n" | Where-Object { $_ -notmatch '^HOST_PROJECT_DIR=' }
+    $envText = (($envLines -join "`n").TrimEnd()) + "`nHOST_PROJECT_DIR=$AbsoluteInstallDir`n"
+    [System.IO.File]::WriteAllText("$(Get-Location)\.env", $envText, [System.Text.UTF8Encoding]::new($false))
+    Write-Host "  ✓ Existing config preserved (HOST_PROJECT_DIR refreshed)" -ForegroundColor Green
 } else {
     Write-Host "  Generating secrets..."
     $Env = @"

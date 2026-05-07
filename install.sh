@@ -154,8 +154,14 @@ gen_hex() { openssl rand -hex "$1" 2>/dev/null || head -c "$1" /dev/urandom | od
 ABSOLUTE_INSTALL_DIR="$(pwd)"
 
 if [ -f ".env" ] && grep -q '^POSTGRES_PASSWORD=' .env 2>/dev/null; then
-    # Update HOST_PROJECT_DIR in case install location changed
-    grep -q '^HOST_PROJECT_DIR=' .env 2>/dev/null || echo "HOST_PROJECT_DIR=${ABSOLUTE_INSTALL_DIR}" >> .env
+    # Always (re)write HOST_PROJECT_DIR with current install dir — the location
+    # may have changed since the previous install, and a stale or missing value
+    # breaks docker-compose interpolation (warning + empty bind-mount path →
+    # dashboard-api cannot reach .env.enc → fake "first run").
+    grep -v '^HOST_PROJECT_DIR=' .env > .env.tmp 2>/dev/null \
+        && printf 'HOST_PROJECT_DIR=%s\n' "${ABSOLUTE_INSTALL_DIR}" >> .env.tmp \
+        && mv .env.tmp .env \
+        && chmod 600 .env
     # Backward compat: legacy install without .env.enc — show warning in dashboard
     if [ ! -f "${AGE_KEY_LOCAL}" ] && [ ! -f "${AGE_KEY_PATH}" ]; then
         echo "  ⚠ Legacy install detected: no age key found."
