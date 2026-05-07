@@ -534,11 +534,13 @@ services:
 
     Write-Host "  Starting vault container..."
     Push-Location $INSTALL_DIR -ErrorAction Stop
-    # --force-recreate so the container reloads cert/config files from the
-    # host bind mounts (the TLS PKI bootstrap regenerated them this run).
-    # Otherwise compose keeps a Running container that still has the stale
-    # certs in memory and TLS verify fails ("unable to get local issuer cert").
-    $upOut = & docker compose @vaultComposeArgs up -d --force-recreate coderaft-vault 2>&1
+    # Explicit stop+rm to guarantee the container reloads cert/config files
+    # from the host bind mounts (the TLS PKI bootstrap regenerated them this
+    # run). --force-recreate alone has been observed to leave the container
+    # in "Running" state on Docker Desktop Windows, with stale certs in mem.
+    & docker compose @vaultComposeArgs stop coderaft-vault 2>&1 | Tee-Object -FilePath $migrationLog -Append | Out-Null
+    & docker compose @vaultComposeArgs rm -f coderaft-vault 2>&1 | Tee-Object -FilePath $migrationLog -Append | Out-Null
+    $upOut = & docker compose @vaultComposeArgs up -d coderaft-vault 2>&1
     $upOut | Tee-Object -FilePath $migrationLog -Append | Out-Host
     $upExit = $LASTEXITCODE
     Pop-Location -ErrorAction SilentlyContinue
