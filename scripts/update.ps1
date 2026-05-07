@@ -297,16 +297,16 @@ if ($vaultNeedsMigration) {
         exit 1
     }
 
-    # ── 4c Key bootstrap ──────────────────────────────────────────────────
+    # ── 4c Vault directories (always) ─────────────────────────────────────
+    New-Item -ItemType Directory -Force -Path (Join-Path $INSTALL_DIR "vault-keys")   | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $INSTALL_DIR "vault-tls")    | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $INSTALL_DIR "vault-config") | Out-Null
+
+    # ── 4c.1 Age master key (ONCE — rotating it would orphan vault.db) ────
     if (-not (Test-Path $vaultAgeKey)) {
         Write-Host "  Generating vault master key..."
-        New-Item -ItemType Directory -Force -Path (Join-Path $INSTALL_DIR "vault-keys")  | Out-Null
-        New-Item -ItemType Directory -Force -Path (Join-Path $INSTALL_DIR "vault-tls")   | Out-Null
-        New-Item -ItemType Directory -Force -Path (Join-Path $INSTALL_DIR "vault-config") | Out-Null
-
         $ageKeygen = Get-Command age-keygen -ErrorAction SilentlyContinue
         if (-not $ageKeygen) {
-            # Auto-download age-keygen.exe from GitHub releases (mirrors install.sh logic).
             Write-Host "    age-keygen not on PATH — downloading from GitHub releases..."
             $ageVersion = "v1.2.1"
             $ageArch = if ([Environment]::Is64BitOperatingSystem) { "amd64" } else { "386" }
@@ -328,91 +328,6 @@ if ($vaultNeedsMigration) {
 
         & $ageKeygen.Path -o $vaultAgeKey 2>$null
         if (-not (Test-Path $vaultAgeKey)) { Invoke-VaultMigrationRollback "age-keygen failed" }
-
-        # ── 4c.2 Bootstrap mTLS PKI + config.yaml + acl.yaml ─────────────
-        # The vault binary hard-requires TLS — must provide vault.crt/vault.key,
-        # client-ca.crt, and config.yaml/acl.yaml before container can start.
-        $openssl = Get-Command openssl -ErrorAction SilentlyContinue
-        if (-not $openssl) {
-            $gitOpenssl = "C:\Program Files\Git\usr\bin\openssl.exe"
-            if (Test-Path $gitOpenssl) { $openssl = [pscustomobject]@{ Path = $gitOpenssl } }
-            else { Invoke-VaultMigrationRollback "openssl required (install Git for Windows or Chocolatey)" }
-        }
-        $opensslPath = if ($openssl.Path) { $openssl.Path } else { $openssl }
-
-        $tlsDir = Join-Path $INSTALL_DIR "vault-tls"
-        $cfgDir = Join-Path $INSTALL_DIR "vault-config"
-        # CA
-        & $opensslPath req -x509 -newkey rsa:4096 -days 3650 -nodes -sha256 `
-            -keyout (Join-Path $tlsDir "client-ca.key") -out (Join-Path $tlsDir "client-ca.crt") `
-            -subj "/CN=coderaft-vault-ca" -addext "basicConstraints=critical,CA:TRUE" 2>$null
-        # Server cert with SANs that cover both internal DNS and loopback for the
-        # healthcheck wget call from inside the container.
-        & $opensslPath req -newkey rsa:2048 -nodes -sha256 `
-            -keyout (Join-Path $tlsDir "vault.key") -out (Join-Path $tlsDir "vault.csr") `
-            -subj "/CN=coderaft-vault" 2>$null
-        $extServer = "subjectAltName=DNS:coderaft-vault,DNS:localhost,IP:127.0.0.1`nbasicConstraints=CA:FALSE"
-        $extServerFile = [System.IO.Path]::GetTempFileName()
-        [System.IO.File]::WriteAllText($extServerFile, $extServer)
-        & $opensslPath x509 -req -days 3650 -sha256 `
-            -in (Join-Path $tlsDir "vault.csr") -CA (Join-Path $tlsDir "client-ca.crt") -CAkey (Join-Path $tlsDir "client-ca.key") -CAcreateserial `
-            -out (Join-Path $tlsDir "vault.crt") -extfile $extServerFile 2>$null
-        Remove-Item $extServerFile, (Join-Path $tlsDir "vault.csr") -ErrorAction SilentlyContinue
-        # Per-product client certs
-        foreach ($pair in @(
-            @("dashboard-api", "dashboard-api.coderaft.local"),
-            @("entraguard",    "entraguard.coderaft.local"),
-            @("ravenscan",     "ravenscan.coderaft.local"),
-            @("redfox",        "redfox.coderaft.local")
-        )) {
-            $name = $pair[0]; $san = $pair[1]
-            & $opensslPath req -newkey rsa:2048 -nodes -sha256 `
-                -keyout (Join-Path $tlsDir "$name-client.key") -out (Join-Path $tlsDir "$name-client.csr") `
-                -subj "/CN=$san" 2>$null
-            $extClient = "subjectAltName=DNS:$san`nbasicConstraints=CA:FALSE"
-            $extClientFile = [System.IO.Path]::GetTempFileName()
-            [System.IO.File]::WriteAllText($extClientFile, $extClient)
-            & $opensslPath x509 -req -days 3650 -sha256 `
-                -in (Join-Path $tlsDir "$name-client.csr") -CA (Join-Path $tlsDir "client-ca.crt") -CAkey (Join-Path $tlsDir "client-ca.key") -CAcreateserial `
-                -out (Join-Path $tlsDir "$name-client.crt") -extfile $extClientFile 2>$null
-            Remove-Item $extClientFile, (Join-Path $tlsDir "$name-client.csr") -ErrorAction SilentlyContinue
-        }
-        # Vault config.yaml — must match what the vault binary expects.
-        $configYaml = @'
-server:
-  addr: "0.0.0.0:8200"
-  tls_cert: "/tls/vault.crt"
-  tls_key:  "/tls/vault.key"
-  client_ca: "/tls/client-ca.crt"
-storage:
-  path: "/data/vault.db"
-keys:
-  age_key_path: "/keys/age.key"
-audit:
-  log_path: "/data/audit.log"
-acl_path: "/etc/coderaft-vault/acl.yaml"
-'@
-        [System.IO.File]::WriteAllText((Join-Path $cfgDir "config.yaml"), $configYaml, [System.Text.UTF8Encoding]::new($false))
-        # ACL
-        # Field names MUST match the vault binary's YAML struct tags:
-        # name / cert_san / permissions (see internal/config/config.go ACLClient)
-        $aclYaml = @'
-clients:
-  - name: dashboard-api
-    cert_san: "dashboard-api.coderaft.local"
-    permissions: ["*"]
-  - name: entraguard
-    cert_san: "entraguard.coderaft.local"
-    permissions: ["read:azure_*","read:license_key","read:entraguard_*"]
-  - name: ravenscan
-    cert_san: "ravenscan.coderaft.local"
-    permissions: ["read:ravenscan_*","read:neo4j_*","read:license_key"]
-  - name: redfox
-    cert_san: "redfox.coderaft.local"
-    permissions: ["read:redfox_*","read:license_key"]
-'@
-        [System.IO.File]::WriteAllText((Join-Path $cfgDir "acl.yaml"), $aclYaml, [System.Text.UTF8Encoding]::new($false))
-        Write-Host "  ✓ Vault TLS PKI + config bootstrapped"
 
         $recoveryPhrase = ""
         if ($env:CODERAFT_TEST_MODE -ne "1") {
@@ -444,7 +359,86 @@ clients:
         }
         if ($reply -ne "CONFIRMED") { Invoke-VaultMigrationRollback "operator did not confirm recovery phrase" }
         Write-Host "  ✓ Recovery phrase confirmed" -ForegroundColor Green
+    } else {
+        Write-Host "  ✓ Vault age key already exists — reusing"
     }
+
+    # ── 4c.2 mTLS PKI + config.yaml + acl.yaml (ALWAYS — idempotent) ──────
+    # These artefacts cost <1s to regenerate and are always overwritten so a
+    # half-bootstrapped vault from a previous failed run is healed on next try.
+    Write-Host "  Bootstrapping vault TLS PKI + config..."
+    $openssl = Get-Command openssl -ErrorAction SilentlyContinue
+    if (-not $openssl) {
+        $gitOpenssl = "C:\Program Files\Git\usr\bin\openssl.exe"
+        if (Test-Path $gitOpenssl) { $openssl = [pscustomobject]@{ Path = $gitOpenssl } }
+        else { Invoke-VaultMigrationRollback "openssl required (install Git for Windows or Chocolatey)" }
+    }
+    $opensslPath = if ($openssl.Path) { $openssl.Path } else { $openssl }
+    $tlsDir = Join-Path $INSTALL_DIR "vault-tls"
+    $cfgDir = Join-Path $INSTALL_DIR "vault-config"
+    & $opensslPath req -x509 -newkey rsa:4096 -days 3650 -nodes -sha256 `
+        -keyout (Join-Path $tlsDir "client-ca.key") -out (Join-Path $tlsDir "client-ca.crt") `
+        -subj "/CN=coderaft-vault-ca" -addext "basicConstraints=critical,CA:TRUE" 2>$null
+    & $opensslPath req -newkey rsa:2048 -nodes -sha256 `
+        -keyout (Join-Path $tlsDir "vault.key") -out (Join-Path $tlsDir "vault.csr") `
+        -subj "/CN=coderaft-vault" 2>$null
+    $extServer = "subjectAltName=DNS:coderaft-vault,DNS:localhost,IP:127.0.0.1`nbasicConstraints=CA:FALSE"
+    $extServerFile = [System.IO.Path]::GetTempFileName()
+    [System.IO.File]::WriteAllText($extServerFile, $extServer)
+    & $opensslPath x509 -req -days 3650 -sha256 `
+        -in (Join-Path $tlsDir "vault.csr") -CA (Join-Path $tlsDir "client-ca.crt") -CAkey (Join-Path $tlsDir "client-ca.key") -CAcreateserial `
+        -out (Join-Path $tlsDir "vault.crt") -extfile $extServerFile 2>$null
+    Remove-Item $extServerFile, (Join-Path $tlsDir "vault.csr") -ErrorAction SilentlyContinue
+    foreach ($pair in @(
+        @("dashboard-api", "dashboard-api.coderaft.local"),
+        @("entraguard",    "entraguard.coderaft.local"),
+        @("ravenscan",     "ravenscan.coderaft.local"),
+        @("redfox",        "redfox.coderaft.local")
+    )) {
+        $name = $pair[0]; $san = $pair[1]
+        & $opensslPath req -newkey rsa:2048 -nodes -sha256 `
+            -keyout (Join-Path $tlsDir "$name-client.key") -out (Join-Path $tlsDir "$name-client.csr") `
+            -subj "/CN=$san" 2>$null
+        $extClient = "subjectAltName=DNS:$san`nbasicConstraints=CA:FALSE"
+        $extClientFile = [System.IO.Path]::GetTempFileName()
+        [System.IO.File]::WriteAllText($extClientFile, $extClient)
+        & $opensslPath x509 -req -days 3650 -sha256 `
+            -in (Join-Path $tlsDir "$name-client.csr") -CA (Join-Path $tlsDir "client-ca.crt") -CAkey (Join-Path $tlsDir "client-ca.key") -CAcreateserial `
+            -out (Join-Path $tlsDir "$name-client.crt") -extfile $extClientFile 2>$null
+        Remove-Item $extClientFile, (Join-Path $tlsDir "$name-client.csr") -ErrorAction SilentlyContinue
+    }
+    $configYaml = @'
+server:
+  addr: "0.0.0.0:8200"
+  tls_cert: "/tls/vault.crt"
+  tls_key:  "/tls/vault.key"
+  client_ca: "/tls/client-ca.crt"
+storage:
+  path: "/data/vault.db"
+keys:
+  age_key_path: "/keys/age.key"
+audit:
+  log_path: "/data/audit.log"
+acl_path: "/etc/coderaft-vault/acl.yaml"
+'@
+    [System.IO.File]::WriteAllText((Join-Path $cfgDir "config.yaml"), $configYaml, [System.Text.UTF8Encoding]::new($false))
+    $aclYaml = @'
+clients:
+  - name: dashboard-api
+    cert_san: "dashboard-api.coderaft.local"
+    permissions: ["*"]
+  - name: entraguard
+    cert_san: "entraguard.coderaft.local"
+    permissions: ["read:azure_*","read:license_key","read:entraguard_*"]
+  - name: ravenscan
+    cert_san: "ravenscan.coderaft.local"
+    permissions: ["read:ravenscan_*","read:neo4j_*","read:license_key"]
+  - name: redfox
+    cert_san: "redfox.coderaft.local"
+    permissions: ["read:redfox_*","read:license_key"]
+'@
+    [System.IO.File]::WriteAllText((Join-Path $cfgDir "acl.yaml"), $aclYaml, [System.Text.UTF8Encoding]::new($false))
+    Write-Host "  ✓ Vault TLS PKI + config written"
 
     # ── 4d Pull and start vault ────────────────────────────────────────────
     if ($env:CODERAFT_TEST_FAIL -eq "4d") { Invoke-VaultMigrationRollback "injected test failure at 4d" }
