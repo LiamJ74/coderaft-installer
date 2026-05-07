@@ -873,6 +873,15 @@ $ComposeArgs = @("compose")
 if (Test-Path ".\docker-compose.override.yml") {
     $ComposeArgs += @("-f", ".\docker-compose.yml", "-f", ".\docker-compose.override.yml")
 }
+# Include vault override if a migration has been run (sentinel) OR the file
+# is simply present on disk. Without this, the later `up -d --remove-orphans`
+# treats coderaft-vault as orphan and silently removes it after migration.
+if ((Test-Path ".\docker-compose.vault.yml") -or (Test-Path ".\vault-data\.migrated")) {
+    if ($ComposeArgs -notcontains ".\docker-compose.yml") {
+        $ComposeArgs += @("-f", ".\docker-compose.yml")
+    }
+    $ComposeArgs += @("-f", ".\docker-compose.vault.yml")
+}
 
 # ── Refresh license keys (drift "superseded") ─────────────────────────────
 # When the License Server resigns a license (e.g. feature added, key

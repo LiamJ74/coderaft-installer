@@ -666,6 +666,14 @@ COMPOSE_ARGS=()
 if [ -f "./docker-compose.override.yml" ]; then
     COMPOSE_ARGS=(-f ./docker-compose.yml -f ./docker-compose.override.yml)
 fi
+# Include vault override after migration so `up -d --remove-orphans` does
+# not silently nuke the coderaft-vault container.
+if [ -f "./docker-compose.vault.yml" ] || [ -f "./vault-data/.migrated" ]; then
+    if [ ${#COMPOSE_ARGS[@]} -eq 0 ]; then
+        COMPOSE_ARGS=(-f ./docker-compose.yml)
+    fi
+    COMPOSE_ARGS+=(-f ./docker-compose.vault.yml)
+fi
 
 IMAGES_TO_UPDATE=()
 
