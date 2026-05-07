@@ -552,8 +552,13 @@ services:
 
     function Invoke-VaultCurl {
         param([string]$Method, [string]$Path, [string]$JsonBody = "")
+        # curlimages/curl runs as UID 100 by default — can't read .key files
+        # (mode 0600, owner root from openssl). Override to root with caps
+        # dropped equivalence (read-only mount + ephemeral container).
         $args = @(
-            "run", "--rm", "--network", $vaultNetwork,
+            "run", "--rm",
+            "--user", "0:0",
+            "--network", $vaultNetwork,
             "-v", "${absTlsDir}:/tls:ro",
             "curlimages/curl:latest",
             "--cert", "/tls/dashboard-api-client.crt",
