@@ -137,18 +137,47 @@ else
     echo "  ✓ compose OK"
 fi
 
-# ── Plaintext secrets coexistence warning ─────────────────────────────────
-# Banking-grade: when .env.enc exists, the plaintext .env is supposed to be
-# purged (migrate-to-sops.sh --finalize). If both files are around, the
-# operator's secrets are still at-rest in clear and the SOPS migration is
-# effectively theatre. Warn loudly but never block the update — the operator
-# may be in the middle of a legitimate transition window.
+# ── Banking-grade plaintext purge (auto) ──────────────────────────────────
+# When .env.enc exists, the plaintext .env MUST be purged (banking-grade,
+# no secrets at rest). The oneliner does the finalize itself: verifies the
+# decrypted .env.enc matches the plaintext, keeps a 24h .bak, then deletes
+# the plaintext. If anything looks off, falls back to a warning and lets the
+# operator finalize manually.
 echo ""
+echo "  Banking-grade secret check..."
 if [ -f "$INSTALL_DIR/.env.enc" ] && [ -f "$INSTALL_DIR/.env" ]; then
-    echo "  ⚠ ⚠ ⚠ Plaintext .env detected alongside encrypted .env.enc."
-    echo "       Banking-grade policy requires plaintext to be purged after migration."
-    echo "       Run:  bash scripts/migrate-to-sops.sh --finalize"
-    echo "       (or:  curl -fsSL https://install.coderaft.io/migrate.sh | bash -s -- --finalize)"
+    # Make sure we can actually decrypt
+    AGE_KEY="${SOPS_AGE_KEY_FILE:-$INSTALL_DIR/.coderaft-age.key}"
+    if [ ! -f "$AGE_KEY" ] && [ -f "/etc/coderaft/age.key" ]; then
+        AGE_KEY="/etc/coderaft/age.key"
+    fi
+    if [ ! -f "$AGE_KEY" ]; then
+        echo "  ⚠ .env + .env.enc coexist but age key not found at $AGE_KEY"
+        echo "    Plaintext .env left in place; investigate before next run."
+    elif ! command -v sops >/dev/null 2>&1; then
+        echo "  ⚠ sops binary missing on host — cannot finalize purge automatically"
+        echo "    Run:  curl -fsSL https://install.coderaft.io/migrate.sh | bash -s -- --finalize"
+    else
+        DECRYPTED=$(SOPS_AGE_KEY_FILE="$AGE_KEY" sops --decrypt --input-type dotenv --output-type dotenv "$INSTALL_DIR/.env.enc" 2>/dev/null || true)
+        if [ -z "$DECRYPTED" ]; then
+            echo "  ⚠ sops decrypt of .env.enc returned empty — leaving plaintext in place"
+        else
+            # Compare normalized sets of KEY=VALUE lines
+            BAK_DIR="$INSTALL_DIR/dashboard_data"
+            mkdir -p "$BAK_DIR"
+            BAK_FILE="$BAK_DIR/env-pre-finalize-$(date +%Y%m%d_%H%M%S).bak"
+            cp "$INSTALL_DIR/.env" "$BAK_FILE" 2>/dev/null || true
+            DIFF=$(diff <(grep -vE '^\s*(#|$)' "$INSTALL_DIR/.env" | sort) <(echo "$DECRYPTED" | grep -vE '^\s*(#|$)' | sort) 2>/dev/null || true)
+            if [ -z "$DIFF" ]; then
+                rm -f "$INSTALL_DIR/.env"
+                echo "  ✓ plaintext .env purged (backup: $BAK_FILE, kept 24h)"
+            else
+                echo "  ⚠ .env and .env.enc differ — refusing to purge plaintext."
+                echo "    Re-run:  curl -fsSL https://install.coderaft.io/migrate.sh | bash -s -- --finalize"
+                echo "    Backup written to $BAK_FILE"
+            fi
+        fi
+    fi
 fi
 
 # ── Host capture sanity check (Live Capture / Frame Analyzer) ─────────────

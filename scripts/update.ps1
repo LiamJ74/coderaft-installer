@@ -167,17 +167,48 @@ if (-not $composeOK) {
     Write-Host "  ✓ compose OK"
 }
 
-# ── Plaintext secrets coexistence warning ─────────────────────────────────
-# Banking-grade: when .env.enc exists, the plaintext .env is supposed to be
-# purged (migrate-to-sops.ps1 -Finalize). Warn loudly but never block.
+# ── Banking-grade plaintext purge (auto) ──────────────────────────────────
+# When .env.enc exists, the plaintext .env MUST be purged. The oneliner
+# does the finalize itself: verifies decryption matches plaintext, keeps a
+# 24h .bak, then deletes plaintext. Falls back to a warning otherwise.
 Write-Host ""
+Write-Host "  Banking-grade secret check..."
 $envPlain = Join-Path $INSTALL_DIR ".env"
 $envEnc   = Join-Path $INSTALL_DIR ".env.enc"
 if ((Test-Path $envEnc) -and (Test-Path $envPlain)) {
-    Write-Host "  [!] [!] [!] Plaintext .env detected alongside encrypted .env.enc." -ForegroundColor Yellow
-    Write-Host "          Banking-grade policy requires plaintext to be purged after migration." -ForegroundColor Yellow
-    Write-Host "          Run:  .\scripts\migrate-to-sops.ps1 -Finalize" -ForegroundColor Yellow
-    Write-Host "          (or:  iex (irm https://install.coderaft.io/migrate.ps1) -Finalize)" -ForegroundColor Yellow
+    $ageKey = if ($env:SOPS_AGE_KEY_FILE) { $env:SOPS_AGE_KEY_FILE } else { Join-Path $INSTALL_DIR ".coderaft-age.key" }
+    if (-not (Test-Path $ageKey) -and (Test-Path "C:\ProgramData\coderaft\age.key")) {
+        $ageKey = "C:\ProgramData\coderaft\age.key"
+    }
+    $sops = (Get-Command sops -ErrorAction SilentlyContinue)?.Path
+    if (-not (Test-Path $ageKey)) {
+        Write-Host "  [!] .env + .env.enc coexist but age key not found at $ageKey" -ForegroundColor Yellow
+        Write-Host "      Plaintext .env left in place; investigate before next run." -ForegroundColor Yellow
+    } elseif (-not $sops) {
+        Write-Host "  [!] sops binary missing on host — cannot finalize purge automatically" -ForegroundColor Yellow
+        Write-Host "      Run: iex (irm https://install.coderaft.io/migrate.ps1) -Finalize" -ForegroundColor Yellow
+    } else {
+        $env:SOPS_AGE_KEY_FILE = $ageKey
+        $decrypted = & $sops --decrypt --input-type dotenv --output-type dotenv $envEnc 2>$null
+        if (-not $decrypted) {
+            Write-Host "  [!] sops decrypt of .env.enc returned empty — leaving plaintext" -ForegroundColor Yellow
+        } else {
+            $bakDir = Join-Path $INSTALL_DIR "dashboard_data"
+            New-Item -ItemType Directory -Force -Path $bakDir | Out-Null
+            $bakFile = Join-Path $bakDir ("env-pre-finalize-" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".bak")
+            Copy-Item $envPlain $bakFile -ErrorAction SilentlyContinue
+            $plainNorm   = (Get-Content $envPlain | Where-Object { $_ -notmatch '^\s*(#|$)' } | Sort-Object) -join "`n"
+            $decryptNorm = ($decrypted | Where-Object { $_ -notmatch '^\s*(#|$)' } | Sort-Object) -join "`n"
+            if ($plainNorm -eq $decryptNorm) {
+                Remove-Item $envPlain -Force
+                Write-Host "  ✓ plaintext .env purged (backup: $bakFile, kept 24h)"
+            } else {
+                Write-Host "  [!] .env and .env.enc differ — refusing to purge plaintext." -ForegroundColor Yellow
+                Write-Host "      Re-run: iex (irm https://install.coderaft.io/migrate.ps1) -Finalize" -ForegroundColor Yellow
+                Write-Host "      Backup written to $bakFile" -ForegroundColor Yellow
+            }
+        }
+    }
 }
 
 # ── Host capture sanity check (Live Capture / Frame Analyzer) ─────────────
