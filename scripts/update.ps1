@@ -580,24 +580,52 @@ services:
         return ($resp -join "")
     }
 
-    # Wait for healthy — print attempts so the operator sees progress
-    Write-Host "  Waiting for vault to become healthy..."
-    $vaultHealthy = $false
+    # Wait for vault to be reachable (any TLS handshake completes, even sealed)
+    Write-Host "  Waiting for vault to be reachable..."
+    $vaultReachable = $false
+    $lastSealed = $null
     for ($vi = 1; $vi -le 20; $vi++) {
         try {
             $health = Invoke-VaultCurl -Method "GET" -Path "/v1/health"
-            "[$(Get-Date -Format o)] health attempt $vi → $health" | Out-File -FilePath $migrationLog -Append -Encoding utf8
-            if ($health -match '"sealed":false') { $vaultHealthy = $true; break }
+            "[$(Get-Date -Format o)] reachability attempt $vi → $health" | Out-File -FilePath $migrationLog -Append -Encoding utf8
+            if ($health -match '"sealed":(true|false)') {
+                $vaultReachable = $true
+                $lastSealed = $Matches[1]
+                break
+            }
         } catch {
-            "[$(Get-Date -Format o)] health attempt $vi → exception: $($_.Exception.Message)" | Out-File -FilePath $migrationLog -Append -Encoding utf8
+            "[$(Get-Date -Format o)] reachability attempt $vi → exception: $($_.Exception.Message)" | Out-File -FilePath $migrationLog -Append -Encoding utf8
         }
         if ($vi % 3 -eq 0) { Write-Host "    ... still waiting (attempt $vi/20)" }
         Start-Sleep -Seconds 3
     }
-    if (-not $vaultHealthy) {
+    if (-not $vaultReachable) {
         Write-Host "  Last health probe output (see $migrationLog for full log):" -ForegroundColor Yellow
         Get-Content -Path $migrationLog -Tail 5 | ForEach-Object { Write-Host "    $_" -ForegroundColor Yellow }
-        Invoke-VaultMigrationRollback "coderaft-vault did not become healthy"
+        Invoke-VaultMigrationRollback "coderaft-vault did not respond to TLS probes"
+    }
+
+    # Unseal if sealed (PassphraseSealer = 1 share = the age private key bytes)
+    if ($lastSealed -eq "true") {
+        Write-Host "  Vault is sealed — sending unseal request..."
+        $ageKeyBytes = [System.IO.File]::ReadAllBytes($vaultAgeKey)
+        $shareB64 = [Convert]::ToBase64String($ageKeyBytes)
+        $unsealBody = @{ shares = @($shareB64) } | ConvertTo-Json -Compress
+        $unsealResp = Invoke-VaultCurl -Method "POST" -Path "/v1/unseal" -JsonBody $unsealBody
+        "[$(Get-Date -Format o)] unseal response → $unsealResp" | Out-File -FilePath $migrationLog -Append -Encoding utf8
+        if ($unsealResp -notmatch '"ok"\s*:\s*true|"sealed"\s*:\s*false') {
+            Write-Host "  Unseal response: $unsealResp" -ForegroundColor Yellow
+            Invoke-VaultMigrationRollback "vault unseal failed (see $migrationLog)"
+        }
+        Write-Host "  ✓ Vault unsealed"
+    }
+
+    # Final health check — must say sealed:false now
+    $finalHealth = Invoke-VaultCurl -Method "GET" -Path "/v1/health"
+    "[$(Get-Date -Format o)] final health → $finalHealth" | Out-File -FilePath $migrationLog -Append -Encoding utf8
+    if ($finalHealth -notmatch '"sealed"\s*:\s*false') {
+        Write-Host "  Final health: $finalHealth" -ForegroundColor Yellow
+        Invoke-VaultMigrationRollback "vault still sealed after unseal call"
     }
     Write-Host "  ✓ coderaft-vault is healthy"
 
