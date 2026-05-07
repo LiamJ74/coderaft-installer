@@ -394,20 +394,22 @@ acl_path: "/etc/coderaft-vault/acl.yaml"
 '@
         [System.IO.File]::WriteAllText((Join-Path $cfgDir "config.yaml"), $configYaml, [System.Text.UTF8Encoding]::new($false))
         # ACL
+        # Field names MUST match the vault binary's YAML struct tags:
+        # name / cert_san / permissions (see internal/config/config.go ACLClient)
         $aclYaml = @'
 clients:
-  - san: "dashboard-api.coderaft.local"
-    role: admin
-    allow: ["*"]
-  - san: "entraguard.coderaft.local"
-    role: product
-    allow: ["azure_*","license_key","entraguard_*"]
-  - san: "ravenscan.coderaft.local"
-    role: product
-    allow: ["ravenscan_*","neo4j_*","license_key"]
-  - san: "redfox.coderaft.local"
-    role: product
-    allow: ["redfox_*","license_key"]
+  - name: dashboard-api
+    cert_san: "dashboard-api.coderaft.local"
+    permissions: ["*"]
+  - name: entraguard
+    cert_san: "entraguard.coderaft.local"
+    permissions: ["read:azure_*","read:license_key","read:entraguard_*"]
+  - name: ravenscan
+    cert_san: "ravenscan.coderaft.local"
+    permissions: ["read:ravenscan_*","read:neo4j_*","read:license_key"]
+  - name: redfox
+    cert_san: "redfox.coderaft.local"
+    permissions: ["read:redfox_*","read:license_key"]
 '@
         [System.IO.File]::WriteAllText((Join-Path $cfgDir "acl.yaml"), $aclYaml, [System.Text.UTF8Encoding]::new($false))
         Write-Host "  ✓ Vault TLS PKI + config bootstrapped"
