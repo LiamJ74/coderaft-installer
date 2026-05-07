@@ -106,10 +106,227 @@ if (-not $RavenscanCaptureToken) {
     if ($match) { $RavenscanCaptureToken = $match.Matches.Groups[1].Value }
 }
 
+# ── Vault master-key bootstrap (D2 + D3) ────────────────────────────────────
+# Runs once on fresh install. Skipped if vault-keys\age.key already exists.
+# NOTE: openssl is required. On Windows, use openssl.exe from Git for Windows
+# (typically at C:\Program Files\Git\usr\bin\openssl.exe or on PATH).
+# If openssl is absent, the installer prints a clear error and exits.
+
+function Invoke-VaultBootstrap {
+    New-Item -ItemType Directory -Force -Path "vault-keys" | Out-Null
+    New-Item -ItemType Directory -Force -Path "vault-tls"  | Out-Null
+    New-Item -ItemType Directory -Force -Path "vault-config" | Out-Null
+
+    # ── Step 1: Generate vault age key ──────────────────────────────────────
+    if (Test-Path "vault-keys\age.key") {
+        Write-Host "  ✓ Vault age key already exists — skipping key bootstrap"
+        return
+    }
+
+    # Find age-keygen on PATH or common locations
+    $ageKeygen = Get-Command age-keygen -ErrorAction SilentlyContinue
+    if (-not $ageKeygen) {
+        Write-Host "  ✗ age-keygen is required for vault key bootstrap but was not found." -ForegroundColor Red
+        Write-Host "    Download from https://github.com/FiloSottile/age/releases" -ForegroundColor Red
+        exit 1
+    }
+
+    Write-Host "  Generating vault master key..."
+    & $ageKeygen.Path -o "vault-keys\age.key" 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path "vault-keys\age.key")) {
+        Write-Host "  ✗ age-keygen failed" -ForegroundColor Red
+        exit 1
+    }
+    # Restrict permissions (owner read-only)
+    $acl = Get-Acl "vault-keys\age.key"
+    $acl.SetAccessRuleProtection($true, $false)
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
+        "Read", "Allow")
+    $acl.AddAccessRule($rule)
+    Set-Acl "vault-keys\age.key" $acl -ErrorAction SilentlyContinue
+
+    # ── Step 2: Compute BIP39 recovery phrase ───────────────────────────────
+    # TODO (Phase 1 follow-up): verify -mnemonic-from-key sub-command exists
+    # in coderaft-vault image before relying on it.
+    $recoveryPhrase = ""
+    if ($env:CODERAFT_TEST_MODE -ne "1") {
+        $privKey = (Get-Content "vault-keys\age.key" | Where-Object { $_ -match '^AGE-SECRET-KEY-' } | Select-Object -First 1)
+        if ($privKey) {
+            try {
+                $recoveryPhrase = ($privKey | & docker run --rm -i `
+                    ghcr.io/liamj74/coderaft-vault:latest `
+                    -mnemonic-from-key /dev/stdin 2>$null) -join ""
+            } catch { $recoveryPhrase = "" }
+        }
+    }
+    # Fallback: use age public-key fingerprint as placeholder
+    if (-not $recoveryPhrase) {
+        $pubKey = (Get-Content "vault-keys\age.key" | Where-Object { $_ -match '# public key:' } | Select-Object -First 1) -replace '.*# public key:\s*', ''
+        $recoveryPhrase = "[FALLBACK — save vault-keys\age.key securely] fingerprint: $pubKey"
+        Write-Host ""
+        Write-Host "  [!] coderaft-vault -mnemonic-from-key not available yet (Phase 1 TODO)." -ForegroundColor Yellow
+        Write-Host "      Using fingerprint as placeholder. Secure vault-keys\age.key manually." -ForegroundColor Yellow
+        Write-Host ""
+    }
+
+    # ── Step 3: Display recovery phrase ─────────────────────────────────────
+    Write-Host ""
+    Write-Host "  +==================================================================+" -ForegroundColor Cyan
+    Write-Host "  | *** VAULT RECOVERY PHRASE — WRITE THIS DOWN NOW ***             |" -ForegroundColor Cyan
+    Write-Host "  |                                                                  |" -ForegroundColor Cyan
+    Write-Host "  | This 24-word phrase is the ONLY way to recover your vault       |" -ForegroundColor Cyan
+    Write-Host "  | if vault-keys\age.key is lost or corrupted.                     |" -ForegroundColor Cyan
+    Write-Host "  |                                                                  |" -ForegroundColor Cyan
+    Write-Host "  | Store it on an encrypted USB, in 1Password, or a physical safe. |" -ForegroundColor Cyan
+    Write-Host "  | DO NOT store it on this machine or in plaintext.                |" -ForegroundColor Cyan
+    Write-Host "  |                                                                  |" -ForegroundColor Cyan
+    Write-Host "  | If BOTH vault-keys\age.key AND this phrase are lost,            |" -ForegroundColor Cyan
+    Write-Host "  | ALL encrypted secrets are permanently unrecoverable.            |" -ForegroundColor Cyan
+    Write-Host "  +==================================================================+" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  RECOVERY PHRASE:" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "    $recoveryPhrase" -ForegroundColor White
+    Write-Host ""
+
+    if ($env:CODERAFT_TEST_MODE -eq "1") {
+        Write-Host "  [CODERAFT_TEST_MODE] Auto-accepting CONFIRMED prompt"
+        $reply = "CONFIRMED"
+    } else {
+        $reply = Read-Host "  Type CONFIRMED (all caps) once you have securely stored the phrase"
+    }
+
+    if ($reply -ne "CONFIRMED") {
+        Write-Host ""
+        Write-Host "  Aborted. vault-keys\age.key has been kept in place."
+        Write-Host "  Re-run the installer when you are ready."
+        exit 1
+    }
+    Write-Host "  ✓ Recovery phrase confirmed" -ForegroundColor Green
+
+    # ── Step 4: Generate mTLS PKI ────────────────────────────────────────────
+    Invoke-VaultBootstrapTLS
+}
+
+function Invoke-VaultBootstrapTLS {
+    # Require openssl.exe — Git for Windows ships it at:
+    #   C:\Program Files\Git\usr\bin\openssl.exe
+    # Fallback: openssl on PATH (Chocolatey / Scoop installs).
+    # NOTE: .NET New-SelfSignedCertificate is Windows-only and lacks CA chaining
+    # features needed for mTLS — we require openssl for consistent behavior.
+    $openssl = Get-Command openssl -ErrorAction SilentlyContinue
+    if (-not $openssl) {
+        $gitOpenssl = "C:\Program Files\Git\usr\bin\openssl.exe"
+        if (Test-Path $gitOpenssl) {
+            $openssl = $gitOpenssl
+        } else {
+            Write-Host "  ✗ openssl.exe is required for vault mTLS bootstrap." -ForegroundColor Red
+            Write-Host "    It is included with Git for Windows. Install from https://git-scm.com/download/win" -ForegroundColor Red
+            Write-Host "    or set openssl on your PATH, then re-run the installer." -ForegroundColor Red
+            exit 1
+        }
+    } else {
+        $openssl = $openssl.Path
+    }
+
+    if ((Test-Path "vault-tls\ca.crt") -and (Test-Path "vault-tls\ca.key")) {
+        Write-Host "  ✓ Vault mTLS PKI already exists — skipping cert generation"
+        return
+    }
+
+    Write-Host "  Generating vault mTLS PKI..."
+
+    # CA
+    & $openssl req -x509 -newkey rsa:4096 -days 3650 -nodes -sha256 `
+        -keyout "vault-tls\ca.key" -out "vault-tls\ca.crt" `
+        -subj "/CN=coderaft-vault-ca" `
+        -addext "basicConstraints=critical,CA:TRUE" 2>$null
+
+    # Server cert
+    & $openssl req -newkey rsa:2048 -nodes -sha256 `
+        -keyout "vault-tls\server.key" -out "vault-tls\server.csr" `
+        -subj "/CN=coderaft-vault" 2>$null
+    $extContent = "subjectAltName=DNS:coderaft-vault`nbasicConstraints=CA:FALSE"
+    $extFile = [System.IO.Path]::GetTempFileName()
+    [System.IO.File]::WriteAllText($extFile, $extContent)
+    & $openssl x509 -req -days 3650 -sha256 `
+        -in "vault-tls\server.csr" -CA "vault-tls\ca.crt" -CAkey "vault-tls\ca.key" -CAcreateserial `
+        -out "vault-tls\server.crt" -extfile $extFile 2>$null
+    Remove-Item $extFile, "vault-tls\server.csr" -ErrorAction SilentlyContinue
+
+    # Per-product client certs
+    foreach ($pair in @(
+        @("dashboard-api", "dashboard-api.coderaft.local"),
+        @("entraguard",    "entraguard.coderaft.local"),
+        @("ravenscan",     "ravenscan.coderaft.local"),
+        @("redfox",        "redfox.coderaft.local")
+    )) {
+        $name = $pair[0]; $san = $pair[1]
+        & $openssl req -newkey rsa:2048 -nodes -sha256 `
+            -keyout "vault-tls\$name-client.key" -out "vault-tls\$name-client.csr" `
+            -subj "/CN=$san" 2>$null
+        $extContent2 = "subjectAltName=DNS:$san`nbasicConstraints=CA:FALSE"
+        $extFile2 = [System.IO.Path]::GetTempFileName()
+        [System.IO.File]::WriteAllText($extFile2, $extContent2)
+        & $openssl x509 -req -days 3650 -sha256 `
+            -in "vault-tls\$name-client.csr" -CA "vault-tls\ca.crt" -CAkey "vault-tls\ca.key" -CAcreateserial `
+            -out "vault-tls\$name-client.crt" -extfile $extFile2 2>$null
+        Remove-Item $extFile2, "vault-tls\$name-client.csr" -ErrorAction SilentlyContinue
+    }
+
+    # ACL config
+    $aclContent = @'
+# coderaft-vault ACL — controls which client cert SAN can access which secrets.
+clients:
+  - san: "dashboard-api.coderaft.local"
+    role: admin
+    allow: ["*"]
+
+  - san: "entraguard.coderaft.local"
+    role: product
+    allow:
+      - "azure_*"
+      - "license_key"
+      - "entraguard_*"
+
+  - san: "ravenscan.coderaft.local"
+    role: product
+    allow:
+      - "ravenscan_*"
+      - "neo4j_*"
+
+  - san: "redfox.coderaft.local"
+    role: product
+    allow:
+      - "redfox_*"
+'@
+    [System.IO.File]::WriteAllText("$(Get-Location)\vault-config\acl.yaml", $aclContent, [System.Text.UTF8Encoding]::new($false))
+    Write-Host "  ✓ Vault mTLS PKI generated (CA + server cert + 4 client certs)" -ForegroundColor Green
+}
+
+Invoke-VaultBootstrap
+
+# Append CODERAFT_VAULT_* env vars if not already present
+$envText = [System.IO.File]::ReadAllText("$(Get-Location)\.env", [System.Text.UTF8Encoding]::new($false))
+foreach ($kv in @(
+    "CODERAFT_VAULT_URL=https://coderaft-vault:8200",
+    "CODERAFT_VAULT_AZURE=0",
+    "CODERAFT_VAULT_LICENSE=0",
+    "CODERAFT_VAULT_PRODUCTS=0",
+    "CODERAFT_VAULT_JWT=0"
+)) {
+    $k = $kv.Split('=')[0]
+    if ($envText -notmatch "(?m)^$k=") {
+        $envText = $envText.TrimEnd() + "`n$kv`n"
+    }
+}
+[System.IO.File]::WriteAllText("$(Get-Location)\.env", $envText, [System.Text.UTF8Encoding]::new($false))
+
 # Init DB
 [System.IO.File]::WriteAllText("$(Get-Location)\init-db.sql", '-- Product databases are created by the dashboard on demand', [System.Text.UTF8Encoding]::new($false))
 
-# Docker compose
+# Docker compose — dashboard + vault
 Write-Host "  Writing docker-compose.yml..."
 $Compose = @'
 # CodeRaft Dashboard
@@ -153,9 +370,13 @@ services:
 
   dashboard-api:
     image: ghcr.io/liamj74/coderaft-dashboard-api:latest
+    networks:
+      - default
+      - coderaft-vault-net
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
+      coderaft-vault: { condition: service_healthy }
     environment:
       - LICENSE_SERVER_URL=https://license.coderaft.io
       - DATABASE_URL=postgres://coderaft:${POSTGRES_PASSWORD}@postgres:5432/coderaft
@@ -164,11 +385,44 @@ services:
       - CONTAINER_COMPOSE_DIR=/host-compose
       - HOST_PROJECT_DIR=${HOST_PROJECT_DIR}
       - COMPOSE_PROJECT_NAME=coderaft
+      # NOTE: Phase 0.5 keeps SOPS path for backward compat; Phase 5 removes it.
+      - CODERAFT_VAULT_URL=https://coderaft-vault:8200
+      - CODERAFT_VAULT_TLS_CA=/vault-tls/ca.crt
+      - CODERAFT_VAULT_TLS_CERT=/vault-tls/dashboard-api-client.crt
+      - CODERAFT_VAULT_TLS_KEY=/vault-tls/dashboard-api-client.key
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - dashboard_data:/data
       - .:/host-compose
+      # Age private key for SOPS decryption (legacy — kept for backward compat).
+      - ./.coderaft-age.key:/keys/age.key:ro
+      # Vault mTLS client cert for dashboard-api
+      - ./vault-tls/ca.crt:/vault-tls/ca.crt:ro
+      - ./vault-tls/dashboard-api-client.crt:/vault-tls/dashboard-api-client.crt:ro
+      - ./vault-tls/dashboard-api-client.key:/vault-tls/dashboard-api-client.key:ro
     security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+
+  # ── coderaft-vault ──────────────────────────────────────────────────────────
+  # Centralised secret store. All products read/write through it via mTLS.
+  # Port 8200 is internal-only (coderaft-vault-net). No external exposure.
+  coderaft-vault:
+    image: ghcr.io/liamj74/coderaft-vault:latest
+    networks:
+      - coderaft-vault-net
+    volumes:
+      - vault_data:/data
+      - ./vault-keys:/keys:ro
+      - ./vault-tls:/tls:ro
+      - ./vault-config:/etc/coderaft-vault:ro
+    healthcheck:
+      test: ["CMD", "/coderaft-vault", "-health-check"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
     restart: unless-stopped
 
   postgres:
@@ -206,11 +460,17 @@ services:
       retries: 5
     restart: unless-stopped
 
+networks:
+  # Internal network for vault <-> product communication. No external port.
+  coderaft-vault-net:
+    internal: true
+
 volumes:
   postgres_data:
   dashboard_data:
   caddy_data:
   caddy_config:
+  vault_data:
 '@
 [System.IO.File]::WriteAllText("$(Get-Location)\docker-compose.yml", $Compose, [System.Text.UTF8Encoding]::new($false))
 

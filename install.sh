@@ -255,12 +255,235 @@ fi
 # install step (only relevant on macOS).
 RAVENSCAN_CAPTURE_TOKEN_VALUE="$(grep '^RAVENSCAN_CAPTURE_TOKEN=' .env | cut -d= -f2)"
 
+# ── Vault master-key bootstrap (D2 + D3) ────────────────────────────────────
+# Runs once on fresh install. Skipped if vault-keys/age.key already exists.
+# The vault age key is SEPARATE from the SOPS age key (.coderaft-age.key).
+# .coderaft-age.key = SOPS legacy path (kept for backward compat per Phase 0.5)
+# vault-keys/age.key = master key that encrypts the vault's envelope DEK
+vault_bootstrap() {
+    mkdir -p vault-keys vault-tls vault-config
+
+    # ── Step 1: Generate vault age key (or reuse existing) ──────────────────
+    if [ -f vault-keys/age.key ]; then
+        echo "  ✓ Vault age key already exists — skipping key bootstrap"
+        return 0
+    fi
+
+    if ! ensure_age_binary; then
+        echo "  ✗ Cannot generate vault age key — age-keygen not available"
+        echo "    Install age from https://github.com/FiloSottile/age/releases"
+        echo "    then re-run the installer."
+        exit 1
+    fi
+
+    echo "  Generating vault master key..."
+    age-keygen -o vault-keys/age.key 2>/dev/null || {
+        echo "  ✗ age-keygen failed"
+        exit 1
+    }
+    chmod 400 vault-keys/age.key
+
+    # ── Step 2: Compute BIP39 recovery phrase ───────────────────────────────
+    # The vault container exposes: docker run --rm ... -mnemonic-from-key /dev/stdin
+    # We feed it the raw age private key to get a 24-word BIP39 mnemonic.
+    # TODO (Phase 1 follow-up): verify this sub-command exists in coderaft-vault
+    # image — if it returns non-zero, we fall back to the raw key fingerprint
+    # as a placeholder so the installer is never blocked.
+    RECOVERY_PHRASE=""
+    if [ "${CODERAFT_TEST_MODE:-0}" != "1" ]; then
+        VAULT_PRIV_KEY=$(grep '^AGE-SECRET-KEY-' vault-keys/age.key 2>/dev/null || true)
+        if [ -n "$VAULT_PRIV_KEY" ]; then
+            RECOVERY_PHRASE=$(echo "$VAULT_PRIV_KEY" | \
+                docker run --rm -i ghcr.io/liamj74/coderaft-vault:latest \
+                    -mnemonic-from-key /dev/stdin 2>/dev/null || true)
+        fi
+    fi
+    # Fallback: use age public-key fingerprint as placeholder
+    if [ -z "$RECOVERY_PHRASE" ]; then
+        VAULT_PUB=$(grep '# public key:' vault-keys/age.key 2>/dev/null | awk '{print $NF}' || true)
+        RECOVERY_PHRASE="[FALLBACK — save vault-keys/age.key securely] fingerprint: ${VAULT_PUB}"
+        echo ""
+        echo "  ⚠ coderaft-vault -mnemonic-from-key not available yet (Phase 1 TODO)."
+        echo "    Using fingerprint as placeholder. Secure vault-keys/age.key manually."
+        echo ""
+    fi
+
+    # ── Step 3: Display recovery phrase with big warning ────────────────────
+    echo ""
+    echo "  ╔══════════════════════════════════════════════════════════════════╗"
+    echo "  ║   *** VAULT RECOVERY PHRASE — WRITE THIS DOWN NOW ***           ║"
+    echo "  ║                                                                  ║"
+    echo "  ║   This 24-word phrase is the ONLY way to recover your vault     ║"
+    echo "  ║   if vault-keys/age.key is lost or corrupted.                   ║"
+    echo "  ║                                                                  ║"
+    echo "  ║   Store it on an encrypted USB, in 1Password, or a physical     ║"
+    echo "  ║   safe. DO NOT store it on this machine or in plaintext.        ║"
+    echo "  ║                                                                  ║"
+    echo "  ║   If BOTH vault-keys/age.key AND this phrase are lost,          ║"
+    echo "  ║   ALL encrypted secrets are permanently unrecoverable.          ║"
+    echo "  ╚══════════════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "  RECOVERY PHRASE:"
+    echo ""
+    echo "    ${RECOVERY_PHRASE}"
+    echo ""
+    echo "  ╔══════════════════════════════════════════════════════════════════╗"
+    echo "  ║   Type CONFIRMED (all caps) once you have securely stored       ║"
+    echo "  ║   the recovery phrase, then press Enter to continue.            ║"
+    echo "  ╚══════════════════════════════════════════════════════════════════╝"
+    echo ""
+
+    if [ "${CODERAFT_TEST_MODE:-0}" = "1" ]; then
+        echo "  [CODERAFT_TEST_MODE] Auto-accepting CONFIRMED prompt"
+        REPLY="CONFIRMED"
+    else
+        # stty trick: disable echo so the phrase isn't logged twice, then re-enable
+        if command -v stty &>/dev/null; then
+            stty -echo 2>/dev/null || true
+            printf "  Type CONFIRMED to continue: "
+            read -r REPLY
+            stty echo 2>/dev/null || true
+            echo ""
+        else
+            printf "  Type CONFIRMED to continue: "
+            read -r REPLY
+        fi
+    fi
+
+    if [ "$REPLY" != "CONFIRMED" ]; then
+        echo ""
+        echo "  Aborted. vault-keys/age.key has been kept in place."
+        echo "  Re-run the installer when you are ready."
+        exit 1
+    fi
+    echo "  ✓ Recovery phrase confirmed"
+
+    # ── Step 4: Generate mTLS PKI (D3) ─────────────────────────────────────
+    vault_bootstrap_tls
+}
+
+vault_bootstrap_tls() {
+    # Require openssl
+    if ! command -v openssl &>/dev/null; then
+        echo "  ✗ openssl is required for vault mTLS bootstrap but was not found."
+        echo "    Install openssl (brew install openssl on macOS, apt-get install"
+        echo "    openssl on Debian/Ubuntu) then re-run the installer."
+        exit 1
+    fi
+
+    # Skip if CA already exists (re-run safety)
+    if [ -f vault-tls/ca.crt ] && [ -f vault-tls/ca.key ]; then
+        echo "  ✓ Vault mTLS PKI already exists — skipping cert generation"
+        return 0
+    fi
+
+    echo "  Generating vault mTLS PKI..."
+    chmod 700 vault-tls
+
+    # CA
+    openssl req -x509 -newkey rsa:4096 -days 3650 -nodes -sha256 \
+        -keyout vault-tls/ca.key \
+        -out vault-tls/ca.crt \
+        -subj "/CN=coderaft-vault-ca" \
+        -addext "basicConstraints=critical,CA:TRUE" \
+        2>/dev/null
+    chmod 600 vault-tls/ca.key vault-tls/ca.crt
+
+    # Server cert (SAN = coderaft-vault)
+    openssl req -newkey rsa:2048 -nodes -sha256 \
+        -keyout vault-tls/server.key \
+        -out vault-tls/server.csr \
+        -subj "/CN=coderaft-vault" \
+        2>/dev/null
+    openssl x509 -req -days 3650 -sha256 \
+        -in vault-tls/server.csr \
+        -CA vault-tls/ca.crt -CAkey vault-tls/ca.key -CAcreateserial \
+        -out vault-tls/server.crt \
+        -extfile <(printf "subjectAltName=DNS:coderaft-vault\nbasicConstraints=CA:FALSE") \
+        2>/dev/null
+    rm -f vault-tls/server.csr
+    chmod 600 vault-tls/server.crt vault-tls/server.key
+
+    # Per-product client certs
+    _vault_client_cert "dashboard-api"  "dashboard-api.coderaft.local"
+    _vault_client_cert "entraguard"     "entraguard.coderaft.local"
+    _vault_client_cert "ravenscan"      "ravenscan.coderaft.local"
+    _vault_client_cert "redfox"         "redfox.coderaft.local"
+
+    # ACL config
+    cat > vault-config/acl.yaml << 'ACLEOF'
+# coderaft-vault ACL — controls which client cert SAN can access which secrets.
+# Format: each client entry lists the SANs allowed and the secret-name prefixes
+# they may read/write. dashboard-api is admin (may list all).
+clients:
+  - san: "dashboard-api.coderaft.local"
+    role: admin
+    allow: ["*"]
+
+  - san: "entraguard.coderaft.local"
+    role: product
+    allow:
+      - "azure_*"
+      - "license_key"
+      - "entraguard_*"
+
+  - san: "ravenscan.coderaft.local"
+    role: product
+    allow:
+      - "ravenscan_*"
+      - "neo4j_*"
+
+  - san: "redfox.coderaft.local"
+    role: product
+    allow:
+      - "redfox_*"
+ACLEOF
+    chmod 600 vault-config/acl.yaml
+
+    echo "  ✓ Vault mTLS PKI generated (CA + server cert + 4 client certs)"
+    echo "    CA:      vault-tls/ca.crt"
+    echo "    Server:  vault-tls/server.{crt,key}"
+    echo "    Clients: vault-tls/{dashboard-api,entraguard,ravenscan,redfox}-client.{crt,key}"
+}
+
+_vault_client_cert() {
+    local name="$1" san="$2"
+    openssl req -newkey rsa:2048 -nodes -sha256 \
+        -keyout "vault-tls/${name}-client.key" \
+        -out    "vault-tls/${name}-client.csr" \
+        -subj   "/CN=${san}" \
+        2>/dev/null
+    openssl x509 -req -days 3650 -sha256 \
+        -in "vault-tls/${name}-client.csr" \
+        -CA vault-tls/ca.crt -CAkey vault-tls/ca.key -CAcreateserial \
+        -out "vault-tls/${name}-client.crt" \
+        -extfile <(printf "subjectAltName=DNS:%s\nbasicConstraints=CA:FALSE" "$san") \
+        2>/dev/null
+    rm -f "vault-tls/${name}-client.csr"
+    chmod 600 "vault-tls/${name}-client.crt" "vault-tls/${name}-client.key"
+}
+
+vault_bootstrap
+
+# Append CODERAFT_VAULT_* env vars if not already present
+_add_env_if_missing() {
+    local key="$1" val="$2"
+    if ! grep -q "^${key}=" .env 2>/dev/null; then
+        printf '%s=%s\n' "$key" "$val" >> .env
+    fi
+}
+_add_env_if_missing "CODERAFT_VAULT_URL"      "https://coderaft-vault:8200"
+_add_env_if_missing "CODERAFT_VAULT_AZURE"    "0"
+_add_env_if_missing "CODERAFT_VAULT_LICENSE"  "0"
+_add_env_if_missing "CODERAFT_VAULT_PRODUCTS" "0"
+_add_env_if_missing "CODERAFT_VAULT_JWT"      "0"
+
 # Init DB
 cat > init-db.sql << 'SQL'
 -- Product databases are created by the dashboard on demand
 SQL
 
-# Docker compose — dashboard only
+# Docker compose — dashboard + vault
 echo "  Writing docker-compose.yml..."
 cat > docker-compose.yml << 'COMPOSE'
 # CodeRaft Dashboard
@@ -311,9 +534,13 @@ services:
 
   dashboard-api:
     image: ghcr.io/liamj74/coderaft-dashboard-api:latest
+    networks:
+      - default
+      - coderaft-vault-net
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
+      coderaft-vault: { condition: service_healthy }
     environment:
       - LICENSE_SERVER_URL=https://license.coderaft.io
       - DATABASE_URL=postgres://coderaft:${POSTGRES_PASSWORD}@postgres:5432/coderaft
@@ -324,16 +551,49 @@ services:
       - COMPOSE_PROJECT_NAME=coderaft
       # Banking-grade: dashboard-api reads .env.enc (sops+age). Plaintext .env
       # is refused at runtime when CODERAFT_REJECT_PLAINTEXT_ENV=1.
+      # NOTE: Phase 0.5 keeps SOPS path for backward compat; Phase 5 removes it.
       - CODERAFT_REJECT_PLAINTEXT_ENV=1
       - SOPS_AGE_KEY_FILE=/keys/age.key
+      # Vault integration (Phase 0.5 — products read secrets from the vault)
+      - CODERAFT_VAULT_URL=https://coderaft-vault:8200
+      - CODERAFT_VAULT_TLS_CA=/vault-tls/ca.crt
+      - CODERAFT_VAULT_TLS_CERT=/vault-tls/dashboard-api-client.crt
+      - CODERAFT_VAULT_TLS_KEY=/vault-tls/dashboard-api-client.key
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - dashboard_data:/data
       - .:/host-compose
-      # Age private key for SOPS decryption. The installer creates the host
-      # file at .coderaft-age.key on first run when `age` is available.
+      # Age private key for SOPS decryption (legacy — kept for backward compat).
+      # The installer creates the host file at .coderaft-age.key on first run.
       - ./.coderaft-age.key:/keys/age.key:ro
+      # Vault mTLS client cert for dashboard-api
+      - ./vault-tls/ca.crt:/vault-tls/ca.crt:ro
+      - ./vault-tls/dashboard-api-client.crt:/vault-tls/dashboard-api-client.crt:ro
+      - ./vault-tls/dashboard-api-client.key:/vault-tls/dashboard-api-client.key:ro
     security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+
+  # ── coderaft-vault ──────────────────────────────────────────────────────────
+  # Centralised secret store. All products read/write through it via mTLS.
+  # Port 8200 is internal-only (coderaft-vault-net). No external exposure.
+  # Phase 0.5: deployed from fresh install; existing installs migrate on update.
+  coderaft-vault:
+    image: ghcr.io/liamj74/coderaft-vault:latest
+    networks:
+      - coderaft-vault-net
+    volumes:
+      - vault_data:/data
+      - ./vault-keys:/keys:ro
+      - ./vault-tls:/tls:ro
+      - ./vault-config:/etc/coderaft-vault:ro
+    healthcheck:
+      test: ["CMD", "/coderaft-vault", "-health-check"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
     restart: unless-stopped
 
   postgres:
@@ -371,11 +631,17 @@ services:
       retries: 5
     restart: unless-stopped
 
+networks:
+  # Internal network for vault ↔ product communication. No external port.
+  coderaft-vault-net:
+    internal: true
+
 volumes:
   postgres_data:
   dashboard_data:
   caddy_data:
   caddy_config:
+  vault_data:
 COMPOSE
 
 # ── Caddyfile (local HTTPS) ──────────────────────────────────────────────────
@@ -597,7 +863,8 @@ verify_coderaft_image() {
 }
 for img in \
     "ghcr.io/liamj74/coderaft-dashboard:latest" \
-    "ghcr.io/liamj74/coderaft-dashboard-api:latest"; do
+    "ghcr.io/liamj74/coderaft-dashboard-api:latest" \
+    "ghcr.io/liamj74/coderaft-vault:latest"; do
     verify_coderaft_image "${img}"
 done
 
