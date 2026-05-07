@@ -278,8 +278,22 @@ if ($vaultNeedsMigration) {
         }
         try { & docker compose up -d 2>$null } catch { }
         Write-Host ""
-        Write-Host "  Rollback complete. Backup: $vaultBak" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  Rollback complete. Backup directory: $vaultBak" -ForegroundColor Yellow
         Write-Host "  Legacy secret stores are intact." -ForegroundColor Yellow
+        $log = Join-Path $vaultBak "migration.log"
+        if (Test-Path $log) {
+            Write-Host ""
+            Write-Host "  Last 20 lines of migration log:" -ForegroundColor Yellow
+            Get-Content -Path $log -Tail 20 | ForEach-Object { Write-Host "    $_" }
+            Write-Host ""
+            Write-Host "  Full log: $log" -ForegroundColor Yellow
+        }
+        Write-Host ""
+        Write-Host "  Press any key to acknowledge before the window closes..." -ForegroundColor Yellow
+        if (-not $env:CODERAFT_TEST_MODE) {
+            try { [void][System.Console]::ReadKey($true) } catch { Start-Sleep -Seconds 30 }
+        }
         exit 1
     }
 
@@ -350,26 +364,46 @@ if ($vaultNeedsMigration) {
     # ── 4d Pull and start vault ────────────────────────────────────────────
     if ($env:CODERAFT_TEST_FAIL -eq "4d") { Invoke-VaultMigrationRollback "injected test failure at 4d" }
 
-    if ($env:CODERAFT_TEST_MODE -ne "1") {
-        try { & docker pull ghcr.io/liamj74/coderaft-vault:latest 2>$null } catch { Invoke-VaultMigrationRollback "docker pull failed" }
-    }
-    try {
-        Push-Location $INSTALL_DIR -ErrorAction Stop
-        & docker compose up -d coderaft-vault 2>$null
-        Pop-Location -ErrorAction SilentlyContinue
-    } catch { Invoke-VaultMigrationRollback "docker compose up coderaft-vault failed" }
+    # All docker output (stdout + stderr) is logged to migration.log inside the
+    # backup dir AND streamed to the console. No more silent failures.
+    $migrationLog = Join-Path $vaultBak "migration.log"
+    "[$(Get-Date -Format o)] Phase 4d — pull + start vault" | Out-File -FilePath $migrationLog -Encoding utf8
 
-    # Wait for healthy
+    if ($env:CODERAFT_TEST_MODE -ne "1") {
+        Write-Host "  Pulling vault image..."
+        $pullOut = & docker pull ghcr.io/liamj74/coderaft-vault:latest 2>&1
+        $pullOut | Tee-Object -FilePath $migrationLog -Append | Out-Host
+        if ($LASTEXITCODE -ne 0) { Invoke-VaultMigrationRollback "docker pull failed (see $migrationLog)" }
+    }
+
+    Write-Host "  Starting vault container..."
+    Push-Location $INSTALL_DIR -ErrorAction Stop
+    $upOut = & docker compose up -d coderaft-vault 2>&1
+    $upOut | Tee-Object -FilePath $migrationLog -Append | Out-Host
+    $upExit = $LASTEXITCODE
+    Pop-Location -ErrorAction SilentlyContinue
+    if ($upExit -ne 0) { Invoke-VaultMigrationRollback "docker compose up coderaft-vault failed (see $migrationLog)" }
+
+    # Wait for healthy — print attempts so the operator sees progress
+    Write-Host "  Waiting for vault to become healthy..."
     $vaultHealthy = $false
     for ($vi = 1; $vi -le 20; $vi++) {
         try {
             $health = & docker compose exec -T coderaft-vault `
-                /bin/sh -c 'wget -qO- http://localhost:8200/v1/health 2>/dev/null' 2>$null
+                /bin/sh -c 'wget -qO- http://localhost:8200/v1/health 2>&1' 2>&1
+            "[$(Get-Date -Format o)] health attempt $vi → $health" | Out-File -FilePath $migrationLog -Append -Encoding utf8
             if ($health -match '"sealed":false') { $vaultHealthy = $true; break }
-        } catch { }
+        } catch {
+            "[$(Get-Date -Format o)] health attempt $vi → exception: $($_.Exception.Message)" | Out-File -FilePath $migrationLog -Append -Encoding utf8
+        }
+        if ($vi % 3 -eq 0) { Write-Host "    ... still waiting (attempt $vi/20)" }
         Start-Sleep -Seconds 3
     }
-    if (-not $vaultHealthy) { Invoke-VaultMigrationRollback "coderaft-vault did not become healthy" }
+    if (-not $vaultHealthy) {
+        Write-Host "  Last health probe output (see $migrationLog for full log):" -ForegroundColor Yellow
+        Get-Content -Path $migrationLog -Tail 5 | ForEach-Object { Write-Host "    $_" -ForegroundColor Yellow }
+        Invoke-VaultMigrationRollback "coderaft-vault did not become healthy"
+    }
     Write-Host "  ✓ coderaft-vault is healthy"
 
     # ── 4e Migrate secrets ────────────────────────────────────────────────
