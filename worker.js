@@ -10,11 +10,15 @@ export default {
 
       const scripts = {
         '/install':      'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/install.sh',
-        '/win':          'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/install.ps1',
-        '/update':       'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/update.sh',
-        '/update.ps1':   'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/update.ps1',
-        '/rollback':     'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/rollback.sh',
-        '/rollback.ps1': 'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/rollback.ps1',
+        '/win':           'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/install.ps1',
+        '/update':        'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/update.sh',
+        '/update.ps1':    'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/update.ps1',
+        '/rollback':      'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/rollback.sh',
+        '/rollback.ps1':  'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/rollback.ps1',
+        // SOPS+age secrets migration (banking-grade plaintext purge)
+        '/migrate':       'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/migrate-to-sops.sh',
+        '/migrate.sh':    'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/migrate-to-sops.sh',
+        '/migrate.ps1':   'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/migrate-to-sops.ps1',
       };
 
       const isBrowser = request.headers.get('accept')?.includes('text/html');

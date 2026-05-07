@@ -8,8 +8,23 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 GITHUB_RAW="https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/migrate-to-sops.sh"
+
+# ── Argument parsing ─────────────────────────────────────────────────────────
+# --finalize : skip migration, purge any leftover plaintext .env after
+#              verifying that .env.enc decrypts AND dashboard-api is healthy.
+FINALIZE_ONLY=0
+for arg in "$@"; do
+  case "${arg}" in
+    --finalize) FINALIZE_ONLY=1 ;;
+    -h|--help)
+      echo "Usage: $0 [--finalize]"
+      echo "  --finalize   Purge plaintext .env after verifying encrypted backup."
+      exit 0
+      ;;
+  esac
+done
 
 # ── Self-update ──────────────────────────────────────────────────────────────
 if [ "${CODERAFT_SKIP_SELF_UPDATE:-0}" != "1" ]; then
@@ -47,6 +62,78 @@ echo "  ║  CodeRaft — SOPS+age secrets migration   ║"
 echo "  ║  (v${SCRIPT_VERSION})                            ║"
 echo "  ╚══════════════════════════════════════════╝"
 echo ""
+
+# ── Local age key (bind-mount source for dashboard-api) ─────────────────────
+AGE_KEY_LOCAL="$(pwd)/.coderaft-age.key"
+
+mirror_age_key_to_local() {
+  if [ -f "${AGE_KEY_LOCAL}" ]; then
+    return 0
+  fi
+  if [ -f "${AGE_KEY_PATH}" ]; then
+    if sudo cat "${AGE_KEY_PATH}" 2>/dev/null > "${AGE_KEY_LOCAL}" \
+       || cat "${AGE_KEY_PATH}" 2>/dev/null > "${AGE_KEY_LOCAL}"; then
+      chmod 400 "${AGE_KEY_LOCAL}"
+      info "Mirrored age key to ${AGE_KEY_LOCAL} (bind-mount source for dashboard-api)"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# ── --finalize fast path: purge leftover plaintext .env safely ──────────────
+if [ "${FINALIZE_ONLY}" = "1" ]; then
+  headline "--finalize: purge plaintext .env"
+  if [ ! -f ".env.enc" ]; then
+    fatal ".env.enc missing — nothing to finalize. Run a full migration first."
+  fi
+  if [ ! -f ".env" ]; then
+    info "No plaintext .env present. Nothing to do."
+    exit 0
+  fi
+  if ! command -v sops &>/dev/null; then
+    fatal "sops binary required for --finalize. Install it first or run a full migration."
+  fi
+  if [ ! -f "${AGE_KEY_PATH}" ] && [ ! -f "${AGE_KEY_LOCAL}" ]; then
+    fatal "No age key found at ${AGE_KEY_PATH} or ${AGE_KEY_LOCAL}. Cannot verify .env.enc."
+  fi
+  mirror_age_key_to_local || true
+  AGE_KEY_FOR_DECRYPT="${AGE_KEY_LOCAL}"
+  [ -f "${AGE_KEY_FOR_DECRYPT}" ] || AGE_KEY_FOR_DECRYPT="${AGE_KEY_PATH}"
+
+  _VERIFY_TMP="$(mktemp)"
+  trap 'rm -f "${_VERIFY_TMP}"' EXIT
+  if ! SOPS_AGE_KEY_FILE="${AGE_KEY_FOR_DECRYPT}" sudo -E sops --decrypt .env.enc > "${_VERIFY_TMP}" 2>/dev/null \
+       && ! SOPS_AGE_KEY_FILE="${AGE_KEY_FOR_DECRYPT}" sops --decrypt .env.enc > "${_VERIFY_TMP}" 2>/dev/null; then
+    fatal ".env.enc cannot be decrypted with the available age key — refusing to purge .env."
+  fi
+  if ! diff -q "${_VERIFY_TMP}" .env > /dev/null 2>&1; then
+    warn ".env and .env.enc differ. Showing diff (truncated 30 lines):"
+    diff "${_VERIFY_TMP}" .env | head -30 || true
+    warn "Aborting --finalize. Re-encrypt with: sops --encrypt --age <pub> --output .env.enc .env"
+    exit 1
+  fi
+  rm -f "${_VERIFY_TMP}"
+  trap - EXIT
+
+  TS="$(date -u +%Y%m%dT%H%M%SZ)"
+  BACKUP="${DATA_DIR}/env-pre-finalize-${TS}.bak"
+  mkdir -p "${DATA_DIR}"
+  cp .env "${BACKUP}"
+  chmod 400 "${BACKUP}"
+  rm -f .env
+  info ".env purged (24h backup: ${BACKUP})"
+  echo "[migrate] finalize at ${TS} | plaintext purged | backup=${BACKUP}" >> "${DATA_DIR}/migration.log"
+
+  # Best-effort: clean backups older than 24h
+  find "${DATA_DIR}" -name 'env-pre-finalize-*.bak' -mtime +1 -delete 2>/dev/null || true
+
+  echo ""
+  info "Plaintext .env purged. Restart the dashboard-api so it re-reads .env.enc:"
+  echo "    docker compose restart dashboard-api"
+  echo ""
+  exit 0
+fi
 
 # ── 1. Detect plaintext .env ─────────────────────────────────────────────────
 headline ".env detection"
@@ -223,8 +310,21 @@ info "Verification OK: decryption matches the original .env"
 
 # ── 7. Remove plaintext .env ─────────────────────────────────────────────────
 headline "Remove plaintext .env"
+# Keep a short-lived (24h) plaintext backup under dashboard_data so the
+# operator can recover if something blows up before the dashboard reboots.
+mkdir -p "${DATA_DIR}"
+PRE_SOPS_BAK="${DATA_DIR}/.env.pre-sops-${TS}.bak"
+cp .env "${PRE_SOPS_BAK}"
+chmod 400 "${PRE_SOPS_BAK}"
 rm .env
 info ".env removed (only .env.enc remains on disk)"
+info "Short-lived backup: ${PRE_SOPS_BAK} (auto-purged after 24h on next migrate run)"
+# Best-effort: clean backups older than 24h on every run
+find "${DATA_DIR}" -name '.env.pre-sops-*.bak' -mtime +1 -delete 2>/dev/null || true
+
+# Mirror age.key into install dir so the dashboard-api bind-mount works
+# without giving the container access to /etc/coderaft.
+mirror_age_key_to_local || warn "Could not mirror age key to ${AGE_KEY_LOCAL} — dashboard-api may fail to decrypt."
 
 # ── 8. RedFox jwt.key migration ──────────────────────────────────────────────
 headline "RedFox jwt.key migration"

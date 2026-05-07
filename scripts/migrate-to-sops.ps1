@@ -10,13 +10,14 @@
 [CmdletBinding()]
 param(
     [string]$BackupPassphrase = $env:CODERAFT_BACKUP_PASS,
-    [switch]$SkipSelfUpdate
+    [switch]$SkipSelfUpdate,
+    [switch]$Finalize
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion  = '1.0.0'
+$ScriptVersion  = '1.1.0'
 $GithubRaw      = 'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/migrate-to-sops.ps1'
 $AgeKeyDir      = 'C:\ProgramData\coderaft'
 $AgeKeyPath     = Join-Path $AgeKeyDir 'age.key'
@@ -51,6 +52,95 @@ Write-Host "  |  CodeRaft - SOPS+age secrets migration  |" -ForegroundColor Cyan
 Write-Host "  |  (v$ScriptVersion)                              |" -ForegroundColor Cyan
 Write-Host "  +-----------------------------------------+" -ForegroundColor Cyan
 Write-Host ""
+
+# ── Local age key (bind-mount source for dashboard-api) ─────────────────────
+$AgeKeyLocal = Join-Path (Get-Location) '.coderaft-age.key'
+
+function Mirror-AgeKeyToLocal {
+    if (Test-Path $AgeKeyLocal) { return $true }
+    if (Test-Path $AgeKeyPath) {
+        try {
+            Copy-Item -LiteralPath $AgeKeyPath -Destination $AgeKeyLocal -Force
+            $acl = Get-Acl $AgeKeyLocal
+            $acl.SetAccessRuleProtection($true, $false)
+            $admin = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                "BUILTIN\Administrators","FullControl","Allow")
+            $acl.SetAccessRule($admin)
+            Set-Acl -Path $AgeKeyLocal -AclObject $acl
+            Write-Info "Mirrored age key to $AgeKeyLocal (bind-mount source for dashboard-api)"
+            return $true
+        } catch {
+            return $false
+        }
+    }
+    return $false
+}
+
+# ── -Finalize fast path: purge leftover plaintext .env safely ───────────────
+if ($Finalize) {
+    Write-Host "  -- -Finalize: purge plaintext .env --"
+    if (-not (Test-Path '.env.enc')) {
+        Write-Fatal ".env.enc missing — nothing to finalize. Run a full migration first."
+    }
+    if (-not (Test-Path '.env')) {
+        Write-Info "No plaintext .env present. Nothing to do."
+        exit 0
+    }
+    if (-not (Get-Command sops.exe -ErrorAction SilentlyContinue)) {
+        Write-Fatal "sops.exe required for -Finalize. Install it first or run a full migration."
+    }
+    if (-not (Test-Path $AgeKeyPath) -and -not (Test-Path $AgeKeyLocal)) {
+        Write-Fatal "No age key found at $AgeKeyPath or $AgeKeyLocal. Cannot verify .env.enc."
+    }
+    Mirror-AgeKeyToLocal | Out-Null
+    $ageKeyForDecrypt = if (Test-Path $AgeKeyLocal) { $AgeKeyLocal } else { $AgeKeyPath }
+
+    $verifyTmp = Join-Path $env:TEMP ("coderaft-finalize-" + (Get-Date -Format 'yyyyMMddHHmmss') + ".env")
+    $env:SOPS_AGE_KEY_FILE = $ageKeyForDecrypt
+    try {
+        & sops.exe --decrypt .env.enc | Out-File -FilePath $verifyTmp -Encoding UTF8
+        if ($LASTEXITCODE -ne 0) {
+            Write-Fatal ".env.enc cannot be decrypted with the available age key — refusing to purge .env."
+        }
+        $original  = Get-Content '.env'      -Raw
+        $decrypted = Get-Content $verifyTmp  -Raw
+        $diff = Compare-Object ($original -split "`n") ($decrypted -split "`n")
+        if ($diff) {
+            Write-Warn ".env and .env.enc differ. Aborting -Finalize."
+            $diff | Format-Table | Out-String | Write-Host
+            exit 1
+        }
+    } finally {
+        Remove-Item $verifyTmp -ErrorAction SilentlyContinue
+        Remove-Item Env:SOPS_AGE_KEY_FILE -ErrorAction SilentlyContinue
+    }
+
+    $ts = Get-Date -Format 'yyyyMMddTHHmmssZ'
+    New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
+    $bak = Join-Path $DataDir "env-pre-finalize-$ts.bak"
+    Copy-Item '.env' $bak -Force
+    $acl = Get-Acl $bak
+    $acl.SetAccessRuleProtection($true, $false)
+    $adminRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        "BUILTIN\Administrators","FullControl","Allow")
+    $acl.SetAccessRule($adminRule)
+    Set-Acl -Path $bak -AclObject $acl
+    Remove-Item '.env' -Force
+    Write-Info ".env purged (24h backup: $bak)"
+    Add-Content -Path (Join-Path $DataDir 'migration.log') `
+        -Value "[migrate] finalize at $ts | plaintext purged | backup=$bak"
+
+    # Clean older 24h+ backups
+    Get-ChildItem -Path $DataDir -Filter 'env-pre-finalize-*.bak' -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) } |
+        Remove-Item -ErrorAction SilentlyContinue
+
+    Write-Host ""
+    Write-Info "Plaintext .env purged. Restart the dashboard-api so it re-reads .env.enc:"
+    Write-Host "    docker compose restart dashboard-api"
+    Write-Host ""
+    exit 0
+}
 
 # ── 1. Detect plaintext .env ─────────────────────────────────────────────────
 Write-Host "  -- .env detection --"
@@ -196,8 +286,28 @@ Write-Info "Verification OK: decryption matches the original .env"
 
 # ── 7. Remove .env ───────────────────────────────────────────────────────────
 Write-Host "  -- Remove plaintext .env --"
+# 24h-retention backup: copy .env to dashboard_data\.env.pre-sops-<ts>.bak
+$preSopsBak = Join-Path $DataDir ".env.pre-sops-$ts.bak"
+Copy-Item '.env' $preSopsBak -Force
+$acl = Get-Acl $preSopsBak
+$acl.SetAccessRuleProtection($true, $false)
+$adminRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+    "BUILTIN\Administrators","FullControl","Allow")
+$acl.SetAccessRule($adminRule)
+Set-Acl -Path $preSopsBak -AclObject $acl
 Remove-Item '.env' -Force
 Write-Info ".env removed (only .env.enc remains on disk)"
+Write-Info "Short-lived backup: $preSopsBak (auto-purged after 24h on next migrate run)"
+
+# Clean backups older than 24h on every run
+Get-ChildItem -Path $DataDir -Filter '.env.pre-sops-*.bak' -ErrorAction SilentlyContinue |
+    Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) } |
+    Remove-Item -ErrorAction SilentlyContinue
+
+# Mirror age key to install dir so the dashboard-api bind-mount works
+if (-not (Mirror-AgeKeyToLocal)) {
+    Write-Warn "Could not mirror age key to $AgeKeyLocal — dashboard-api may fail to decrypt."
+}
 
 # ── 8. RedFox jwt.key migration ──────────────────────────────────────────────
 Write-Host "  -- RedFox jwt.key migration --"

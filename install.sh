@@ -74,52 +74,79 @@ mkdir -p "${INSTALL_DIR}"
 cd "${INSTALL_DIR}"
 
 # ── age key setup (SOPS Phase 2 secrets management) ─────────────────────────
+# We keep TWO paths:
+#   * AGE_KEY_PATH      = /etc/coderaft/age.key      (system-wide, root-owned, legacy)
+#   * AGE_KEY_LOCAL     = ${INSTALL_DIR}/.coderaft-age.key (bind-mount source for
+#                                                          dashboard-api → /keys/age.key)
+# The compose bind-mount uses AGE_KEY_LOCAL so it works on macOS / Windows
+# Docker Desktop without giving the container root access to /etc/coderaft.
+# When AGE_KEY_PATH already exists (legacy install), we copy it to AGE_KEY_LOCAL
+# so the dashboard-api can decrypt .env.enc without changing convention.
 AGE_KEY_DIR="/etc/coderaft"
 AGE_KEY_PATH="${AGE_KEY_DIR}/age.key"
+AGE_KEY_LOCAL="$(pwd)/.coderaft-age.key"
+
+ensure_age_binary() {
+    if command -v age-keygen &>/dev/null; then
+        return 0
+    fi
+    echo "  Downloading age-keygen..."
+    AGE_VERSION="v1.2.1"
+    AGE_OS="${CODERAFT_OS/macos/darwin}"
+    AGE_TMP="$(mktemp -d)"
+    trap 'rm -rf "$AGE_TMP"' EXIT
+    curl -fsSL "https://github.com/FiloSottile/age/releases/download/${AGE_VERSION}/age-${AGE_VERSION}-${AGE_OS}-${CODERAFT_ARCH}.tar.gz" \
+        -o "${AGE_TMP}/age.tar.gz" 2>/dev/null || return 1
+    tar -xzf "${AGE_TMP}/age.tar.gz" -C "${AGE_TMP}" 2>/dev/null
+    sudo install -m 755 "${AGE_TMP}/age/age-keygen" /usr/local/bin/age-keygen 2>/dev/null \
+        || install -m 755 "${AGE_TMP}/age/age-keygen" "$HOME/.local/bin/age-keygen" 2>/dev/null \
+        || return 1
+    sudo install -m 755 "${AGE_TMP}/age/age" /usr/local/bin/age 2>/dev/null \
+        || install -m 755 "${AGE_TMP}/age/age" "$HOME/.local/bin/age" 2>/dev/null \
+        || true
+    echo "  ✓ age installed"
+    return 0
+}
 
 setup_age_key() {
-    if [ -f "${AGE_KEY_PATH}" ]; then
-        echo "  ✓ age key already exists at ${AGE_KEY_PATH}"
+    # 1. If a legacy /etc/coderaft/age.key exists and the local one doesn't,
+    #    mirror it so the dashboard-api bind-mount works without sudo.
+    if [ -f "${AGE_KEY_PATH}" ] && [ ! -f "${AGE_KEY_LOCAL}" ]; then
+        echo "  ✓ Reusing legacy age key from ${AGE_KEY_PATH}"
+        sudo cat "${AGE_KEY_PATH}" 2>/dev/null > "${AGE_KEY_LOCAL}" \
+            || cat "${AGE_KEY_PATH}" 2>/dev/null > "${AGE_KEY_LOCAL}" \
+            || { echo "  ⚠ Could not read ${AGE_KEY_PATH} — generating a new local key."; rm -f "${AGE_KEY_LOCAL}"; }
+        if [ -s "${AGE_KEY_LOCAL}" ]; then
+            chmod 400 "${AGE_KEY_LOCAL}"
+            return 0
+        fi
+    fi
+
+    if [ -f "${AGE_KEY_LOCAL}" ]; then
+        echo "  ✓ age key already exists at ${AGE_KEY_LOCAL}"
         return 0
     fi
 
-    # Install age-keygen if not present
-    if ! command -v age-keygen &>/dev/null; then
-        echo "  Downloading age-keygen..."
-        AGE_VERSION="v1.2.1"
-        AGE_OS="${CODERAFT_OS/macos/darwin}"
-        AGE_TMP="$(mktemp -d)"
-        trap 'rm -rf "$AGE_TMP"' EXIT
-        curl -fsSL "https://github.com/FiloSottile/age/releases/download/${AGE_VERSION}/age-${AGE_VERSION}-${AGE_OS}-${CODERAFT_ARCH}.tar.gz" \
-            -o "${AGE_TMP}/age.tar.gz" 2>/dev/null || {
-            echo "  ⚠ Could not download age-keygen. SOPS encryption will be set up by the dashboard."
-            return 1
-        }
-        tar -xzf "${AGE_TMP}/age.tar.gz" -C "${AGE_TMP}" 2>/dev/null
-        sudo install -m 755 "${AGE_TMP}/age/age-keygen" /usr/local/bin/age-keygen 2>/dev/null || {
-            echo "  ⚠ Could not install age-keygen (no sudo?). SOPS encryption skipped."
-            return 1
-        }
-        echo "  ✓ age-keygen installed"
+    if ! ensure_age_binary; then
+        echo "  ⚠ Could not install age — SOPS encryption deferred to migrate-to-sops.sh"
+        return 1
     fi
 
-    echo "  Generating age key at ${AGE_KEY_PATH} (sudo required)..."
-    sudo mkdir -p "${AGE_KEY_DIR}"
-    sudo age-keygen -o "${AGE_KEY_PATH}" 2>/dev/null
-    sudo chmod 400 "${AGE_KEY_PATH}"
-    sudo chown root:root "${AGE_KEY_PATH}" 2>/dev/null || true
-    echo "  ✓ age key generated"
+    echo "  Generating age key at ${AGE_KEY_LOCAL}..."
+    age-keygen -o "${AGE_KEY_LOCAL}" 2>/dev/null || return 1
+    chmod 400 "${AGE_KEY_LOCAL}"
+    echo "  ✓ age key generated (${AGE_KEY_LOCAL})"
     echo ""
-    echo "  IMPORTANT: Back up ${AGE_KEY_PATH} to an encrypted USB or secure vault."
+    echo "  IMPORTANT: Back up ${AGE_KEY_LOCAL} to an encrypted USB or secure vault."
     echo "  If this key is lost, all encrypted .env.enc secrets are unrecoverable."
     echo ""
+    return 0
 }
 
-# Only attempt age setup on Linux (where /etc/coderaft is writable with sudo).
-# On macOS the dashboard-api handles it at first boot.
-if [ "${CODERAFT_OS}" = "linux" ]; then
-    setup_age_key || true
-fi
+# Try to set up age key on every OS. Failure is non-fatal: the dashboard
+# falls back to plaintext .env with a loud warning, and the operator can
+# run scripts/migrate-to-sops.sh later.
+setup_age_key || true
 
 # Generate secrets on first install
 gen_hex() { openssl rand -hex "$1" 2>/dev/null || head -c "$1" /dev/urandom | od -An -tx1 | tr -d ' \n'; }
@@ -130,7 +157,7 @@ if [ -f ".env" ] && grep -q '^POSTGRES_PASSWORD=' .env 2>/dev/null; then
     # Update HOST_PROJECT_DIR in case install location changed
     grep -q '^HOST_PROJECT_DIR=' .env 2>/dev/null || echo "HOST_PROJECT_DIR=${ABSOLUTE_INSTALL_DIR}" >> .env
     # Backward compat: legacy install without .env.enc — show warning in dashboard
-    if [ ! -f "${AGE_KEY_PATH}" ]; then
+    if [ ! -f "${AGE_KEY_LOCAL}" ] && [ ! -f "${AGE_KEY_PATH}" ]; then
         echo "  ⚠ Legacy install detected: no age key found."
         echo "    Secrets are currently stored as plaintext in .env."
         echo "    Run the Setup Wizard to migrate to encrypted .env.enc."
@@ -150,6 +177,72 @@ CODERAFT_HOST_ARCH=${CODERAFT_ARCH}
 ENVFILE
     chmod 600 .env
     echo "  ✓ Secrets generated"
+fi
+
+# ── Encrypt .env → .env.enc and purge plaintext (banking-grade) ─────────────
+# Runs on first install OR on a re-install where plaintext is still around. The
+# dashboard-api still needs a plaintext .env at `docker compose up` time for
+# variable interpolation, so we keep .env present here and let the dashboard
+# decrypt .env.enc on subsequent boots. The migrate-to-sops.sh --finalize step
+# is what eventually purges plaintext on running deployments. For NEW installs
+# we can be more aggressive: write .env.enc immediately so readHostEnv() never
+# touches plaintext after the first `docker compose up` settles.
+encrypt_env_to_enc() {
+    local age_key=""
+    if [ -f "${AGE_KEY_LOCAL}" ]; then
+        age_key="${AGE_KEY_LOCAL}"
+    elif [ -f "${AGE_KEY_PATH}" ]; then
+        # Mirror legacy key into install dir so the bind-mount works.
+        sudo cat "${AGE_KEY_PATH}" 2>/dev/null > "${AGE_KEY_LOCAL}" \
+            || cat "${AGE_KEY_PATH}" 2>/dev/null > "${AGE_KEY_LOCAL}" \
+            || return 1
+        chmod 400 "${AGE_KEY_LOCAL}"
+        age_key="${AGE_KEY_LOCAL}"
+    else
+        return 1
+    fi
+
+    if ! command -v sops &>/dev/null; then
+        # Try to install sops on the fly; non-fatal.
+        SOPS_VERSION="v3.8.1"
+        SOPS_OS="${CODERAFT_OS/macos/darwin}"
+        curl -fsSL "https://github.com/getsops/sops/releases/download/${SOPS_VERSION}/sops-${SOPS_VERSION}.${SOPS_OS}.${CODERAFT_ARCH}" \
+            -o /tmp/sops-coderaft 2>/dev/null || return 1
+        sudo install -m 755 /tmp/sops-coderaft /usr/local/bin/sops 2>/dev/null \
+            || install -m 755 /tmp/sops-coderaft "$HOME/.local/bin/sops" 2>/dev/null \
+            || return 1
+        rm -f /tmp/sops-coderaft
+    fi
+
+    local age_pub
+    age_pub=$(grep "# public key:" "${age_key}" 2>/dev/null | head -1 | awk '{print $NF}')
+    [ -n "${age_pub}" ] || return 1
+
+    SOPS_AGE_KEY_FILE="${age_key}" sops --encrypt --age "${age_pub}" --output .env.enc .env \
+        || return 1
+    chmod 600 .env.enc
+    echo "  ✓ .env.enc created (sops + age)"
+    return 0
+}
+
+if [ -f .env ] && [ ! -f .env.enc ]; then
+    if encrypt_env_to_enc; then
+        echo "  ✓ Secrets encrypted to .env.enc"
+        # On a fresh install we keep .env (compose interpolation needs it for
+        # the very first `up`). The dashboard-api re-encrypts on every deploy
+        # and will refuse to read plaintext at runtime when CODERAFT_REJECT_PLAINTEXT_ENV=1.
+        # Operators can run `bash scripts/migrate-to-sops.sh --finalize` after
+        # the first successful boot to purge plaintext for good.
+        echo ""
+        echo "  ⚠ Plaintext .env still on disk (needed by 'docker compose up' for"
+        echo "    variable interpolation). Run this AFTER the dashboard boots OK:"
+        echo "        curl -fsSL https://install.coderaft.io/migrate.sh | bash -s -- --finalize"
+        echo ""
+    else
+        echo "  ⚠ Could not encrypt .env to .env.enc (age/sops unavailable)."
+        echo "    Plaintext .env will be used as fallback."
+        echo "    Run scripts/migrate-to-sops.sh later to fix."
+    fi
 fi
 
 # Read the capture token back so we can pass it to the native daemon
@@ -223,10 +316,17 @@ services:
       - CONTAINER_COMPOSE_DIR=/host-compose
       - HOST_PROJECT_DIR=${HOST_PROJECT_DIR}
       - COMPOSE_PROJECT_NAME=coderaft
+      # Banking-grade: dashboard-api reads .env.enc (sops+age). Plaintext .env
+      # is refused at runtime when CODERAFT_REJECT_PLAINTEXT_ENV=1.
+      - CODERAFT_REJECT_PLAINTEXT_ENV=1
+      - SOPS_AGE_KEY_FILE=/keys/age.key
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - dashboard_data:/data
       - .:/host-compose
+      # Age private key for SOPS decryption. The installer creates the host
+      # file at .coderaft-age.key on first run when `age` is available.
+      - ./.coderaft-age.key:/keys/age.key:ro
     security_opt: [no-new-privileges:true]
     restart: unless-stopped
 

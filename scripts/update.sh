@@ -137,6 +137,20 @@ else
     echo "  ✓ compose OK"
 fi
 
+# ── Plaintext secrets coexistence warning ─────────────────────────────────
+# Banking-grade: when .env.enc exists, the plaintext .env is supposed to be
+# purged (migrate-to-sops.sh --finalize). If both files are around, the
+# operator's secrets are still at-rest in clear and the SOPS migration is
+# effectively theatre. Warn loudly but never block the update — the operator
+# may be in the middle of a legitimate transition window.
+echo ""
+if [ -f "$INSTALL_DIR/.env.enc" ] && [ -f "$INSTALL_DIR/.env" ]; then
+    echo "  ⚠ ⚠ ⚠ Plaintext .env detected alongside encrypted .env.enc."
+    echo "       Banking-grade policy requires plaintext to be purged after migration."
+    echo "       Run:  bash scripts/migrate-to-sops.sh --finalize"
+    echo "       (or:  curl -fsSL https://install.coderaft.io/migrate.sh | bash -s -- --finalize)"
+fi
+
 # ── Host capture sanity check (Live Capture / Frame Analyzer) ─────────────
 # When the operator picked native capture (CODERAFT_HOST_OS=windows|macos),
 # Ravenscan expects a host daemon on 127.0.0.1:7777 reachable via

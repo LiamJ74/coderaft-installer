@@ -167,6 +167,19 @@ if (-not $composeOK) {
     Write-Host "  ✓ compose OK"
 }
 
+# ── Plaintext secrets coexistence warning ─────────────────────────────────
+# Banking-grade: when .env.enc exists, the plaintext .env is supposed to be
+# purged (migrate-to-sops.ps1 -Finalize). Warn loudly but never block.
+Write-Host ""
+$envPlain = Join-Path $INSTALL_DIR ".env"
+$envEnc   = Join-Path $INSTALL_DIR ".env.enc"
+if ((Test-Path $envEnc) -and (Test-Path $envPlain)) {
+    Write-Host "  [!] [!] [!] Plaintext .env detected alongside encrypted .env.enc." -ForegroundColor Yellow
+    Write-Host "          Banking-grade policy requires plaintext to be purged after migration." -ForegroundColor Yellow
+    Write-Host "          Run:  .\scripts\migrate-to-sops.ps1 -Finalize" -ForegroundColor Yellow
+    Write-Host "          (or:  iex (irm https://install.coderaft.io/migrate.ps1) -Finalize)" -ForegroundColor Yellow
+}
+
 # ── Host capture sanity check (Live Capture / Frame Analyzer) ─────────────
 # Mirrors update.sh: when CODERAFT_HOST_OS=windows|macos the Frame Analyzer
 # expects a native daemon on 127.0.0.1:7777. We probe via an alpine curl
