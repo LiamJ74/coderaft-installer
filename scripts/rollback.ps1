@@ -67,7 +67,10 @@ Write-Host ""
 Write-Host "  Rolling back to snapshot $TARGET_ID ..."
 
 try {
-    $body = "{`"id`":`"$TARGET_ID`"}"
+    # C14 fix: use ConvertTo-Json instead of hand-escaped double-quoted string.
+    # The backtick-escape form ("{`"id`":`"$TARGET_ID`"}") cascade-fails in PS 5.1
+    # when TARGET_ID contains characters that interact with the PS parser.
+    $body = @{ id = $TARGET_ID } | ConvertTo-Json -Compress
     $result = Invoke-RestMethod -Method Post -Uri "$DASHBOARD_API/api/dashboard/recovery/rollback" `
         -Headers $headers -Body $body -TimeoutSec 60
 } catch {
