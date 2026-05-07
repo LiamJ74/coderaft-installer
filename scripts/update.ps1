@@ -260,6 +260,10 @@ if ($vaultNeedsMigration) {
     } catch { }
     Write-Host "  ✓ Pre-flight backup complete"
 
+    # Migration log (used by all phases — captures docker / openssl stdout+stderr).
+    $migrationLog = Join-Path $vaultBak "migration.log"
+    "[$(Get-Date -Format o)] migration started" | Out-File -FilePath $migrationLog -Encoding utf8
+
     # Rollback helper
     function Invoke-VaultMigrationRollback {
         param([string]$Reason)
@@ -366,46 +370,67 @@ if ($vaultNeedsMigration) {
     # ── 4c.2 mTLS PKI + config.yaml + acl.yaml (ALWAYS — idempotent) ──────
     # These artefacts cost <1s to regenerate and are always overwritten so a
     # half-bootstrapped vault from a previous failed run is healed on next try.
-    Write-Host "  Bootstrapping vault TLS PKI + config..."
-    $openssl = Get-Command openssl -ErrorAction SilentlyContinue
-    if (-not $openssl) {
-        $gitOpenssl = "C:\Program Files\Git\usr\bin\openssl.exe"
-        if (Test-Path $gitOpenssl) { $openssl = [pscustomobject]@{ Path = $gitOpenssl } }
-        else { Invoke-VaultMigrationRollback "openssl required (install Git for Windows or Chocolatey)" }
-    }
-    $opensslPath = if ($openssl.Path) { $openssl.Path } else { $openssl }
+    # PKI generation runs inside a one-shot alpine container (always has openssl
+    # baked in) — no host dependency on openssl/Git for Windows.
+    Write-Host "  Bootstrapping vault TLS PKI + config (via alpine container)..."
     $tlsDir = Join-Path $INSTALL_DIR "vault-tls"
     $cfgDir = Join-Path $INSTALL_DIR "vault-config"
-    & $opensslPath req -x509 -newkey rsa:4096 -days 3650 -nodes -sha256 `
-        -keyout (Join-Path $tlsDir "client-ca.key") -out (Join-Path $tlsDir "client-ca.crt") `
-        -subj "/CN=coderaft-vault-ca" -addext "basicConstraints=critical,CA:TRUE" 2>$null
-    & $opensslPath req -newkey rsa:2048 -nodes -sha256 `
-        -keyout (Join-Path $tlsDir "vault.key") -out (Join-Path $tlsDir "vault.csr") `
-        -subj "/CN=coderaft-vault" 2>$null
-    $extServer = "subjectAltName=DNS:coderaft-vault,DNS:localhost,IP:127.0.0.1`nbasicConstraints=CA:FALSE"
-    $extServerFile = [System.IO.Path]::GetTempFileName()
-    [System.IO.File]::WriteAllText($extServerFile, $extServer)
-    & $opensslPath x509 -req -days 3650 -sha256 `
-        -in (Join-Path $tlsDir "vault.csr") -CA (Join-Path $tlsDir "client-ca.crt") -CAkey (Join-Path $tlsDir "client-ca.key") -CAcreateserial `
-        -out (Join-Path $tlsDir "vault.crt") -extfile $extServerFile 2>$null
-    Remove-Item $extServerFile, (Join-Path $tlsDir "vault.csr") -ErrorAction SilentlyContinue
-    foreach ($pair in @(
-        @("dashboard-api", "dashboard-api.coderaft.local"),
-        @("entraguard",    "entraguard.coderaft.local"),
-        @("ravenscan",     "ravenscan.coderaft.local"),
-        @("redfox",        "redfox.coderaft.local")
-    )) {
-        $name = $pair[0]; $san = $pair[1]
-        & $opensslPath req -newkey rsa:2048 -nodes -sha256 `
-            -keyout (Join-Path $tlsDir "$name-client.key") -out (Join-Path $tlsDir "$name-client.csr") `
-            -subj "/CN=$san" 2>$null
-        $extClient = "subjectAltName=DNS:$san`nbasicConstraints=CA:FALSE"
-        $extClientFile = [System.IO.Path]::GetTempFileName()
-        [System.IO.File]::WriteAllText($extClientFile, $extClient)
-        & $opensslPath x509 -req -days 3650 -sha256 `
-            -in (Join-Path $tlsDir "$name-client.csr") -CA (Join-Path $tlsDir "client-ca.crt") -CAkey (Join-Path $tlsDir "client-ca.key") -CAcreateserial `
-            -out (Join-Path $tlsDir "$name-client.crt") -extfile $extClientFile 2>$null
-        Remove-Item $extClientFile, (Join-Path $tlsDir "$name-client.csr") -ErrorAction SilentlyContinue
+
+    # Single shell script run inside alpine that produces all certs at once.
+    # Uses /work as the bind-mounted vault-tls directory.
+    $opensslScript = @'
+set -e
+apk add --no-cache openssl >/dev/null
+cd /work
+# CA
+openssl req -x509 -newkey rsa:4096 -days 3650 -nodes -sha256 \
+    -keyout client-ca.key -out client-ca.crt \
+    -subj "/CN=coderaft-vault-ca" \
+    -addext "basicConstraints=critical,CA:TRUE" 2>/dev/null
+# Server cert
+openssl req -newkey rsa:2048 -nodes -sha256 \
+    -keyout vault.key -out vault.csr \
+    -subj "/CN=coderaft-vault" 2>/dev/null
+cat > /tmp/server.ext <<EOF
+subjectAltName=DNS:coderaft-vault,DNS:localhost,IP:127.0.0.1
+basicConstraints=CA:FALSE
+EOF
+openssl x509 -req -days 3650 -sha256 \
+    -in vault.csr -CA client-ca.crt -CAkey client-ca.key -CAcreateserial \
+    -out vault.crt -extfile /tmp/server.ext 2>/dev/null
+rm -f vault.csr
+# Per-product client certs
+for pair in "dashboard-api:dashboard-api.coderaft.local" \
+            "entraguard:entraguard.coderaft.local" \
+            "ravenscan:ravenscan.coderaft.local" \
+            "redfox:redfox.coderaft.local"; do
+    name="${pair%%:*}"
+    san="${pair##*:}"
+    openssl req -newkey rsa:2048 -nodes -sha256 \
+        -keyout "${name}-client.key" -out "${name}-client.csr" \
+        -subj "/CN=${san}" 2>/dev/null
+    cat > /tmp/client.ext <<EOF
+subjectAltName=DNS:${san}
+basicConstraints=CA:FALSE
+EOF
+    openssl x509 -req -days 3650 -sha256 \
+        -in "${name}-client.csr" -CA client-ca.crt -CAkey client-ca.key -CAcreateserial \
+        -out "${name}-client.crt" -extfile /tmp/client.ext 2>/dev/null
+    rm -f "${name}-client.csr"
+done
+chmod 600 *.key 2>/dev/null || true
+'@
+    # Bind-mount tlsDir into the alpine container at /work and run the script.
+    # Use --user to keep file ownership readable on Linux hosts; on Windows/Mac
+    # Docker Desktop handles UID translation transparently.
+    $absTlsDir = (Resolve-Path -LiteralPath $tlsDir).Path
+    # Use stdin to avoid quoting nightmares with the heredoc inside the script.
+    $opensslOut = $opensslScript | & docker run --rm -i `
+        -v "${absTlsDir}:/work" `
+        alpine:3.20 sh 2>&1
+    $opensslOut | Tee-Object -FilePath $migrationLog -Append | Out-Host
+    if (-not (Test-Path (Join-Path $tlsDir "vault.crt"))) {
+        Invoke-VaultMigrationRollback "openssl-in-alpine cert generation failed (see $migrationLog)"
     }
     $configYaml = @'
 server:
@@ -445,8 +470,7 @@ clients:
 
     # All docker output (stdout + stderr) is logged to migration.log inside the
     # backup dir AND streamed to the console. No more silent failures.
-    $migrationLog = Join-Path $vaultBak "migration.log"
-    "[$(Get-Date -Format o)] Phase 4d — pull + start vault" | Out-File -FilePath $migrationLog -Encoding utf8
+    "[$(Get-Date -Format o)] Phase 4d — pull + start vault" | Out-File -FilePath $migrationLog -Append -Encoding utf8
 
     # ── 4d.1 — Compose patch ───────────────────────────────────────────────
     # Existing installs were generated by an older install.{sh,ps1} that did
