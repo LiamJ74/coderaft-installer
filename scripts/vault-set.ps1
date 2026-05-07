@@ -24,16 +24,17 @@ if ($ps -notmatch "running") {
     exit 1
 }
 
-# Escape for JSON (backslash then double-quote)
-$escapedValue = $Value -replace '\\', '\\' -replace '"', '\"'
-$body = "{`"name`":`"$Name`",`"value`":`"$escapedValue`"}"
+# Build JSON via ConvertTo-Json (PS 5.1 compatible).
+$body = @{ name = $Name; value = $Value } | ConvertTo-Json -Compress
+# POSIX-shell-quote the body for the wget --post-data argument.
+$shellSafeBody = $body -replace "'", "'\''"
 
 Write-Host "  Setting secret: $Name..."
 $resp = ""
 try {
     Push-Location $InstallDir -ErrorAction SilentlyContinue
-    $resp = & docker compose exec -T coderaft-vault /bin/sh -c `
-        "wget -qO- --post-data='$body' --header='Content-Type: application/json' http://localhost:8200/v1/secret/set 2>/dev/null" 2>$null
+    $cmd = "wget -qO- --post-data='$shellSafeBody' --header='Content-Type: application/json' http://localhost:8200/v1/secret/set"
+    $resp = & docker compose exec -T coderaft-vault /bin/sh -c $cmd 2>&1
     Pop-Location -ErrorAction SilentlyContinue
 } catch {
     Write-Host "  [!] docker exec failed: $($_.Exception.Message)" -ForegroundColor Red

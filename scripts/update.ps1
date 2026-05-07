@@ -412,19 +412,27 @@ if ($vaultNeedsMigration) {
     function Set-VaultSecret {
         param([string]$Name, [string]$Value)
         if (-not $Value) { return $true }
-        $body = "{`"name`":`"$Name`",`"value`":`"$Value`"}"
+        # Build JSON via ConvertTo-Json (PS 5.1 compatible) instead of hand-escaped strings.
+        $body = @{ name = $Name; value = $Value } | ConvertTo-Json -Compress
+        # Encode body for shell single-quote: replace any single quote with the
+        # POSIX shell trick '\''.  Vault names/values are alnum-ish so usually
+        # nothing to escape, but be defensive.
+        $shellSafeBody = $body -replace "'", "'\''"
+        $cmd = "wget -qO- --post-data='$shellSafeBody' --header='Content-Type: application/json' http://localhost:8200/v1/secret/set"
         try {
-            $resp = & docker compose exec -T coderaft-vault /bin/sh -c `
-                "wget -qO- --post-data='$body' --header='Content-Type: application/json' http://localhost:8200/v1/secret/set 2>/dev/null" 2>$null
-            return ($resp -match '"ok":true')
+            $resp = & docker compose exec -T coderaft-vault /bin/sh -c $cmd 2>&1
+            return (($resp -join "") -match '"ok"\s*:\s*true')
         } catch { return $false }
     }
     function Get-VaultSecret {
         param([string]$Name)
         try {
-            $resp = & docker compose exec -T coderaft-vault /bin/sh -c `
-                "wget -qO- --post-data='{`"name`":`"$Name`"}' --header='Content-Type: application/json' http://localhost:8200/v1/secret/get 2>/dev/null" 2>$null
-            if ($resp -match '"value":"([^"]*)"') { return $Matches[1] }
+            $body = @{ name = $Name } | ConvertTo-Json -Compress
+            $shellSafeBody = $body -replace "'", "'\''"
+            $cmd = "wget -qO- --post-data='$shellSafeBody' --header='Content-Type: application/json' http://localhost:8200/v1/secret/get"
+            $resp = & docker compose exec -T coderaft-vault /bin/sh -c $cmd 2>&1
+            $respText = ($resp -join "")
+            if ($respText -match '"value"\s*:\s*"([^"]*)"') { return $Matches[1] }
         } catch { }
         return ""
     }
