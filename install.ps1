@@ -123,12 +123,32 @@ function Invoke-VaultBootstrap {
         return
     }
 
-    # Find age-keygen on PATH or common locations
+    # Find age-keygen on PATH; auto-download from GitHub releases if absent
+    # (mirrors the install.sh behaviour for macOS/Linux).
     $ageKeygen = Get-Command age-keygen -ErrorAction SilentlyContinue
     if (-not $ageKeygen) {
-        Write-Host "  ✗ age-keygen is required for vault key bootstrap but was not found." -ForegroundColor Red
-        Write-Host "    Download from https://github.com/FiloSottile/age/releases" -ForegroundColor Red
-        exit 1
+        Write-Host "    age-keygen not on PATH — downloading from GitHub releases..."
+        $ageVersion = "v1.2.1"
+        $ageArch = if ([Environment]::Is64BitOperatingSystem) { "amd64" } else { "386" }
+        $ageTmp = Join-Path $env:TEMP "coderaft-age-$(Get-Random)"
+        New-Item -ItemType Directory -Force -Path $ageTmp | Out-Null
+        $ageZip = Join-Path $ageTmp "age.zip"
+        $ageUrl = "https://github.com/FiloSottile/age/releases/download/$ageVersion/age-$ageVersion-windows-$ageArch.zip"
+        try {
+            Invoke-WebRequest -Uri $ageUrl -OutFile $ageZip -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+            Expand-Archive -Path $ageZip -DestinationPath $ageTmp -Force -ErrorAction Stop
+            $ageKeygenExe = Get-ChildItem -Path $ageTmp -Filter "age-keygen.exe" -Recurse | Select-Object -First 1
+            if (-not $ageKeygenExe) {
+                Write-Host "  ✗ age-keygen.exe missing in downloaded archive" -ForegroundColor Red
+                exit 1
+            }
+            $ageKeygen = [pscustomobject]@{ Path = $ageKeygenExe.FullName }
+            Write-Host "    ✓ age-keygen downloaded ($($ageKeygen.Path))" -ForegroundColor Green
+        } catch {
+            Write-Host "  ✗ Could not auto-download age-keygen: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "    Manual install: https://github.com/FiloSottile/age/releases" -ForegroundColor Red
+            exit 1
+        }
     }
 
     Write-Host "  Generating vault master key..."

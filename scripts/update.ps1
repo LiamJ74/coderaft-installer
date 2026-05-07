@@ -291,7 +291,26 @@ if ($vaultNeedsMigration) {
         New-Item -ItemType Directory -Force -Path (Join-Path $INSTALL_DIR "vault-config") | Out-Null
 
         $ageKeygen = Get-Command age-keygen -ErrorAction SilentlyContinue
-        if (-not $ageKeygen) { Invoke-VaultMigrationRollback "age-keygen not found" }
+        if (-not $ageKeygen) {
+            # Auto-download age-keygen.exe from GitHub releases (mirrors install.sh logic).
+            Write-Host "    age-keygen not on PATH — downloading from GitHub releases..."
+            $ageVersion = "v1.2.1"
+            $ageArch = if ([Environment]::Is64BitOperatingSystem) { "amd64" } else { "386" }
+            $ageTmp = Join-Path $env:TEMP "coderaft-age-$(Get-Random)"
+            New-Item -ItemType Directory -Force -Path $ageTmp | Out-Null
+            $ageZip = Join-Path $ageTmp "age.zip"
+            $ageUrl = "https://github.com/FiloSottile/age/releases/download/$ageVersion/age-$ageVersion-windows-$ageArch.zip"
+            try {
+                Invoke-WebRequest -Uri $ageUrl -OutFile $ageZip -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+                Expand-Archive -Path $ageZip -DestinationPath $ageTmp -Force -ErrorAction Stop
+                $ageKeygenExe = Get-ChildItem -Path $ageTmp -Filter "age-keygen.exe" -Recurse | Select-Object -First 1
+                if (-not $ageKeygenExe) { Invoke-VaultMigrationRollback "age-keygen.exe missing in downloaded archive" }
+                $ageKeygen = [pscustomobject]@{ Path = $ageKeygenExe.FullName }
+                Write-Host "    ✓ age-keygen downloaded to $($ageKeygen.Path)"
+            } catch {
+                Invoke-VaultMigrationRollback "age-keygen download failed: $($_.Exception.Message)"
+            }
+        }
 
         & $ageKeygen.Path -o $vaultAgeKey 2>$null
         if (-not (Test-Path $vaultAgeKey)) { Invoke-VaultMigrationRollback "age-keygen failed" }
