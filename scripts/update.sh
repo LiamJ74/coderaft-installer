@@ -347,9 +347,9 @@ refresh_license() {
     fi
 
     if [[ -n "$latest" && "$latest" != "$current_key" ]]; then
+        # 1. override.yml — replace ALL occurrences (entraguard-api +
+        #    entraguard-worker may share the same key across services).
         cp "$override_file" "${override_file}.bak"
-        # awk: replace ALL occurrences (entraguard-api + entraguard-worker
-        # may share the same key across multiple services).
         awk -v var="$env_var" -v key="$latest" '
             {
                 pat = "^[[:space:]]*-?[[:space:]]*" var "="
@@ -362,6 +362,39 @@ refresh_license() {
                 print
             }
         ' "${override_file}.bak" > "$override_file"
+
+        # 2. .env (host) — dashboard-api reads this directly, and compose
+        #    interpolation pulls ${LICENSE_KEY} from here too. Without this
+        #    sync, override.yml has the new key but dashboard-api keeps
+        #    seeing the old one and license.json never refreshes.
+        local env_file="$INSTALL_DIR/.env"
+        if [ -f "$env_file" ] && grep -qE "^[[:space:]]*${env_var}=" "$env_file"; then
+            cp "$env_file" "${env_file}.bak.$(date +%s)" 2>/dev/null || true
+            awk -v var="$env_var" -v key="$latest" '
+                {
+                    pat = "^[[:space:]]*" var "="
+                    if ($0 ~ pat) {
+                        print var "=" key
+                        next
+                    }
+                    print
+                }
+            ' "${env_file}" > "${env_file}.tmp" && mv "${env_file}.tmp" "${env_file}"
+        fi
+
+        # 3. .env.enc (sops) — re-encrypt if present so the next
+        #    dashboard-api boot reads the fresh key from the encrypted
+        #    source. Best-effort; banking-grade purge happens later.
+        if [ -f "$INSTALL_DIR/.env.enc" ] && command -v sops >/dev/null 2>&1; then
+            local age_key="${SOPS_AGE_KEY_FILE:-$INSTALL_DIR/.coderaft-age.key}"
+            [ ! -f "$age_key" ] && [ -f "/etc/coderaft/age.key" ] && age_key="/etc/coderaft/age.key"
+            if [ -f "$age_key" ] && [ -f "$INSTALL_DIR/.env" ]; then
+                SOPS_AGE_KEY_FILE="$age_key" sops --encrypt --input-type dotenv --output-type dotenv "$INSTALL_DIR/.env" > "$INSTALL_DIR/.env.enc.tmp" 2>/dev/null \
+                    && mv "$INSTALL_DIR/.env.enc.tmp" "$INSTALL_DIR/.env.enc" \
+                    || rm -f "$INSTALL_DIR/.env.enc.tmp"
+            fi
+        fi
+
         echo "  🔄 License refreshed for ${env_var}"
         return 1  # signal: restart needed
     fi

@@ -359,19 +359,50 @@ function Update-License {
     }
 
     if ($latest -and $latest -ne $currentKey) {
+        # 1. override.yml — replace ALL occurrences (worker + api may share)
         Copy-Item -LiteralPath $OverrideFile -Destination "$OverrideFile.bak" -Force
-        # Replace ALL occurrences (worker + api may share the key)
         $newContent = foreach ($line in $content) {
             if ($line -match $regex) {
                 $padMatch = [Regex]::Match($line, "^(\s*-?\s*)")
                 $pad = $padMatch.Groups[1].Value
                 "$pad$EnvVar=$latest"
-            } else {
-                $line
+            } else { $line }
+        }
+        [System.IO.File]::WriteAllLines($OverrideFile, $newContent, (New-Object System.Text.UTF8Encoding($false)))
+
+        # 2. .env (host) — dashboard-api reads this directly. Without this
+        #    sync, override.yml has the new key but dashboard-api keeps
+        #    seeing the old one and license.json never refreshes.
+        $envFile = Join-Path $INSTALL_DIR ".env"
+        if (Test-Path $envFile) {
+            $envLines = Get-Content -LiteralPath $envFile
+            $envRegex = "^\s*${EnvVar}="
+            if ($envLines -match $envRegex) {
+                Copy-Item -LiteralPath $envFile -Destination "$envFile.bak.$(Get-Date -UFormat %s)" -Force -ErrorAction SilentlyContinue
+                $newEnv = foreach ($l in $envLines) {
+                    if ($l -match $envRegex) { "$EnvVar=$latest" } else { $l }
+                }
+                [System.IO.File]::WriteAllLines($envFile, $newEnv, (New-Object System.Text.UTF8Encoding($false)))
             }
         }
-        # Preserve the absence of BOM and use Unix LF (compose tolerates CRLF but we avoid pollution)
-        [System.IO.File]::WriteAllLines($OverrideFile, $newContent, (New-Object System.Text.UTF8Encoding($false)))
+
+        # 3. .env.enc — re-encrypt so next dashboard-api boot reads fresh
+        $envEnc = Join-Path $INSTALL_DIR ".env.enc"
+        $sopsCmd = Get-Command sops -ErrorAction SilentlyContinue
+        if ((Test-Path $envEnc) -and $sopsCmd -and (Test-Path $envFile)) {
+            $ageKey = if ($env:SOPS_AGE_KEY_FILE) { $env:SOPS_AGE_KEY_FILE } else { Join-Path $INSTALL_DIR ".coderaft-age.key" }
+            if (-not (Test-Path $ageKey) -and (Test-Path "C:\ProgramData\coderaft\age.key")) {
+                $ageKey = "C:\ProgramData\coderaft\age.key"
+            }
+            if (Test-Path $ageKey) {
+                $env:SOPS_AGE_KEY_FILE = $ageKey
+                try {
+                    & $sopsCmd.Path --encrypt --input-type dotenv --output-type dotenv $envFile > "$envEnc.tmp" 2>$null
+                    if ($LASTEXITCODE -eq 0) { Move-Item -Force "$envEnc.tmp" $envEnc } else { Remove-Item -Force "$envEnc.tmp" -ErrorAction SilentlyContinue }
+                } catch { }
+            }
+        }
+
         Write-Host "  🔄 License refreshed for $EnvVar"
         return $true
     }
