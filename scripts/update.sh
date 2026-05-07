@@ -164,6 +164,382 @@ else
     echo "  ✓ compose OK"
 fi
 
+# ── Vault migration (D4) ─────────────────────────────────────────────────
+# Runs ONCE when the vault container is absent from the compose stack.
+# Phases: 4a detect → 4b backup → 4c key bootstrap → 4d pull+start vault →
+#         4e migrate secrets → 4f rollback on any failure → 4g sentinel →
+#         4h write CODERAFT_VAULT_* into .env.
+# All legacy stores are kept intact (7-day grace); no purge happens here.
+echo ""
+echo "  Checking vault migration status..."
+
+_vault_migration_needed() {
+    # 4a: skip if sentinel exists OR vault container is running
+    if [ -f "${INSTALL_DIR}/vault-data/.migrated" ]; then
+        echo "  ✓ Vault migration already complete (sentinel found)"
+        return 1
+    fi
+    if (cd "${INSTALL_DIR}" 2>/dev/null && docker compose ps coderaft-vault 2>/dev/null | grep -q "running"); then
+        echo "  ✓ coderaft-vault already running — skipping migration"
+        return 1
+    fi
+    # If vault service is in docker-compose.yml it means install.sh already
+    # ran with vault support — check if the keys dir is missing instead.
+    if [ ! -f "${INSTALL_DIR}/vault-keys/age.key" ]; then
+        echo "  Vault master key absent — migration required"
+        return 0
+    fi
+    return 0
+}
+
+_vault_migration_needed || true
+_VAULT_NEEDS_MIGRATION=0
+if ! [ -f "${INSTALL_DIR}/vault-data/.migrated" ] && \
+   ! (cd "${INSTALL_DIR}" 2>/dev/null && docker compose ps coderaft-vault 2>/dev/null | grep -q "running") 2>/dev/null; then
+    _VAULT_NEEDS_MIGRATION=1
+fi
+
+if [ "${_VAULT_NEEDS_MIGRATION}" = "1" ]; then
+    echo "  Running vault migration..."
+
+    # ── 4b Pre-flight backup (atomic — fail-fast) ─────────────────────────
+    _VAULT_TS=$(date -u +"%Y%m%dT%H%M%SZ")
+    _VAULT_BAK="${INSTALL_DIR}/backups/migrate-vault-${_VAULT_TS}"
+    mkdir -p "${_VAULT_BAK}"
+    echo "  Backup directory: ${_VAULT_BAK}"
+
+    _bak_fail() {
+        echo "  ✗ Pre-flight backup failed at: $1" >&2
+        echo "  Vault migration aborted — no changes made." >&2
+        exit 1
+    }
+
+    # Copy flat files
+    [ -f "${INSTALL_DIR}/.env" ]              && cp "${INSTALL_DIR}/.env"              "${_VAULT_BAK}/env"              || _bak_fail ".env"
+    [ -f "${INSTALL_DIR}/.env.enc" ]          && cp "${INSTALL_DIR}/.env.enc"          "${_VAULT_BAK}/env.enc"          || true
+    [ -f "${INSTALL_DIR}/.coderaft-age.key" ] && cp "${INSTALL_DIR}/.coderaft-age.key" "${_VAULT_BAK}/age.key"          || true
+
+    # Postgres auth_config dump
+    if (cd "${INSTALL_DIR}" 2>/dev/null && docker compose ps postgres 2>/dev/null | grep -q "running") 2>/dev/null; then
+        cd "${INSTALL_DIR}" && docker compose exec -T postgres \
+            pg_dump -U coderaft -t auth_config coderaft < /dev/null 2>/dev/null \
+            > "${_VAULT_BAK}/auth_config.sql" || true
+        cd - >/dev/null
+    fi
+
+    # Docker cp for container-side files (best-effort — containers may not be running)
+    (cd "${INSTALL_DIR}" 2>/dev/null && docker compose ps ravenscan 2>/dev/null | grep -q "running") 2>/dev/null && \
+        (cd "${INSTALL_DIR}" && docker compose cp "ravenscan:.ravenscan/ravenscan.db" "${_VAULT_BAK}/ravenscan.db" 2>/dev/null || true)
+    (cd "${INSTALL_DIR}" 2>/dev/null && docker compose ps dashboard-api 2>/dev/null | grep -q "running") 2>/dev/null && {
+        cd "${INSTALL_DIR}"
+        docker compose cp "dashboard-api:/data/vault.enc"    "${_VAULT_BAK}/dashboard-vault.enc" 2>/dev/null || true
+        docker compose cp "dashboard-api:/data/admin_token"  "${_VAULT_BAK}/admin_token"         2>/dev/null || true
+        cd - >/dev/null
+    }
+    echo "  ✓ Pre-flight backup complete"
+
+    # ── 4c Key bootstrap ──────────────────────────────────────────────────
+    if [ ! -f "${INSTALL_DIR}/vault-keys/age.key" ]; then
+        echo "  Generating vault master key..."
+        mkdir -p "${INSTALL_DIR}/vault-keys" "${INSTALL_DIR}/vault-tls" "${INSTALL_DIR}/vault-config"
+        if ! command -v age-keygen &>/dev/null; then
+            echo "  ✗ age-keygen required for vault bootstrap — install from https://github.com/FiloSottile/age/releases" >&2
+            exit 1
+        fi
+        age-keygen -o "${INSTALL_DIR}/vault-keys/age.key" 2>/dev/null
+        chmod 400 "${INSTALL_DIR}/vault-keys/age.key"
+
+        # Recovery phrase
+        _VAULT_RECOVERY=""
+        if [ "${CODERAFT_TEST_MODE:-0}" != "1" ]; then
+            _VAULT_PRIV=$(grep '^AGE-SECRET-KEY-' "${INSTALL_DIR}/vault-keys/age.key" 2>/dev/null || true)
+            if [ -n "$_VAULT_PRIV" ]; then
+                _VAULT_RECOVERY=$(echo "$_VAULT_PRIV" | \
+                    docker run --rm -i ghcr.io/liamj74/coderaft-vault:latest \
+                        -mnemonic-from-key /dev/stdin 2>/dev/null || true)
+            fi
+        fi
+        if [ -z "$_VAULT_RECOVERY" ]; then
+            _VAULT_PUB=$(grep '# public key:' "${INSTALL_DIR}/vault-keys/age.key" 2>/dev/null | awk '{print $NF}' || true)
+            _VAULT_RECOVERY="[FALLBACK] fingerprint: ${_VAULT_PUB}"
+        fi
+
+        echo ""
+        echo "  ╔══════════════════════════════════════════════════════════════════╗"
+        echo "  ║   *** VAULT RECOVERY PHRASE — WRITE THIS DOWN NOW ***           ║"
+        echo "  ╚══════════════════════════════════════════════════════════════════╝"
+        echo ""
+        echo "    ${_VAULT_RECOVERY}"
+        echo ""
+
+        if [ "${CODERAFT_TEST_MODE:-0}" = "1" ]; then
+            _VAULT_CONFIRM_REPLY="CONFIRMED"
+        else
+            printf "  Type CONFIRMED to continue: "
+            read -r _VAULT_CONFIRM_REPLY
+        fi
+        if [ "$_VAULT_CONFIRM_REPLY" != "CONFIRMED" ]; then
+            echo "  Aborted. vault-keys/age.key kept in place."
+            exit 1
+        fi
+
+        # Generate mTLS PKI if absent
+        if [ ! -f "${INSTALL_DIR}/vault-tls/ca.crt" ] && command -v openssl &>/dev/null; then
+            _old_pwd="$PWD"
+            cd "${INSTALL_DIR}"
+            _vault_gen_tls_update
+            cd "$_old_pwd"
+        fi
+    fi
+
+    # ── 4d Pull and start vault ────────────────────────────────────────────
+    _VAULT_ROLLBACK() {
+        echo "  ✗ Vault migration failed — rolling back..." >&2
+        (cd "${INSTALL_DIR}" 2>/dev/null && docker compose down 2>/dev/null) || true
+        # Restore flat files
+        [ -f "${_VAULT_BAK}/env" ]   && cp "${_VAULT_BAK}/env"   "${INSTALL_DIR}/.env"
+        [ -f "${_VAULT_BAK}/env.enc" ] && cp "${_VAULT_BAK}/env.enc" "${INSTALL_DIR}/.env.enc"
+        [ -f "${_VAULT_BAK}/age.key" ] && cp "${_VAULT_BAK}/age.key" "${INSTALL_DIR}/.coderaft-age.key"
+        # Restore postgres
+        if [ -s "${_VAULT_BAK}/auth_config.sql" ] && \
+           (cd "${INSTALL_DIR}" 2>/dev/null && docker compose up -d postgres 2>/dev/null); then
+            sleep 5
+            (cd "${INSTALL_DIR}" && docker compose exec -T postgres \
+                psql -U coderaft coderaft < "${_VAULT_BAK}/auth_config.sql" > /dev/null 2>&1 || true)
+        fi
+        # Remove vault from compose if present (revert)
+        if grep -q 'coderaft-vault:' "${INSTALL_DIR}/docker-compose.yml" 2>/dev/null; then
+            python3 -c "
+import re, sys
+txt = open('${INSTALL_DIR}/docker-compose.yml').read()
+# Remove coderaft-vault service block and vault_data volume and coderaft-vault-net network
+# Simple approach: warn operator to manually remove
+print('  ⚠ Remove coderaft-vault service from docker-compose.yml manually', file=sys.stderr)
+" 2>/dev/null || echo "  ⚠ Remove coderaft-vault from docker-compose.yml manually" >&2
+        fi
+        (cd "${INSTALL_DIR}" 2>/dev/null && docker compose up -d 2>/dev/null) || true
+        echo ""
+        echo "  Rollback complete. Backup is at: ${_VAULT_BAK}" >&2
+        echo "  The legacy secrets stores are intact." >&2
+        exit 1
+    }
+
+    # cosign verify if available and STRICT_COSIGN_VERIFY=1
+    if [ "${CODERAFT_TEST_MODE:-0}" != "1" ]; then
+        if command -v cosign &>/dev/null && [ "${STRICT_COSIGN_VERIFY:-}" = "1" ]; then
+            cosign verify \
+                --certificate-identity-regexp="^https://github.com/LiamJ74/" \
+                --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+                "ghcr.io/liamj74/coderaft-vault:latest" > /dev/null 2>&1 || {
+                echo "  ✗ cosign verify failed for coderaft-vault (STRICT_COSIGN_VERIFY=1)" >&2
+                exit 1
+            }
+        fi
+        docker pull ghcr.io/liamj74/coderaft-vault:latest 2>/dev/null || _VAULT_ROLLBACK
+    fi
+
+    # Inject test-mode failure point 4d
+    if [ "${CODERAFT_TEST_FAIL:-}" = "4d" ]; then
+        echo "  [TEST] Injecting failure at step 4d"
+        _VAULT_ROLLBACK
+    fi
+
+    # Start just the vault service (products still running from before)
+    (cd "${INSTALL_DIR}" && docker compose up -d coderaft-vault 2>/dev/null) || _VAULT_ROLLBACK
+
+    # Wait for vault to become healthy
+    _VAULT_HEALTHY=0
+    for _i in $(seq 1 20); do
+        _HEALTH=$(curl -sk --max-time 3 "https://coderaft-vault:8200/v1/health" 2>/dev/null \
+            || docker exec coderaft-coderaft-vault-1 /bin/sh -c \
+                'wget -qO- http://localhost:8200/v1/health 2>/dev/null' 2>/dev/null || true)
+        if echo "$_HEALTH" | grep -q '"sealed":false'; then
+            _VAULT_HEALTHY=1
+            break
+        fi
+        sleep 3
+    done
+    if [ "$_VAULT_HEALTHY" = "0" ]; then
+        echo "  ✗ coderaft-vault did not become healthy in time" >&2
+        _VAULT_ROLLBACK
+    fi
+    echo "  ✓ coderaft-vault is healthy"
+
+    # ── 4e Migrate secrets one at a time ─────────────────────────────────
+    # Helper: set a secret in the vault via docker exec
+    _vault_set() {
+        local name="$1" value="$2"
+        [ -z "$value" ] && return 0  # skip empty
+        local body
+        body=$(printf '{"name":"%s","value":"%s"}' "$name" "$value")
+        local resp
+        # Try via internal network (if a vault client exists), otherwise docker exec
+        resp=$(docker compose -f "${INSTALL_DIR}/docker-compose.yml" exec -T coderaft-vault \
+            /bin/sh -c "wget -qO- --post-data='${body}' \
+                --header='Content-Type: application/json' \
+                http://localhost:8200/v1/secret/set 2>/dev/null" 2>/dev/null || true)
+        echo "$resp" | grep -q '"ok":true'
+    }
+
+    # Helper: read a secret back to verify round-trip
+    _vault_get() {
+        local name="$1"
+        docker compose -f "${INSTALL_DIR}/docker-compose.yml" exec -T coderaft-vault \
+            /bin/sh -c "wget -qO- --post-data='{\"name\":\"${name}\"}' \
+                --header='Content-Type: application/json' \
+                http://localhost:8200/v1/secret/get 2>/dev/null" 2>/dev/null \
+            | grep -o '"value":"[^"]*"' | cut -d'"' -f4 || true
+    }
+
+    # Read secrets from .env
+    _env_val() {
+        grep -E "^[[:space:]]*$1=" "${INSTALL_DIR}/.env" 2>/dev/null \
+            | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | xargs 2>/dev/null || true
+    }
+
+    # Inject test-mode failure point 4e
+    if [ "${CODERAFT_TEST_FAIL:-}" = "4e" ]; then
+        echo "  [TEST] Injecting failure at step 4e"
+        _VAULT_ROLLBACK
+    fi
+
+    echo "  Migrating secrets to vault..."
+    _VAULT_MIGRATE_OK=1
+
+    # a. LICENSE_KEY
+    _LK=$(_env_val LICENSE_KEY)
+    if [ -n "$_LK" ]; then
+        _vault_set "license_key" "$_LK" || { _VAULT_MIGRATE_OK=0; echo "  ✗ Failed to migrate license_key" >&2; }
+        _READBACK=$(_vault_get "license_key")
+        [ "$_READBACK" = "$_LK" ] || { _VAULT_MIGRATE_OK=0; echo "  ✗ Round-trip verify failed: license_key" >&2; }
+    fi
+
+    # b-f. Infrastructure / product secrets from .env
+    for _SECRET_MAP in \
+        "POSTGRES_PASSWORD:postgres_password" \
+        "REDIS_PASSWORD:redis_password" \
+        "DASHBOARD_SECRET:dashboard_secret_legacy" \
+        "NEO4J_PASSWORD:neo4j_password" \
+        "RAVENSCAN_SECRET_KEY:ravenscan_secret_key" \
+        "RAVENSCAN_CAPTURE_TOKEN:ravenscan_capture_token" \
+        "RAVENSCAN_LICENSE_KEY:ravenscan_license_key" \
+        "REDFOX_MASTER_PASSPHRASE:redfox_master_passphrase" \
+        "REDFOX_JWT_PRIVATE_KEY:redfox_jwt_private_key" \
+        "REDFOX_JWT_PUBLIC_KEY:redfox_jwt_public_key" \
+        "REDFOX_GW_SESSION_SECRET:redfox_gw_session_secret" \
+        "REDFOX_LICENSE_KEY:redfox_license_key"; do
+        _ENV_KEY="${_SECRET_MAP%%:*}"
+        _VAULT_KEY="${_SECRET_MAP##*:}"
+        _VAL=$(_env_val "$_ENV_KEY")
+        if [ -n "$_VAL" ]; then
+            if _vault_set "$_VAULT_KEY" "$_VAL"; then
+                _RB=$(_vault_get "$_VAULT_KEY")
+                if [ "$_RB" != "$_VAL" ]; then
+                    _VAULT_MIGRATE_OK=0
+                    echo "  ✗ Round-trip verify failed: ${_VAULT_KEY}" >&2
+                fi
+            else
+                _VAULT_MIGRATE_OK=0
+                echo "  ✗ Failed to migrate: ${_VAULT_KEY}" >&2
+            fi
+        fi
+    done
+
+    if [ "$_VAULT_MIGRATE_OK" = "0" ]; then
+        _VAULT_ROLLBACK
+    fi
+    echo "  ✓ Secrets migrated and verified"
+
+    # ── 4g Sentinel ───────────────────────────────────────────────────────
+    # sentinel goes in the docker volume via docker exec, not host dir
+    docker compose -f "${INSTALL_DIR}/docker-compose.yml" exec -T coderaft-vault \
+        /bin/sh -c "touch /data/.migrated" 2>/dev/null || \
+        touch "${INSTALL_DIR}/vault-data/.migrated" 2>/dev/null || true
+    echo "  ✓ Migration sentinel written"
+
+    # ── 4h Write CODERAFT_VAULT_* into .env ──────────────────────────────
+    _add_env_if_missing_update() {
+        local key="$1" val="$2"
+        if ! grep -q "^${key}=" "${INSTALL_DIR}/.env" 2>/dev/null; then
+            printf '%s=%s\n' "$key" "$val" >> "${INSTALL_DIR}/.env"
+        fi
+    }
+    _add_env_if_missing_update "CODERAFT_VAULT_URL"      "https://coderaft-vault:8200"
+    _add_env_if_missing_update "CODERAFT_VAULT_AZURE"    "0"
+    _add_env_if_missing_update "CODERAFT_VAULT_LICENSE"  "0"
+    _add_env_if_missing_update "CODERAFT_VAULT_PRODUCTS" "0"
+    _add_env_if_missing_update "CODERAFT_VAULT_JWT"      "0"
+    chmod 600 "${INSTALL_DIR}/.env" 2>/dev/null || true
+    echo "  ✓ CODERAFT_VAULT_* vars written to .env"
+    echo ""
+    echo "  Vault migration complete."
+    echo "  Legacy stores retained for 7-day grace period."
+    echo "  The dashboard will show a banner to purge them after 7 days of stable operation."
+    echo ""
+fi
+
+_vault_gen_tls_update() {
+    # Called from update.sh when vault-tls/ca.crt is absent during migration.
+    # Requires openssl on PATH. No-ops if already present.
+    [ -f "vault-tls/ca.crt" ] && return 0
+    command -v openssl &>/dev/null || return 1
+    mkdir -p vault-tls vault-config
+    chmod 700 vault-tls
+
+    openssl req -x509 -newkey rsa:4096 -days 3650 -nodes -sha256 \
+        -keyout vault-tls/ca.key -out vault-tls/ca.crt \
+        -subj "/CN=coderaft-vault-ca" \
+        -addext "basicConstraints=critical,CA:TRUE" 2>/dev/null
+    chmod 600 vault-tls/ca.key vault-tls/ca.crt
+
+    openssl req -newkey rsa:2048 -nodes -sha256 \
+        -keyout vault-tls/server.key -out vault-tls/server.csr \
+        -subj "/CN=coderaft-vault" 2>/dev/null
+    openssl x509 -req -days 3650 -sha256 \
+        -in vault-tls/server.csr \
+        -CA vault-tls/ca.crt -CAkey vault-tls/ca.key -CAcreateserial \
+        -out vault-tls/server.crt \
+        -extfile <(printf "subjectAltName=DNS:coderaft-vault\nbasicConstraints=CA:FALSE") 2>/dev/null
+    rm -f vault-tls/server.csr
+    chmod 600 vault-tls/server.crt vault-tls/server.key
+
+    for _pair in "dashboard-api:dashboard-api.coderaft.local" \
+                 "entraguard:entraguard.coderaft.local" \
+                 "ravenscan:ravenscan.coderaft.local" \
+                 "redfox:redfox.coderaft.local"; do
+        _n="${_pair%%:*}"; _s="${_pair##*:}"
+        openssl req -newkey rsa:2048 -nodes -sha256 \
+            -keyout "vault-tls/${_n}-client.key" \
+            -out    "vault-tls/${_n}-client.csr" \
+            -subj   "/CN=${_s}" 2>/dev/null
+        openssl x509 -req -days 3650 -sha256 \
+            -in "vault-tls/${_n}-client.csr" \
+            -CA vault-tls/ca.crt -CAkey vault-tls/ca.key -CAcreateserial \
+            -out "vault-tls/${_n}-client.crt" \
+            -extfile <(printf "subjectAltName=DNS:%s\nbasicConstraints=CA:FALSE" "$_s") 2>/dev/null
+        rm -f "vault-tls/${_n}-client.csr"
+        chmod 600 "vault-tls/${_n}-client.crt" "vault-tls/${_n}-client.key"
+    done
+
+    cat > vault-config/acl.yaml << 'ACLEOF'
+# coderaft-vault ACL
+clients:
+  - san: "dashboard-api.coderaft.local"
+    role: admin
+    allow: ["*"]
+  - san: "entraguard.coderaft.local"
+    role: product
+    allow: ["azure_*", "license_key", "entraguard_*"]
+  - san: "ravenscan.coderaft.local"
+    role: product
+    allow: ["ravenscan_*", "neo4j_*"]
+  - san: "redfox.coderaft.local"
+    role: product
+    allow: ["redfox_*"]
+ACLEOF
+    chmod 600 vault-config/acl.yaml
+}
+
 # ── Banking-grade plaintext purge (auto) ──────────────────────────────────
 # When .env.enc exists, the plaintext .env MUST be purged (banking-grade,
 # no secrets at rest). The oneliner does the finalize itself: verifies the

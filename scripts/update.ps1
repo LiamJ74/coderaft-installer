@@ -195,6 +195,261 @@ if (-not $composeOK) {
     Write-Host "  ✓ compose OK"
 }
 
+# ── Vault migration (D4) ─────────────────────────────────────────────────
+# Runs ONCE when the vault container is absent from the compose stack.
+Write-Host ""
+Write-Host "  Checking vault migration status..."
+
+$vaultMigrationSentinel = Join-Path $INSTALL_DIR "vault-data\.migrated"
+$vaultAgeKey = Join-Path $INSTALL_DIR "vault-keys\age.key"
+$vaultRunning = $false
+try {
+    $ps = & docker compose ps coderaft-vault 2>$null
+    if ($ps -match "running") { $vaultRunning = $true }
+} catch { }
+
+$vaultNeedsMigration = $false
+if (-not (Test-Path $vaultMigrationSentinel) -and -not $vaultRunning) {
+    $vaultNeedsMigration = $true
+}
+
+if ($vaultNeedsMigration) {
+    Write-Host "  Running vault migration..."
+
+    # ── 4b Pre-flight backup ──────────────────────────────────────────────
+    $vaultTs  = (Get-Date -Format "yyyyMMddTHHmmssZ")
+    $vaultBak = Join-Path $INSTALL_DIR "backups\migrate-vault-$vaultTs"
+    New-Item -ItemType Directory -Force -Path $vaultBak | Out-Null
+    Write-Host "  Backup directory: $vaultBak"
+
+    $envPath = Join-Path $INSTALL_DIR ".env"
+    if (Test-Path $envPath) {
+        Copy-Item $envPath (Join-Path $vaultBak "env") -ErrorAction Stop
+    } else {
+        Write-Host "  ✗ .env not found — cannot backup. Vault migration aborted." -ForegroundColor Red
+        exit 1
+    }
+    $envEncPath = Join-Path $INSTALL_DIR ".env.enc"
+    if (Test-Path $envEncPath) { Copy-Item $envEncPath (Join-Path $vaultBak "env.enc") -ErrorAction SilentlyContinue }
+    $ageKeyPath = Join-Path $INSTALL_DIR ".coderaft-age.key"
+    if (Test-Path $ageKeyPath) { Copy-Item $ageKeyPath (Join-Path $vaultBak "age.key") -ErrorAction SilentlyContinue }
+
+    # Postgres dump
+    try {
+        $pgRunning = (& docker compose ps postgres 2>$null) -match "running"
+        if ($pgRunning) {
+            $bakSql = Join-Path $vaultBak "auth_config.sql"
+            $proc = Start-Process -FilePath "docker" `
+                -ArgumentList @("compose","exec","-T","postgres","pg_dump","-U","coderaft","-t","auth_config","coderaft") `
+                -RedirectStandardOutput $bakSql -NoNewWindow -PassThru -Wait
+            if ($proc.ExitCode -ne 0) { Remove-Item $bakSql -ErrorAction SilentlyContinue }
+        }
+    } catch { }
+
+    # Container-side files
+    try {
+        $rvRunning = (& docker compose ps ravenscan 2>$null) -match "running"
+        if ($rvRunning) { & docker compose cp "ravenscan:.ravenscan/ravenscan.db" (Join-Path $vaultBak "ravenscan.db") 2>$null }
+    } catch { }
+    try {
+        $apiRunning = (& docker compose ps dashboard-api 2>$null) -match "running"
+        if ($apiRunning) {
+            & docker compose cp "dashboard-api:/data/vault.enc"   (Join-Path $vaultBak "dashboard-vault.enc") 2>$null
+            & docker compose cp "dashboard-api:/data/admin_token" (Join-Path $vaultBak "admin_token") 2>$null
+        }
+    } catch { }
+    Write-Host "  ✓ Pre-flight backup complete"
+
+    # Rollback helper
+    function Invoke-VaultMigrationRollback {
+        param([string]$Reason)
+        Write-Host "  ✗ Vault migration failed: $Reason — rolling back..." -ForegroundColor Red
+        try { & docker compose down 2>$null } catch { }
+        if (Test-Path (Join-Path $vaultBak "env"))   { Copy-Item (Join-Path $vaultBak "env") $envPath -Force -ErrorAction SilentlyContinue }
+        if (Test-Path (Join-Path $vaultBak "env.enc")) { Copy-Item (Join-Path $vaultBak "env.enc") $envEncPath -Force -ErrorAction SilentlyContinue }
+        if (Test-Path (Join-Path $vaultBak "age.key")) { Copy-Item (Join-Path $vaultBak "age.key") $ageKeyPath -Force -ErrorAction SilentlyContinue }
+        $authSql = Join-Path $vaultBak "auth_config.sql"
+        if (Test-Path $authSql) {
+            try {
+                & docker compose up -d postgres 2>$null
+                Start-Sleep -Seconds 5
+                & docker compose exec -T postgres psql -U coderaft coderaft < $authSql 2>$null
+            } catch { }
+        }
+        try { & docker compose up -d 2>$null } catch { }
+        Write-Host ""
+        Write-Host "  Rollback complete. Backup: $vaultBak" -ForegroundColor Yellow
+        Write-Host "  Legacy secret stores are intact." -ForegroundColor Yellow
+        exit 1
+    }
+
+    # ── 4c Key bootstrap ──────────────────────────────────────────────────
+    if (-not (Test-Path $vaultAgeKey)) {
+        Write-Host "  Generating vault master key..."
+        New-Item -ItemType Directory -Force -Path (Join-Path $INSTALL_DIR "vault-keys")  | Out-Null
+        New-Item -ItemType Directory -Force -Path (Join-Path $INSTALL_DIR "vault-tls")   | Out-Null
+        New-Item -ItemType Directory -Force -Path (Join-Path $INSTALL_DIR "vault-config") | Out-Null
+
+        $ageKeygen = Get-Command age-keygen -ErrorAction SilentlyContinue
+        if (-not $ageKeygen) { Invoke-VaultMigrationRollback "age-keygen not found" }
+
+        & $ageKeygen.Path -o $vaultAgeKey 2>$null
+        if (-not (Test-Path $vaultAgeKey)) { Invoke-VaultMigrationRollback "age-keygen failed" }
+
+        $recoveryPhrase = ""
+        if ($env:CODERAFT_TEST_MODE -ne "1") {
+            $privKey = (Get-Content $vaultAgeKey | Where-Object { $_ -match '^AGE-SECRET-KEY-' } | Select-Object -First 1)
+            if ($privKey) {
+                try {
+                    $recoveryPhrase = ($privKey | & docker run --rm -i `
+                        ghcr.io/liamj74/coderaft-vault:latest -mnemonic-from-key /dev/stdin 2>$null) -join ""
+                } catch { $recoveryPhrase = "" }
+            }
+        }
+        if (-not $recoveryPhrase) {
+            $pubKey = (Get-Content $vaultAgeKey | Where-Object { $_ -match '# public key:' } | Select-Object -First 1) -replace '.*# public key:\s*', ''
+            $recoveryPhrase = "[FALLBACK] fingerprint: $pubKey"
+        }
+
+        Write-Host ""
+        Write-Host "  +==================================================================+" -ForegroundColor Cyan
+        Write-Host "  | *** VAULT RECOVERY PHRASE — WRITE THIS DOWN NOW ***             |" -ForegroundColor Cyan
+        Write-Host "  +==================================================================+" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "    $recoveryPhrase" -ForegroundColor White
+        Write-Host ""
+
+        if ($env:CODERAFT_TEST_MODE -eq "1") {
+            $reply = "CONFIRMED"
+        } else {
+            $reply = Read-Host "  Type CONFIRMED (all caps) once you have securely stored the phrase"
+        }
+        if ($reply -ne "CONFIRMED") { Invoke-VaultMigrationRollback "operator did not confirm recovery phrase" }
+        Write-Host "  ✓ Recovery phrase confirmed" -ForegroundColor Green
+    }
+
+    # ── 4d Pull and start vault ────────────────────────────────────────────
+    if ($env:CODERAFT_TEST_FAIL -eq "4d") { Invoke-VaultMigrationRollback "injected test failure at 4d" }
+
+    if ($env:CODERAFT_TEST_MODE -ne "1") {
+        try { & docker pull ghcr.io/liamj74/coderaft-vault:latest 2>$null } catch { Invoke-VaultMigrationRollback "docker pull failed" }
+    }
+    try {
+        Push-Location $INSTALL_DIR -ErrorAction Stop
+        & docker compose up -d coderaft-vault 2>$null
+        Pop-Location -ErrorAction SilentlyContinue
+    } catch { Invoke-VaultMigrationRollback "docker compose up coderaft-vault failed" }
+
+    # Wait for healthy
+    $vaultHealthy = $false
+    for ($vi = 1; $vi -le 20; $vi++) {
+        try {
+            $health = & docker compose exec -T coderaft-vault `
+                /bin/sh -c 'wget -qO- http://localhost:8200/v1/health 2>/dev/null' 2>$null
+            if ($health -match '"sealed":false') { $vaultHealthy = $true; break }
+        } catch { }
+        Start-Sleep -Seconds 3
+    }
+    if (-not $vaultHealthy) { Invoke-VaultMigrationRollback "coderaft-vault did not become healthy" }
+    Write-Host "  ✓ coderaft-vault is healthy"
+
+    # ── 4e Migrate secrets ────────────────────────────────────────────────
+    if ($env:CODERAFT_TEST_FAIL -eq "4e") { Invoke-VaultMigrationRollback "injected test failure at 4e" }
+
+    function Set-VaultSecret {
+        param([string]$Name, [string]$Value)
+        if (-not $Value) { return $true }
+        $body = "{`"name`":`"$Name`",`"value`":`"$Value`"}"
+        try {
+            $resp = & docker compose exec -T coderaft-vault /bin/sh -c `
+                "wget -qO- --post-data='$body' --header='Content-Type: application/json' http://localhost:8200/v1/secret/set 2>/dev/null" 2>$null
+            return ($resp -match '"ok":true')
+        } catch { return $false }
+    }
+    function Get-VaultSecret {
+        param([string]$Name)
+        try {
+            $resp = & docker compose exec -T coderaft-vault /bin/sh -c `
+                "wget -qO- --post-data='{`"name`":`"$Name`"}' --header='Content-Type: application/json' http://localhost:8200/v1/secret/get 2>/dev/null" 2>$null
+            if ($resp -match '"value":"([^"]*)"') { return $Matches[1] }
+        } catch { }
+        return ""
+    }
+    function Get-EnvVal {
+        param([string]$Key)
+        $line = (Get-Content $envPath -ErrorAction SilentlyContinue | Where-Object { $_ -match "^\s*$([regex]::Escape($Key))=(.+)$" } | Select-Object -First 1)
+        if ($line -match "^\s*$([regex]::Escape($Key))=(.+)$") { return $Matches[1].Trim().Trim('"').Trim("'") }
+        return ""
+    }
+
+    Write-Host "  Migrating secrets to vault..."
+    $migrationOk = $true
+
+    $secretMap = @(
+        @("LICENSE_KEY",              "license_key"),
+        @("POSTGRES_PASSWORD",        "postgres_password"),
+        @("REDIS_PASSWORD",           "redis_password"),
+        @("DASHBOARD_SECRET",         "dashboard_secret_legacy"),
+        @("NEO4J_PASSWORD",           "neo4j_password"),
+        @("RAVENSCAN_SECRET_KEY",     "ravenscan_secret_key"),
+        @("RAVENSCAN_CAPTURE_TOKEN",  "ravenscan_capture_token"),
+        @("RAVENSCAN_LICENSE_KEY",    "ravenscan_license_key"),
+        @("REDFOX_MASTER_PASSPHRASE", "redfox_master_passphrase"),
+        @("REDFOX_JWT_PRIVATE_KEY",   "redfox_jwt_private_key"),
+        @("REDFOX_JWT_PUBLIC_KEY",    "redfox_jwt_public_key"),
+        @("REDFOX_GW_SESSION_SECRET", "redfox_gw_session_secret"),
+        @("REDFOX_LICENSE_KEY",       "redfox_license_key")
+    )
+    foreach ($pair in $secretMap) {
+        $envKey = $pair[0]; $vaultKey = $pair[1]
+        $val = Get-EnvVal -Key $envKey
+        if ($val) {
+            if (Set-VaultSecret -Name $vaultKey -Value $val) {
+                $rb = Get-VaultSecret -Name $vaultKey
+                if ($rb -ne $val) {
+                    $migrationOk = $false
+                    Write-Host "  ✗ Round-trip verify failed: $vaultKey" -ForegroundColor Red
+                }
+            } else {
+                $migrationOk = $false
+                Write-Host "  ✗ Failed to migrate: $vaultKey" -ForegroundColor Red
+            }
+        }
+    }
+    if (-not $migrationOk) { Invoke-VaultMigrationRollback "secret migration verify failed" }
+    Write-Host "  ✓ Secrets migrated and verified"
+
+    # ── 4g Sentinel ───────────────────────────────────────────────────────
+    try {
+        & docker compose exec -T coderaft-vault /bin/sh -c "touch /data/.migrated" 2>$null
+    } catch { }
+    $hostSentinelDir = Join-Path $INSTALL_DIR "vault-data"
+    New-Item -ItemType Directory -Force -Path $hostSentinelDir | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $hostSentinelDir ".migrated"), (Get-Date -Format o)) | Out-Null
+    Write-Host "  ✓ Migration sentinel written"
+
+    # ── 4h Write CODERAFT_VAULT_* vars ───────────────────────────────────
+    $envText = [System.IO.File]::ReadAllText($envPath, [System.Text.UTF8Encoding]::new($false))
+    foreach ($kv in @(
+        "CODERAFT_VAULT_URL=https://coderaft-vault:8200",
+        "CODERAFT_VAULT_AZURE=0",
+        "CODERAFT_VAULT_LICENSE=0",
+        "CODERAFT_VAULT_PRODUCTS=0",
+        "CODERAFT_VAULT_JWT=0"
+    )) {
+        $k = $kv.Split('=')[0]
+        if ($envText -notmatch "(?m)^$k=") { $envText = $envText.TrimEnd() + "`n$kv`n" }
+    }
+    [System.IO.File]::WriteAllText($envPath, $envText, [System.Text.UTF8Encoding]::new($false))
+    Write-Host "  ✓ CODERAFT_VAULT_* vars written to .env"
+    Write-Host ""
+    Write-Host "  Vault migration complete."
+    Write-Host "  Legacy stores retained for 7-day grace period."
+    Write-Host ""
+} else {
+    Write-Host "  ✓ Vault migration not needed (already done or vault running)"
+}
+
 # ── Banking-grade plaintext purge (auto) ──────────────────────────────────
 # When .env.enc exists, the plaintext .env MUST be purged. The oneliner
 # does the finalize itself: verifies decryption matches plaintext, keeps a
