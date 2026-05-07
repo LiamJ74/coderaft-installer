@@ -552,10 +552,10 @@ services:
 
     function Invoke-VaultCurl {
         param([string]$Method, [string]$Path, [string]$JsonBody = "")
-        # curlimages/curl runs as UID 100 by default — can't read .key files
-        # (mode 0600, owner root from openssl). Override to root with caps
-        # dropped equivalence (read-only mount + ephemeral container).
-        $args = @(
+        # IMPORTANT: do NOT name this variable $args — that's a PowerShell
+        # automatic variable (function varargs) and the splat @args would
+        # silently pull from it, dropping our crafted values. Use $dockerArgs.
+        $dockerArgs = @(
             "run", "--rm",
             "--user", "0:0",
             "--network", $vaultNetwork,
@@ -568,9 +568,9 @@ services:
             "https://coderaft-vault:8200$Path"
         )
         if ($JsonBody) {
-            $args += @("-H", "Content-Type: application/json", "-d", $JsonBody)
+            $dockerArgs += @("-H", "Content-Type: application/json", "-d", $JsonBody)
         }
-        $resp = & docker @args 2>&1
+        $resp = & docker @dockerArgs 2>&1
         return ($resp -join "")
     }
 
