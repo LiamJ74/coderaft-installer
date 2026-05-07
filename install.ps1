@@ -230,98 +230,119 @@ function Invoke-VaultBootstrap {
 }
 
 function Invoke-VaultBootstrapTLS {
-    # Require openssl.exe — Git for Windows ships it at:
-    #   C:\Program Files\Git\usr\bin\openssl.exe
-    # Fallback: openssl on PATH (Chocolatey / Scoop installs).
-    # NOTE: .NET New-SelfSignedCertificate is Windows-only and lacks CA chaining
-    # features needed for mTLS — we require openssl for consistent behavior.
-    $openssl = Get-Command openssl -ErrorAction SilentlyContinue
-    if (-not $openssl) {
-        $gitOpenssl = "C:\Program Files\Git\usr\bin\openssl.exe"
-        if (Test-Path $gitOpenssl) {
-            $openssl = $gitOpenssl
-        } else {
-            Write-Host "  ✗ openssl.exe is required for vault mTLS bootstrap." -ForegroundColor Red
-            Write-Host "    It is included with Git for Windows. Install from https://git-scm.com/download/win" -ForegroundColor Red
-            Write-Host "    or set openssl on your PATH, then re-run the installer." -ForegroundColor Red
-            exit 1
-        }
-    } else {
-        $openssl = $openssl.Path
-    }
+    # B12 fix: correct cert filenames (client-ca.crt, vault.crt — NOT ca.crt, server.crt).
+    # B11 fix: correct ACL field names (name, cert_san, permissions — NOT san/role/allow).
+    # B7  fix: server cert SAN includes localhost + 127.0.0.1 for mTLS hostname verify.
+    # NON-NEGOTIABLE: DO NOT require host openssl on Windows. Always use the
+    # alpine container approach (same as update.ps1 4c.2) — Git for Windows
+    # openssl is not guaranteed on all Windows installs.
 
-    if ((Test-Path "vault-tls\ca.crt") -and (Test-Path "vault-tls\ca.key")) {
+    if ((Test-Path "vault-tls\client-ca.crt") -and (Test-Path "vault-tls\vault.crt")) {
         Write-Host "  ✓ Vault mTLS PKI already exists — skipping cert generation"
         return
     }
 
-    Write-Host "  Generating vault mTLS PKI..."
+    Write-Host "  Bootstrapping vault TLS PKI + config (via alpine container)..."
+    $tlsDir = "$(Get-Location)\vault-tls"
+    $cfgDir = "$(Get-Location)\vault-config"
 
-    # CA
-    & $openssl req -x509 -newkey rsa:4096 -days 3650 -nodes -sha256 `
-        -keyout "vault-tls\ca.key" -out "vault-tls\ca.crt" `
-        -subj "/CN=coderaft-vault-ca" `
-        -addext "basicConstraints=critical,CA:TRUE" 2>$null
-
-    # Server cert
-    & $openssl req -newkey rsa:2048 -nodes -sha256 `
-        -keyout "vault-tls\server.key" -out "vault-tls\server.csr" `
-        -subj "/CN=coderaft-vault" 2>$null
-    $extContent = "subjectAltName=DNS:coderaft-vault`nbasicConstraints=CA:FALSE"
-    $extFile = [System.IO.Path]::GetTempFileName()
-    [System.IO.File]::WriteAllText($extFile, $extContent)
-    & $openssl x509 -req -days 3650 -sha256 `
-        -in "vault-tls\server.csr" -CA "vault-tls\ca.crt" -CAkey "vault-tls\ca.key" -CAcreateserial `
-        -out "vault-tls\server.crt" -extfile $extFile 2>$null
-    Remove-Item $extFile, "vault-tls\server.csr" -ErrorAction SilentlyContinue
-
-    # Per-product client certs
-    foreach ($pair in @(
-        @("dashboard-api", "dashboard-api.coderaft.local"),
-        @("entraguard",    "entraguard.coderaft.local"),
-        @("ravenscan",     "ravenscan.coderaft.local"),
-        @("redfox",        "redfox.coderaft.local")
-    )) {
-        $name = $pair[0]; $san = $pair[1]
-        & $openssl req -newkey rsa:2048 -nodes -sha256 `
-            -keyout "vault-tls\$name-client.key" -out "vault-tls\$name-client.csr" `
-            -subj "/CN=$san" 2>$null
-        $extContent2 = "subjectAltName=DNS:$san`nbasicConstraints=CA:FALSE"
-        $extFile2 = [System.IO.Path]::GetTempFileName()
-        [System.IO.File]::WriteAllText($extFile2, $extContent2)
-        & $openssl x509 -req -days 3650 -sha256 `
-            -in "vault-tls\$name-client.csr" -CA "vault-tls\ca.crt" -CAkey "vault-tls\ca.key" -CAcreateserial `
-            -out "vault-tls\$name-client.crt" -extfile $extFile2 2>$null
-        Remove-Item $extFile2, "vault-tls\$name-client.csr" -ErrorAction SilentlyContinue
+    # Single shell script run inside alpine — produces all certs at once.
+    $opensslScript = @'
+set -e
+apk add --no-cache openssl >/dev/null
+cd /work
+# CA (client-ca.crt — exact name expected by vault config.yaml)
+openssl req -x509 -newkey rsa:4096 -days 3650 -nodes -sha256 \
+    -keyout client-ca.key -out client-ca.crt \
+    -subj "/CN=coderaft-vault-ca" \
+    -addext "basicConstraints=critical,CA:TRUE" 2>/dev/null
+# Server cert (vault.crt — SAN includes localhost + 127.0.0.1 for mTLS probe)
+openssl req -newkey rsa:2048 -nodes -sha256 \
+    -keyout vault.key -out vault.csr \
+    -subj "/CN=coderaft-vault" 2>/dev/null
+cat > /tmp/server.ext <<EOF
+subjectAltName=DNS:coderaft-vault,DNS:localhost,IP:127.0.0.1
+basicConstraints=CA:FALSE
+EOF
+openssl x509 -req -days 3650 -sha256 \
+    -in vault.csr -CA client-ca.crt -CAkey client-ca.key -CAcreateserial \
+    -out vault.crt -extfile /tmp/server.ext 2>/dev/null
+rm -f vault.csr
+# Per-product client certs
+for pair in "dashboard-api:dashboard-api.coderaft.local" \
+            "entraguard:entraguard.coderaft.local" \
+            "ravenscan:ravenscan.coderaft.local" \
+            "redfox:redfox.coderaft.local"; do
+    name="${pair%%:*}"
+    san="${pair##*:}"
+    openssl req -newkey rsa:2048 -nodes -sha256 \
+        -keyout "${name}-client.key" -out "${name}-client.csr" \
+        -subj "/CN=${san}" 2>/dev/null
+    cat > /tmp/client.ext <<EOF
+subjectAltName=DNS:${san}
+basicConstraints=CA:FALSE
+EOF
+    openssl x509 -req -days 3650 -sha256 \
+        -in "${name}-client.csr" -CA client-ca.crt -CAkey client-ca.key -CAcreateserial \
+        -out "${name}-client.crt" -extfile /tmp/client.ext 2>/dev/null
+    rm -f "${name}-client.csr"
+done
+chmod 600 *.key 2>/dev/null || true
+'@
+    $absTlsDir = (Resolve-Path -LiteralPath $tlsDir -ErrorAction SilentlyContinue)
+    if (-not $absTlsDir) {
+        New-Item -ItemType Directory -Force -Path $tlsDir | Out-Null
+        $absTlsDir = (Resolve-Path -LiteralPath $tlsDir).Path
+    } else {
+        $absTlsDir = $absTlsDir.Path
+    }
+    $opensslOut = $opensslScript | & docker run --rm -i `
+        -v "${absTlsDir}:/work" `
+        alpine:3.20 sh 2>&1
+    $opensslOut | Out-Host
+    if (-not (Test-Path (Join-Path $tlsDir "vault.crt"))) {
+        Write-Host "  ✗ Alpine openssl cert generation failed" -ForegroundColor Red
+        exit 1
     }
 
-    # ACL config
-    $aclContent = @'
-# coderaft-vault ACL — controls which client cert SAN can access which secrets.
-clients:
-  - san: "dashboard-api.coderaft.local"
-    role: admin
-    allow: ["*"]
-
-  - san: "entraguard.coderaft.local"
-    role: product
-    allow:
-      - "azure_*"
-      - "license_key"
-      - "entraguard_*"
-
-  - san: "ravenscan.coderaft.local"
-    role: product
-    allow:
-      - "ravenscan_*"
-      - "neo4j_*"
-
-  - san: "redfox.coderaft.local"
-    role: product
-    allow:
-      - "redfox_*"
+    # vault config.yaml — correct file paths
+    $configYaml = @'
+server:
+  addr: "0.0.0.0:8200"
+  tls_cert: "/tls/vault.crt"
+  tls_key:  "/tls/vault.key"
+  client_ca: "/tls/client-ca.crt"
+storage:
+  path: "/data/vault.db"
+keys:
+  age_key_path: "/keys/age.key"
+audit:
+  log_path: "/data/audit.log"
+acl_path: "/etc/coderaft-vault/acl.yaml"
 '@
-    [System.IO.File]::WriteAllText("$(Get-Location)\vault-config\acl.yaml", $aclContent, [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText((Join-Path $cfgDir "config.yaml"), $configYaml, [System.Text.UTF8Encoding]::new($false))
+
+    # B11 fix: correct ACL field names (name, cert_san, permissions)
+    $aclYaml = @'
+# coderaft-vault ACL — field names: name, cert_san, permissions (NOT san/role/allow)
+clients:
+  - name: dashboard-api
+    cert_san: "dashboard-api.coderaft.local"
+    permissions: ["*"]
+
+  - name: entraguard
+    cert_san: "entraguard.coderaft.local"
+    permissions: ["read:azure_*","read:license_key","read:entraguard_*"]
+
+  - name: ravenscan
+    cert_san: "ravenscan.coderaft.local"
+    permissions: ["read:ravenscan_*","read:neo4j_*","read:license_key"]
+
+  - name: redfox
+    cert_san: "redfox.coderaft.local"
+    permissions: ["read:redfox_*","read:license_key"]
+'@
+    [System.IO.File]::WriteAllText((Join-Path $cfgDir "acl.yaml"), $aclYaml, [System.Text.UTF8Encoding]::new($false))
     Write-Host "  ✓ Vault mTLS PKI generated (CA + server cert + 4 client certs)" -ForegroundColor Green
 }
 
@@ -407,7 +428,8 @@ services:
       - COMPOSE_PROJECT_NAME=coderaft
       # NOTE: Phase 0.5 keeps SOPS path for backward compat; Phase 5 removes it.
       - CODERAFT_VAULT_URL=https://coderaft-vault:8200
-      - CODERAFT_VAULT_TLS_CA=/vault-tls/ca.crt
+      # B12 fix: correct vault TLS filenames (client-ca.crt, not ca.crt)
+      - CODERAFT_VAULT_TLS_CA=/vault-tls/client-ca.crt
       - CODERAFT_VAULT_TLS_CERT=/vault-tls/dashboard-api-client.crt
       - CODERAFT_VAULT_TLS_KEY=/vault-tls/dashboard-api-client.key
     volumes:
@@ -416,8 +438,8 @@ services:
       - .:/host-compose
       # Age private key for SOPS decryption (legacy — kept for backward compat).
       - ./.coderaft-age.key:/keys/age.key:ro
-      # Vault mTLS client cert for dashboard-api
-      - ./vault-tls/ca.crt:/vault-tls/ca.crt:ro
+      # Vault mTLS client cert for dashboard-api (B12: correct filenames)
+      - ./vault-tls/client-ca.crt:/vault-tls/client-ca.crt:ro
       - ./vault-tls/dashboard-api-client.crt:/vault-tls/dashboard-api-client.crt:ro
       - ./vault-tls/dashboard-api-client.key:/vault-tls/dashboard-api-client.key:ro
     security_opt: [no-new-privileges:true]
@@ -428,6 +450,9 @@ services:
   # Port 8200 is internal-only (coderaft-vault-net). No external exposure.
   coderaft-vault:
     image: ghcr.io/liamj74/coderaft-vault:latest
+    # B8 fix: run as root so container can write /data SQLite and read 0600 .key files.
+    # Security maintained via cap_drop:ALL + no-new-privileges.
+    user: "0:0"
     networks:
       - coderaft-vault-net
     volumes:
@@ -678,6 +703,92 @@ exit 1
 '@ -Encoding UTF8
 }
 
+# ── Vault unseal helper (fresh install) ──────────────────────────────────────
+# B6/B7 fix: vault image is distroless — no shell, no wget.
+# NEVER `docker compose exec coderaft-vault sh`. Use curlimages/curl sidecar.
+# B10 fix: vault starts sealed — must POST /v1/unseal after container is up.
+function Invoke-VaultUnsealFresh {
+    $vaultAgeKey = "vault-keys\age.key"
+    if (-not (Test-Path $vaultAgeKey)) {
+        Write-Host "  ✗ vault-keys\age.key not found — cannot unseal" -ForegroundColor Red
+        return $false
+    }
+
+    # Detect compose project name (determines Docker network for sidecar)
+    $vaultProject = (& docker inspect coderaft-coderaft-vault-1 `
+        --format '{{ index .Config.Labels "com.docker.compose.project" }}' 2>$null) -join ""
+    if (-not $vaultProject) { $vaultProject = "coderaft" }
+    $vaultNetwork = "${vaultProject}_coderaft-vault-net"
+    $absTlsDir = (Resolve-Path -LiteralPath "vault-tls").Path
+
+    function Invoke-VaultCurlFresh {
+        param([string]$Method, [string]$Path, [string]$JsonBody = "")
+        # A5 fix: do NOT name this $args — that is a PS automatic variable.
+        $dockerArgs = @(
+            "run", "--rm",
+            "--user", "0:0",
+            "--network", $vaultNetwork,
+            "-v", "${absTlsDir}:/tls:ro",
+            "curlimages/curl:latest",
+            "--cert", "/tls/dashboard-api-client.crt",
+            "--key",  "/tls/dashboard-api-client.key",
+            "--cacert", "/tls/client-ca.crt",
+            "-sS", "-X", $Method,
+            "https://coderaft-vault:8200$Path"
+        )
+        if ($JsonBody) {
+            $dockerArgs += @("-H", "Content-Type: application/json", "-d", $JsonBody)
+        }
+        $resp = & docker @dockerArgs 2>&1
+        return ($resp -join "")
+    }
+
+    Write-Host "  Waiting for vault to be reachable..."
+    $vaultReachable = $false
+    $lastSealed = "true"
+    for ($vi = 1; $vi -le 20; $vi++) {
+        try {
+            $health = Invoke-VaultCurlFresh -Method "GET" -Path "/v1/health"
+            if ($health -match '"sealed":(true|false)') {
+                $vaultReachable = $true
+                $lastSealed = $Matches[1]
+                break
+            }
+        } catch { }
+        if ($vi % 3 -eq 0) { Write-Host "    ... still waiting (attempt $vi/20)" }
+        Start-Sleep -Seconds 3
+    }
+
+    if (-not $vaultReachable) {
+        Write-Host "  ✗ coderaft-vault did not respond to TLS probes" -ForegroundColor Red
+        return $false
+    }
+
+    # B10 fix: unseal if sealed (1 share = base64-encoded age key file bytes)
+    if ($lastSealed -eq "true") {
+        Write-Host "  Vault is sealed — sending unseal request..."
+        $ageKeyBytes = [System.IO.File]::ReadAllBytes($vaultAgeKey)
+        $shareB64 = [Convert]::ToBase64String($ageKeyBytes)
+        $unsealBody = @{ shares = @($shareB64) } | ConvertTo-Json -Compress
+        $unsealResp = Invoke-VaultCurlFresh -Method "POST" -Path "/v1/unseal" -JsonBody $unsealBody
+        if ($unsealResp -notmatch '"ok"\s*:\s*true|"sealed"\s*:\s*false') {
+            Write-Host "  Unseal response: $unsealResp" -ForegroundColor Yellow
+            Write-Host "  ✗ Vault unseal failed" -ForegroundColor Red
+            return $false
+        }
+        Write-Host "  ✓ Vault unsealed" -ForegroundColor Green
+    }
+
+    $finalHealth = Invoke-VaultCurlFresh -Method "GET" -Path "/v1/health"
+    if ($finalHealth -notmatch '"sealed"\s*:\s*false') {
+        Write-Host "  Final health: $finalHealth" -ForegroundColor Yellow
+        Write-Host "  ✗ Vault still sealed after unseal call" -ForegroundColor Red
+        return $false
+    }
+    Write-Host "  ✓ coderaft-vault is healthy (sealed:false)" -ForegroundColor Green
+    return $true
+}
+
 # ── Pull & Start ─────────────────────────────────────────────────────────────
 
 Write-Host ""
@@ -686,7 +797,20 @@ docker compose pull
 
 Write-Host ""
 Write-Host "  Starting dashboard..."
+# B9 fix: explicit stop+rm for vault container before up so fresh certs
+# are picked up from bind mounts (--force-recreate alone can leave a
+# Running container with stale certs in Docker Desktop memory).
+& docker compose stop coderaft-vault 2>$null | Out-Null
+& docker compose rm -f coderaft-vault 2>$null | Out-Null
 docker compose up -d
+
+Write-Host ""
+Write-Host "  Unsealing vault..."
+$vaultOk = Invoke-VaultUnsealFresh
+if (-not $vaultOk) {
+    Write-Host "  ⚠ Vault unseal failed — dashboard may show 'vault unavailable'." -ForegroundColor Yellow
+    Write-Host "    Re-run the installer or run: docker compose restart coderaft-vault"
+}
 
 Write-Host ""
 Write-Host "  Waiting for dashboard to be ready..."
