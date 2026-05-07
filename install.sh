@@ -868,17 +868,23 @@ for img in \
     verify_coderaft_image "${img}"
 done
 
-echo ""
-echo "  Pulling dashboard image..."
-docker compose pull
+if [ "${CODERAFT_TEST_MODE:-0}" = "1" ]; then
+    echo ""
+    echo "  [CODERAFT_TEST_MODE] Skipping docker compose pull and up"
+    echo "  Compose YAML and vault PKI validated — test run complete."
+else
+    echo ""
+    echo "  Pulling dashboard image..."
+    docker compose pull
 
-echo ""
-echo "  Starting dashboard..."
-docker compose up -d
+    echo ""
+    echo "  Starting dashboard..."
+    docker compose up -d
 
-echo ""
-echo "  Waiting for dashboard to be ready..."
-sleep 10
+    echo ""
+    echo "  Waiting for dashboard to be ready..."
+    sleep 10
+fi
 
 
 # ── Native capture daemon install (macOS only — Linux uses Docker, Windows handled by install.ps1) ──
