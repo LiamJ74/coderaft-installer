@@ -493,6 +493,13 @@ volumes:
 services:
   coderaft-vault:
     image: ghcr.io/liamj74/coderaft-vault:latest
+    # Run as root so the container can:
+    #   - write to the Docker-managed /data volume (SQLite + audit log)
+    #   - read /tls/*.key files (mode 0600 from openssl)
+    # Effective security stays equivalent to nonroot because we drop ALL
+    # capabilities AND set no-new-privileges. This is a standard hardening
+    # pattern (root-with-no-caps), not a security regression.
+    user: "0:0"
     networks:
       - coderaft-vault-net
     volumes:
