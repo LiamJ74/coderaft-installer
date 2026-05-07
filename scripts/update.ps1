@@ -273,7 +273,7 @@ if ($vaultNeedsMigration) {
             try {
                 & docker compose up -d postgres 2>$null
                 Start-Sleep -Seconds 5
-                & docker compose exec -T postgres psql -U coderaft coderaft < $authSql 2>$null
+                Get-Content -Raw $authSql | & docker compose exec -T postgres psql -U coderaft coderaft 2>$null
             } catch { }
         }
         try { & docker compose up -d 2>$null } catch { }
