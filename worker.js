@@ -9,16 +9,23 @@ export default {
       }
 
       const scripts = {
-        '/install':      'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/install.sh',
-        '/win':           'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/install.ps1',
-        '/update':        'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/update.sh',
-        '/update.ps1':    'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/update.ps1',
-        '/rollback':      'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/rollback.sh',
-        '/rollback.ps1':  'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/rollback.ps1',
-        // SOPS+age secrets migration (banking-grade plaintext purge)
-        '/migrate':       'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/migrate-to-sops.sh',
-        '/migrate.sh':    'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/migrate-to-sops.sh',
-        '/migrate.ps1':   'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/migrate-to-sops.ps1',
+        '/install':        'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/install.sh',
+        '/win':            'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/install.ps1',
+        '/update':         'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/update.sh',
+        '/update.ps1':     'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/update.ps1',
+        '/rollback':       'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/rollback.sh',
+        '/rollback.ps1':   'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/rollback.ps1',
+        // SOPS+age secrets migration (banking-grade plaintext purge, Phase 0 legacy)
+        '/migrate':        'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/migrate-to-sops.sh',
+        '/migrate.sh':     'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/migrate-to-sops.sh',
+        '/migrate.ps1':    'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/migrate-to-sops.ps1',
+        // Vault CLI helpers (Phase 0.5)
+        '/vault-set':      'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/vault-set.sh',
+        '/vault-set.sh':   'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/vault-set.sh',
+        '/vault-set.ps1':  'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/vault-set.ps1',
+        '/vault-recover':     'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/vault-recover.sh',
+        '/vault-recover.sh':  'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/vault-recover.sh',
+        '/vault-recover.ps1': 'https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/vault-recover.ps1',
       };
 
       const isBrowser = request.headers.get('accept')?.includes('text/html');
@@ -49,6 +56,12 @@ export default {
 
 <p>Windows:</p>
 <pre>$env:ADMIN_TOKEN="&lt;token&gt;"; irm https://install.coderaft.io/rollback.ps1 | iex</pre>
+
+<h2>Vault helpers (Phase 0.5)</h2>
+<p>Set a secret:</p>
+<pre>bash &lt;(curl -fsSL https://install.coderaft.io/vault-set) &lt;name&gt; &lt;value&gt;</pre>
+<p>Recover vault from mnemonic:</p>
+<pre>bash &lt;(curl -fsSL https://install.coderaft.io/vault-recover)</pre>
 
 </body></html>`, {
           headers: { 'content-type': 'text/html; charset=utf-8' }
