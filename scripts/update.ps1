@@ -546,7 +546,7 @@ services:
     for ($vi = 1; $vi -le 20; $vi++) {
         try {
             $health = & docker compose @vaultComposeArgs exec -T coderaft-vault `
-                /bin/sh -c 'wget --no-check-certificate -qO- https://localhost:8200/v1/health 2>&1' 2>&1
+                /bin/sh -c 'wget --certificate=/tls/dashboard-api-client.crt --private-key=/tls/dashboard-api-client.key --ca-certificate=/tls/client-ca.crt -qO- https://coderaft-vault:8200/v1/health 2>&1' 2>&1
             "[$(Get-Date -Format o)] health attempt $vi → $health" | Out-File -FilePath $migrationLog -Append -Encoding utf8
             if ($health -match '"sealed":false') { $vaultHealthy = $true; break }
         } catch {
@@ -574,7 +574,7 @@ services:
         # POSIX shell trick '\''.  Vault names/values are alnum-ish so usually
         # nothing to escape, but be defensive.
         $shellSafeBody = $body -replace "'", "'\''"
-        $cmd = "wget --no-check-certificate -qO- --post-data='$shellSafeBody' --header='Content-Type: application/json' https://localhost:8200/v1/secret/set"
+        $cmd = "wget --certificate=/tls/dashboard-api-client.crt --private-key=/tls/dashboard-api-client.key --ca-certificate=/tls/client-ca.crt -qO- --post-data='$shellSafeBody' --header='Content-Type: application/json' https://coderaft-vault:8200/v1/secret/set"
         try {
             $resp = & docker compose @vaultComposeArgs exec -T coderaft-vault /bin/sh -c $cmd 2>&1
             return (($resp -join "") -match '"ok"\s*:\s*true')
@@ -585,7 +585,7 @@ services:
         try {
             $body = @{ name = $Name } | ConvertTo-Json -Compress
             $shellSafeBody = $body -replace "'", "'\''"
-            $cmd = "wget --no-check-certificate -qO- --post-data='$shellSafeBody' --header='Content-Type: application/json' https://localhost:8200/v1/secret/get"
+            $cmd = "wget --certificate=/tls/dashboard-api-client.crt --private-key=/tls/dashboard-api-client.key --ca-certificate=/tls/client-ca.crt -qO- --post-data='$shellSafeBody' --header='Content-Type: application/json' https://coderaft-vault:8200/v1/secret/get"
             $resp = & docker compose @vaultComposeArgs exec -T coderaft-vault /bin/sh -c $cmd 2>&1
             $respText = ($resp -join "")
             if ($respText -match '"value"\s*:\s*"([^"]*)"') { return $Matches[1] }
