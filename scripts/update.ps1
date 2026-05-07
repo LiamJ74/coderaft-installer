@@ -540,13 +540,41 @@ services:
     Pop-Location -ErrorAction SilentlyContinue
     if ($upExit -ne 0) { Invoke-VaultMigrationRollback "docker compose up coderaft-vault failed (see $migrationLog)" }
 
+    # The vault image is distroless — no shell, no wget. We can't `docker
+    # compose exec coderaft-vault sh ...`. Use a curlimages/curl sidecar on
+    # the same docker network with the dashboard-api client cert mounted.
+    $absTlsDir = (Resolve-Path -LiteralPath $tlsDir).Path
+    # Detect compose project name from the running vault container — it
+    # determines the network name (<project>_coderaft-vault-net).
+    $vaultProject = (& docker inspect coderaft-coderaft-vault-1 --format '{{ index .Config.Labels "com.docker.compose.project" }}' 2>$null) -join ""
+    if (-not $vaultProject) { $vaultProject = "coderaft" }
+    $vaultNetwork = "${vaultProject}_coderaft-vault-net"
+
+    function Invoke-VaultCurl {
+        param([string]$Method, [string]$Path, [string]$JsonBody = "")
+        $args = @(
+            "run", "--rm", "--network", $vaultNetwork,
+            "-v", "${absTlsDir}:/tls:ro",
+            "curlimages/curl:latest",
+            "--cert", "/tls/dashboard-api-client.crt",
+            "--key",  "/tls/dashboard-api-client.key",
+            "--cacert", "/tls/client-ca.crt",
+            "-sS", "-X", $Method,
+            "https://coderaft-vault:8200$Path"
+        )
+        if ($JsonBody) {
+            $args += @("-H", "Content-Type: application/json", "-d", $JsonBody)
+        }
+        $resp = & docker @args 2>&1
+        return ($resp -join "")
+    }
+
     # Wait for healthy — print attempts so the operator sees progress
     Write-Host "  Waiting for vault to become healthy..."
     $vaultHealthy = $false
     for ($vi = 1; $vi -le 20; $vi++) {
         try {
-            $health = & docker compose @vaultComposeArgs exec -T coderaft-vault `
-                /bin/sh -c 'wget --certificate=/tls/dashboard-api-client.crt --private-key=/tls/dashboard-api-client.key --ca-certificate=/tls/client-ca.crt -qO- https://coderaft-vault:8200/v1/health 2>&1' 2>&1
+            $health = Invoke-VaultCurl -Method "GET" -Path "/v1/health"
             "[$(Get-Date -Format o)] health attempt $vi → $health" | Out-File -FilePath $migrationLog -Append -Encoding utf8
             if ($health -match '"sealed":false') { $vaultHealthy = $true; break }
         } catch {
@@ -568,28 +596,15 @@ services:
     function Set-VaultSecret {
         param([string]$Name, [string]$Value)
         if (-not $Value) { return $true }
-        # Build JSON via ConvertTo-Json (PS 5.1 compatible) instead of hand-escaped strings.
         $body = @{ name = $Name; value = $Value } | ConvertTo-Json -Compress
-        # Encode body for shell single-quote: replace any single quote with the
-        # POSIX shell trick '\''.  Vault names/values are alnum-ish so usually
-        # nothing to escape, but be defensive.
-        $shellSafeBody = $body -replace "'", "'\''"
-        $cmd = "wget --certificate=/tls/dashboard-api-client.crt --private-key=/tls/dashboard-api-client.key --ca-certificate=/tls/client-ca.crt -qO- --post-data='$shellSafeBody' --header='Content-Type: application/json' https://coderaft-vault:8200/v1/secret/set"
-        try {
-            $resp = & docker compose @vaultComposeArgs exec -T coderaft-vault /bin/sh -c $cmd 2>&1
-            return (($resp -join "") -match '"ok"\s*:\s*true')
-        } catch { return $false }
+        $resp = Invoke-VaultCurl -Method "POST" -Path "/v1/secret/set" -JsonBody $body
+        return ($resp -match '"ok"\s*:\s*true')
     }
     function Get-VaultSecret {
         param([string]$Name)
-        try {
-            $body = @{ name = $Name } | ConvertTo-Json -Compress
-            $shellSafeBody = $body -replace "'", "'\''"
-            $cmd = "wget --certificate=/tls/dashboard-api-client.crt --private-key=/tls/dashboard-api-client.key --ca-certificate=/tls/client-ca.crt -qO- --post-data='$shellSafeBody' --header='Content-Type: application/json' https://coderaft-vault:8200/v1/secret/get"
-            $resp = & docker compose @vaultComposeArgs exec -T coderaft-vault /bin/sh -c $cmd 2>&1
-            $respText = ($resp -join "")
-            if ($respText -match '"value"\s*:\s*"([^"]*)"') { return $Matches[1] }
-        } catch { }
+        $body = @{ name = $Name } | ConvertTo-Json -Compress
+        $resp = Invoke-VaultCurl -Method "POST" -Path "/v1/secret/get" -JsonBody $body
+        if ($resp -match '"value"\s*:\s*"([^"]*)"') { return $Matches[1] }
         return ""
     }
     function Get-EnvVal {
@@ -637,9 +652,9 @@ services:
     Write-Host "  ✓ Secrets migrated and verified"
 
     # ── 4g Sentinel ───────────────────────────────────────────────────────
-    try {
-        & docker compose @vaultComposeArgs exec -T coderaft-vault /bin/sh -c "touch /data/.migrated" 2>$null
-    } catch { }
+    # Distroless vault has no shell, so we can't touch /data/.migrated from inside.
+    # The host-side sentinel below is sufficient — the migration block's idempotency
+    # check uses it (see _vault_migration_needed at top of vault block).
     $hostSentinelDir = Join-Path $INSTALL_DIR "vault-data"
     New-Item -ItemType Directory -Force -Path $hostSentinelDir | Out-Null
     [System.IO.File]::WriteAllText((Join-Path $hostSentinelDir ".migrated"), (Get-Date -Format o)) | Out-Null
