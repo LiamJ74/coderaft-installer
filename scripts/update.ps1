@@ -1053,9 +1053,17 @@ foreach ($img in $ComposeImages) {
             & docker rm -f $containerIds 2>&1 | Out-Null
         }
         # 2. Untag (silent if the image doesn't exist locally — first update)
-        & docker image inspect $img 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) {
-            & docker rmi -f $img 2>&1 | Out-Null
+        # Wrap in try/catch to handle $ErrorActionPreference='Stop' raising
+        # NativeCommandError when docker.exe writes to stderr on cache miss
+        # (e.g. ghcr.io/liamj74/redfox-gateway:0.2.0 on a machine that has
+        # never deployed RedFox).
+        try {
+            & docker image inspect $img 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                & docker rmi -f $img 2>$null | Out-Null
+            }
+        } catch {
+            # Image not in local cache — skip silently
         }
         $LASTEXITCODE = 0
         # 3. Remove by ID (in case the image survives untagged)
