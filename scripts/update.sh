@@ -130,6 +130,16 @@ if [ -f "$COMPOSE_PATH" ] && grep -qF 'coderaft-vault: { condition: service_heal
     echo "  ✓ Self-heal docker-compose.yml — coderaft-vault: service_healthy → service_started"
 fi
 
+# ── Self-heal: docker-compose.override.yml neo4j port (B26) ───────────────
+# Bind 127.0.0.1 + port paramétrable. Banking-grade.
+OVERRIDE_PATH="${INSTALL_DIR}/docker-compose.override.yml"
+if [ -f "$OVERRIDE_PATH" ] && grep -qE '"7687:7687"|- 7687:7687' "$OVERRIDE_PATH"; then
+    cp "$OVERRIDE_PATH" "$OVERRIDE_PATH.bak-$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+    sed -i.tmp 's|"7687:7687"|"127.0.0.1:${NEO4J_BOLT_PORT:-7687}:7687"|g; s|- 7687:7687|- "127.0.0.1:${NEO4J_BOLT_PORT:-7687}:7687"|g' "$OVERRIDE_PATH"
+    rm -f "$OVERRIDE_PATH.tmp"
+    echo "  ✓ Self-heal docker-compose.override.yml — neo4j 127.0.0.1 only + paramétrable"
+fi
+
 # ── Self-heal HOST_PROJECT_DIR in .env ────────────────────────────────────
 # Older oneliners (and any install where the dir was renamed/moved) leave
 # .env without HOST_PROJECT_DIR, which causes:
