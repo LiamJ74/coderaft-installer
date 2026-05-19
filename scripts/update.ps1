@@ -128,6 +128,42 @@ if (-not $env:CODERAFT_UPDATE_REEXEC) {
     }
 }
 
+# ── Self-heal CODERAFT_HOST_OS in .env (B25) ──────────────────────────────
+# Les installs antérieures préservaient .env sans ajouter CODERAFT_HOST_OS
+# (seul le path "fresh secrets" l'écrivait). Dashboard-api lit cette valeur
+# pour décider du mode capture daemon (native Windows Service vs Docker
+# sidecar Linux). Sans CODERAFT_HOST_OS, le setup wizard affiche
+# "CODERAFT_HOST_OS configured: ✗ not set" et capture ne fonctionne pas.
+$envPathForHostOS = Join-Path $INSTALL_DIR ".env"
+if (Test-Path $envPathForHostOS) {
+    $envTextHO = [System.IO.File]::ReadAllText($envPathForHostOS, [System.Text.UTF8Encoding]::new($false))
+    if ($envTextHO -notmatch '(?m)^\s*CODERAFT_HOST_OS\s*=') {
+        $hostOSValue = "windows"  # update.ps1 ne tourne que sur Windows
+        $envTextHO = $envTextHO.TrimEnd() + "`nCODERAFT_HOST_OS=$hostOSValue`n"
+        [System.IO.File]::WriteAllText($envPathForHostOS, $envTextHO, [System.Text.UTF8Encoding]::new($false))
+        Write-Host "  ✓ Self-heal .env — CODERAFT_HOST_OS=$hostOSValue ajouté"
+    }
+}
+
+# ── Self-heal: docker-compose.yml drift (B24 — depends_on coderaft-vault) ──
+# Les installs antérieures déclaraient coderaft-vault avec
+# `condition: service_healthy`. Le healthcheck binary du vault est buggé
+# (pas de cert client pour le mTLS handshake) → vault toujours unhealthy →
+# dashboard-api bloqué. Workaround validé : passer en service_started.
+$composePath = Join-Path $INSTALL_DIR "docker-compose.yml"
+if (Test-Path $composePath) {
+    $composeText = [System.IO.File]::ReadAllText($composePath, [System.Text.UTF8Encoding]::new($false))
+    $oldDep = 'coderaft-vault: { condition: service_healthy }'
+    $newDep = 'coderaft-vault: { condition: service_started }'
+    if ($composeText.Contains($oldDep)) {
+        $bak = "$composePath.bak-" + (Get-Date -Format "yyyyMMdd_HHmmss")
+        try { Copy-Item -LiteralPath $composePath -Destination $bak -Force -ErrorAction SilentlyContinue } catch {}
+        $composeText = $composeText.Replace($oldDep, $newDep)
+        [System.IO.File]::WriteAllText($composePath, $composeText, [System.Text.UTF8Encoding]::new($false))
+        Write-Host "  ✓ Self-heal docker-compose.yml — coderaft-vault: service_healthy → service_started"
+    }
+}
+
 # ── Self-heal HOST_PROJECT_DIR in .env ────────────────────────────────────
 # Older oneliners (and any install where the dir was renamed/moved) leave
 # .env without HOST_PROJECT_DIR, which causes:

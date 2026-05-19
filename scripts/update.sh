@@ -104,6 +104,32 @@ if [ -z "$CODERAFT_UPDATE_REEXEC" ]; then
     fi
 fi
 
+# ── Self-heal CODERAFT_HOST_OS in .env (B25) ──────────────────────────────
+# Les installs antérieures préservaient .env sans ajouter CODERAFT_HOST_OS.
+# Dashboard-api lit cette valeur pour le mode capture (native vs sidecar).
+ENV_PATH_HO="${INSTALL_DIR}/.env"
+if [ -f "$ENV_PATH_HO" ] && ! grep -qE '^\s*CODERAFT_HOST_OS\s*=' "$ENV_PATH_HO"; then
+    case "$(uname -s)" in
+        Darwin) HOST_OS_VAL="macos" ;;
+        Linux)  HOST_OS_VAL="linux" ;;
+        *)      HOST_OS_VAL="linux" ;;
+    esac
+    printf '\nCODERAFT_HOST_OS=%s\n' "$HOST_OS_VAL" >> "$ENV_PATH_HO"
+    echo "  ✓ Self-heal .env — CODERAFT_HOST_OS=$HOST_OS_VAL ajouté"
+fi
+
+# ── Self-heal: docker-compose.yml drift (B24 — depends_on coderaft-vault) ──
+# Les installs antérieures déclaraient coderaft-vault avec
+# `condition: service_healthy`. Le healthcheck binary est buggé → vault
+# toujours unhealthy → dashboard-api bloqué. Workaround: service_started.
+COMPOSE_PATH="${INSTALL_DIR}/docker-compose.yml"
+if [ -f "$COMPOSE_PATH" ] && grep -qF 'coderaft-vault: { condition: service_healthy }' "$COMPOSE_PATH"; then
+    cp "$COMPOSE_PATH" "$COMPOSE_PATH.bak-$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+    sed -i.tmp 's|coderaft-vault: { condition: service_healthy }|coderaft-vault: { condition: service_started }|' "$COMPOSE_PATH"
+    rm -f "$COMPOSE_PATH.tmp"
+    echo "  ✓ Self-heal docker-compose.yml — coderaft-vault: service_healthy → service_started"
+fi
+
 # ── Self-heal HOST_PROJECT_DIR in .env ────────────────────────────────────
 # Older oneliners (and any install where the dir was renamed/moved) leave
 # .env without HOST_PROJECT_DIR, which causes:
