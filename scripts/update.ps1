@@ -164,6 +164,23 @@ if (Test-Path $composePath) {
     }
 }
 
+# ── Self-heal: docker-compose.override.yml neo4j port (B26) ───────────────
+# Bind 127.0.0.1 + port paramétrable (NEO4J_BOLT_PORT). Banking-grade :
+# pas d'exposition 0.0.0.0 par défaut. Côté prod, NEO4J_BOLT_PORT n'est
+# pas set → 7687 utilisé (cohérent avec l'existant).
+$overridePath = Join-Path $INSTALL_DIR "docker-compose.override.yml"
+if (Test-Path $overridePath) {
+    $overrideText = [System.IO.File]::ReadAllText($overridePath, [System.Text.UTF8Encoding]::new($false))
+    if ($overrideText -match '"7687:7687"|- 7687:7687') {
+        $bak2 = "$overridePath.bak-" + (Get-Date -Format "yyyyMMdd_HHmmss")
+        try { Copy-Item -LiteralPath $overridePath -Destination $bak2 -Force -ErrorAction SilentlyContinue } catch {}
+        $overrideText = $overrideText -replace '"7687:7687"', '"127.0.0.1:${NEO4J_BOLT_PORT:-7687}:7687"'
+        $overrideText = $overrideText -replace '- 7687:7687', '- "127.0.0.1:${NEO4J_BOLT_PORT:-7687}:7687"'
+        [System.IO.File]::WriteAllText($overridePath, $overrideText, [System.Text.UTF8Encoding]::new($false))
+        Write-Host "  ✓ Self-heal docker-compose.override.yml — neo4j 127.0.0.1 only + paramétrable"
+    }
+}
+
 # ── Self-heal HOST_PROJECT_DIR in .env ────────────────────────────────────
 # Older oneliners (and any install where the dir was renamed/moved) leave
 # .env without HOST_PROJECT_DIR, which causes:
