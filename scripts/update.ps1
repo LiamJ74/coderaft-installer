@@ -164,6 +164,40 @@ if (Test-Path $composePath) {
     }
 }
 
+# ── Self-heal: NODE_OPTIONS=ipv4first dans dashboard-api (B15) ────────────
+# Node.js IPv6-first par défaut, container Docker n'a pas d'IPv6 → ENETUNREACH
+# sur appels sortants (license.coderaft.io, login.microsoftonline.com).
+# Manifestation : 'Authentication failed: server_error' lors du callback Entra,
+# 'Internal server error' lors de l'activation licence. Patch in-place :
+# insère NODE_OPTIONS=--dns-result-order=ipv4first dans la section environment:
+# du dashboard-api.
+$composePathB15 = Join-Path $INSTALL_DIR "docker-compose.yml"
+if (Test-Path $composePathB15) {
+    $composeTextB15 = [System.IO.File]::ReadAllText($composePathB15, [System.Text.UTF8Encoding]::new($false))
+    if ($composeTextB15 -notmatch 'NODE_OPTIONS=--dns-result-order=ipv4first') {
+        # Cible le bloc dashboard-api environment, AVANT la ligne LICENSE_SERVER_URL
+        $marker = '      - LICENSE_SERVER_URL=https://license.coderaft.io'
+        $replacement = '      - NODE_OPTIONS=--dns-result-order=ipv4first' + "`n" + $marker
+        if ($composeTextB15.Contains($marker)) {
+            $bakB15 = "$composePathB15.bak-" + (Get-Date -Format "yyyyMMddHHmmss")
+            try { Copy-Item -LiteralPath $composePathB15 -Destination $bakB15 -Force -ErrorAction SilentlyContinue } catch {}
+            # Replace only first occurrence (dashboard service has the same line, mais c'est pas grave
+            # de l'ajouter au dashboard SPA aussi puisque c'est juste un nginx).
+            $idx = $composeTextB15.IndexOf($marker)
+            if ($idx -ge 0) {
+                $composeTextB15 = $composeTextB15.Substring(0, $idx) + $replacement + $composeTextB15.Substring($idx + $marker.Length)
+                # Second occurrence (dashboard-api block)
+                $idx2 = $composeTextB15.IndexOf($marker, $idx + $replacement.Length)
+                if ($idx2 -ge 0) {
+                    $composeTextB15 = $composeTextB15.Substring(0, $idx2) + $replacement + $composeTextB15.Substring($idx2 + $marker.Length)
+                }
+                [System.IO.File]::WriteAllText($composePathB15, $composeTextB15, [System.Text.UTF8Encoding]::new($false))
+                Write-Host "  ✓ Self-heal docker-compose.yml — NODE_OPTIONS=ipv4first ajouté à dashboard-api (B15)"
+            }
+        }
+    }
+}
+
 # ── Self-heal: docker-compose.override.yml neo4j port (B26) ───────────────
 # Bind 127.0.0.1 + port paramétrable (NEO4J_BOLT_PORT). Banking-grade :
 # pas d'exposition 0.0.0.0 par défaut. Côté prod, NEO4J_BOLT_PORT n'est
