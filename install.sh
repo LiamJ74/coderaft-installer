@@ -629,6 +629,11 @@ services:
       redis: { condition: service_healthy }
       coderaft-vault: { condition: service_healthy }
     environment:
+      # B15 (2026-05-19): Node.js résout IPv6 d'abord par défaut. Le container
+      # Docker n'a pas d'IPv6 → ENETUNREACH → fallback IPv4 lent ou timeout
+      # sur les appels sortants (license.coderaft.io, login.microsoftonline.com).
+      # Force IPv4-first.
+      - NODE_OPTIONS=--dns-result-order=ipv4first
       - LICENSE_SERVER_URL=https://license.coderaft.io
       - DATABASE_URL=postgres://coderaft:${POSTGRES_PASSWORD}@postgres:5432/coderaft
       - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0

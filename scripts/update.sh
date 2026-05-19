@@ -130,6 +130,21 @@ if [ -f "$COMPOSE_PATH" ] && grep -qF 'coderaft-vault: { condition: service_heal
     echo "  ✓ Self-heal docker-compose.yml — coderaft-vault: service_healthy → service_started"
 fi
 
+# ── Self-heal: NODE_OPTIONS=ipv4first dans dashboard-api (B15) ────────────
+# Node.js IPv6-first, container Docker n'a pas d'IPv6 → ENETUNREACH sur appels
+# sortants (license.coderaft.io, login.microsoftonline.com). Manifestation:
+# 'Authentication failed: server_error' lors du callback Entra.
+if [ -f "$COMPOSE_PATH" ] && ! grep -qF 'NODE_OPTIONS=--dns-result-order=ipv4first' "$COMPOSE_PATH"; then
+    if grep -qF '      - LICENSE_SERVER_URL=https://license.coderaft.io' "$COMPOSE_PATH"; then
+        cp "$COMPOSE_PATH" "$COMPOSE_PATH.bak-b15-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+        # Inject NODE_OPTIONS line BEFORE every LICENSE_SERVER_URL line.
+        sed -i.tmp 's|      - LICENSE_SERVER_URL=https://license.coderaft.io|      - NODE_OPTIONS=--dns-result-order=ipv4first\
+      - LICENSE_SERVER_URL=https://license.coderaft.io|g' "$COMPOSE_PATH"
+        rm -f "$COMPOSE_PATH.tmp"
+        echo "  ✓ Self-heal docker-compose.yml — NODE_OPTIONS=ipv4first ajouté (B15)"
+    fi
+fi
+
 # ── Self-heal: docker-compose.override.yml neo4j port (B26) ───────────────
 # Bind 127.0.0.1 + port paramétrable. Banking-grade.
 OVERRIDE_PATH="${INSTALL_DIR}/docker-compose.override.yml"
