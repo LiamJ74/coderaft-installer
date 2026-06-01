@@ -40,12 +40,13 @@ esac
 echo "  Detected: ${CODERAFT_OS}/${CODERAFT_ARCH}"
 echo ""
 
-# Force DOCKER_DEFAULT_PLATFORM to work around the Docker Desktop bug that
-# resolves strict linux/arm64/v8 or linux/amd64/v3 and fails the pull on
-# manifests that only expose linux/arm64 or linux/amd64.
-if [ -z "$DOCKER_DEFAULT_PLATFORM" ] && [ "$CODERAFT_ARCH" != "unknown" ]; then
-    export DOCKER_DEFAULT_PLATFORM="linux/${CODERAFT_ARCH}"
-fi
+# B33 (2026-06-01): NE PAS forcer DOCKER_DEFAULT_PLATFORM.
+# Forcer "linux/arm64" (bare) cassait les pulls d'images publiques qui
+# n'exposent que linux/arm64/v8 (postgres:16-alpine, redis:7-alpine,
+# caddy:2-alpine, etc.) → "no matching manifest". Docker Desktop ≥ 4.20
+# résout correctement par lui-même. Si un user a un Docker très ancien, il
+# peut toujours forcer en exportant DOCKER_DEFAULT_PLATFORM=linux/arm64/v8
+# avant de lancer l'install.
 
 # ── Prerequisites ────────────────────────────────────────────────────────────
 
