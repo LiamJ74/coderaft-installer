@@ -775,9 +775,25 @@ function Invoke-VaultUnsealFresh {
         return $false
     }
 
-    # Detect compose project name (determines Docker network for sidecar)
-    $vaultProject = (& docker inspect coderaft-coderaft-vault-1 `
-        --format '{{ index .Config.Labels "com.docker.compose.project" }}' 2>$null) -join ""
+    # Detect compose project name (determines Docker network for sidecar).
+    # B20-inspect (2026-06-09): inline `--format '{{ ... "com.docker..." ... }}'`
+    # gets mangled by PowerShell native-command argument passing — the double
+    # quotes inside the single-quoted string are stripped before reaching
+    # docker, leaving `com.docker.compose.project` as a bare token and
+    # docker's Go template engine then errors with `function "com" not
+    # defined`. Storing the format string in a variable + invoking via
+    # Start-Process preserves the quotes and silences any stderr noise.
+    $inspectFormat = '{{ index .Config.Labels "com.docker.compose.project" }}'
+    $inspectStdout = Join-Path $env:TEMP "coderaft-inspect-out-$(Get-Random).log"
+    $inspectStderr = Join-Path $env:TEMP "coderaft-inspect-err-$(Get-Random).log"
+    Start-Process -FilePath "docker" -ArgumentList @(
+        "inspect", "coderaft-coderaft-vault-1", "--format", $inspectFormat
+    ) -NoNewWindow -Wait `
+        -RedirectStandardOutput $inspectStdout `
+        -RedirectStandardError $inspectStderr `
+        -ErrorAction SilentlyContinue | Out-Null
+    $vaultProject = ((Get-Content $inspectStdout -ErrorAction SilentlyContinue) -join "").Trim()
+    Remove-Item -Path $inspectStdout,$inspectStderr -ErrorAction SilentlyContinue
     if (-not $vaultProject) { $vaultProject = "coderaft" }
     $vaultNetwork = "${vaultProject}_coderaft-vault-net"
     $absTlsDir = (Resolve-Path -LiteralPath "vault-tls").Path
