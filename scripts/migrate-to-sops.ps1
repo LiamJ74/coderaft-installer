@@ -192,8 +192,16 @@ if (-not $sopsExe) {
 Write-Host "  -- age key --"
 if (-not (Test-Path $AgeKeyPath)) {
     New-Item -ItemType Directory -Path $AgeKeyDir -Force | Out-Null
-    & age-keygen.exe -o $AgeKeyPath 2>$null
-    if ($LASTEXITCODE -ne 0) { Write-Fatal "Could not generate the age key" }
+    # B20 (2026-06-08): `& age-keygen.exe -o ... 2>$null` → NativeCommandError PS 5.1
+    # (age-keygen emits a "world-readable file" warning on stderr in Windows).
+    $ageGenErr2 = Join-Path $env:TEMP "coderaft-agegen2-err-$(Get-Random).txt"
+    $ageGenProc2 = Start-Process -FilePath "age-keygen.exe" `
+        -ArgumentList @("-o", $AgeKeyPath) `
+        -NoNewWindow -Wait -PassThru `
+        -RedirectStandardError $ageGenErr2 `
+        -ErrorAction SilentlyContinue
+    Remove-Item -Path $ageGenErr2 -ErrorAction SilentlyContinue
+    if ($ageGenProc2.ExitCode -ne 0) { Write-Fatal "Could not generate the age key" }
 
     # ACL: admin only
     $acl = Get-Acl $AgeKeyPath

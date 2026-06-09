@@ -17,7 +17,16 @@ param(
 if (-not $InstallDir) { $InstallDir = (Get-Location).Path }
 
 # Verify vault is running
-$ps = & docker compose ps coderaft-vault 2>$null
+# B20 (2026-06-08): `& docker compose ps ... 2>$null` → NativeCommandError PS 5.1
+$vsPsOut = Join-Path $env:TEMP "coderaft-vsps-out-$(Get-Random).log"
+$vsPsErr = Join-Path $env:TEMP "coderaft-vsps-err-$(Get-Random).log"
+Start-Process -FilePath "docker" -ArgumentList @("compose","ps","coderaft-vault") `
+    -NoNewWindow -Wait `
+    -RedirectStandardOutput $vsPsOut `
+    -RedirectStandardError  $vsPsErr `
+    -ErrorAction SilentlyContinue | Out-Null
+$ps = (Get-Content $vsPsOut -ErrorAction SilentlyContinue) -join " "
+Remove-Item -Path $vsPsOut,$vsPsErr -ErrorAction SilentlyContinue
 if ($ps -notmatch "running") {
     Write-Host "  [!] coderaft-vault is not running." -ForegroundColor Red
     Write-Host "    Start it with: docker compose up -d coderaft-vault" -ForegroundColor Red
@@ -34,7 +43,16 @@ $resp = ""
 try {
     Push-Location $InstallDir -ErrorAction SilentlyContinue
     $cmd = "wget -qO- --post-data='$shellSafeBody' --header='Content-Type: application/json' http://localhost:8200/v1/secret/set"
-    $resp = & docker compose exec -T coderaft-vault /bin/sh -c $cmd 2>&1
+    # B20 (2026-06-08): `& docker compose exec -T ... 2>&1` → NativeCommandError PS 5.1
+    $vsExecOut = Join-Path $env:TEMP "coderaft-vsexec-out-$(Get-Random).log"
+    $vsExecErr = Join-Path $env:TEMP "coderaft-vsexec-err-$(Get-Random).log"
+    Start-Process -FilePath "docker" -ArgumentList @("compose","exec","-T","coderaft-vault","/bin/sh","-c",$cmd) `
+        -NoNewWindow -Wait `
+        -RedirectStandardOutput $vsExecOut `
+        -RedirectStandardError  $vsExecErr `
+        -ErrorAction SilentlyContinue | Out-Null
+    $resp = (Get-Content $vsExecOut -ErrorAction SilentlyContinue) -join ""
+    Remove-Item -Path $vsExecOut,$vsExecErr -ErrorAction SilentlyContinue
     Pop-Location -ErrorAction SilentlyContinue
 } catch {
     Write-Host "  [!] docker exec failed: $($_.Exception.Message)" -ForegroundColor Red

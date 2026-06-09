@@ -61,13 +61,28 @@ function Find-AdminToken {
     #    at boot and persists it to /data/admin_token).
     try {
         Push-Location $INSTALL_DIR -ErrorAction SilentlyContinue
-        $services = & docker compose ps --services 2>$null
+        # B20 (2026-06-08): `& docker compose ps ... 2>$null` surfaces stderr
+        # as NativeCommandError in PS 5.1. Use Start-Process + temp files.
+        $svcStdout = Join-Path $env:TEMP "coderaft-svc-out-$(Get-Random).log"
+        $svcStderr = Join-Path $env:TEMP "coderaft-svc-err-$(Get-Random).log"
+        Start-Process -FilePath "docker" -ArgumentList @("compose","ps","--services") `
+            -NoNewWindow -Wait `
+            -RedirectStandardOutput $svcStdout `
+            -RedirectStandardError  $svcStderr `
+            -ErrorAction SilentlyContinue | Out-Null
+        $services = (Get-Content $svcStdout -ErrorAction SilentlyContinue) -join "`n"
+        Remove-Item -Path $svcStdout,$svcStderr -ErrorAction SilentlyContinue
         if ($services -match '(?m)^dashboard-api$') {
-            $val = & docker compose exec -T dashboard-api cat /data/admin_token 2>$null
-            if ($val) {
-                $val = ($val -join "`n").Trim()
-                if ($val) { return $val }
-            }
+            $catStdout = Join-Path $env:TEMP "coderaft-cat-out-$(Get-Random).log"
+            $catStderr = Join-Path $env:TEMP "coderaft-cat-err-$(Get-Random).log"
+            Start-Process -FilePath "docker" -ArgumentList @("compose","exec","-T","dashboard-api","cat","/data/admin_token") `
+                -NoNewWindow -Wait `
+                -RedirectStandardOutput $catStdout `
+                -RedirectStandardError  $catStderr `
+                -ErrorAction SilentlyContinue | Out-Null
+            $val = ((Get-Content $catStdout -ErrorAction SilentlyContinue) -join "`n").Trim()
+            Remove-Item -Path $catStdout,$catStderr -ErrorAction SilentlyContinue
+            if ($val) { return $val }
         }
     } catch { }
     finally { Pop-Location -ErrorAction SilentlyContinue }
@@ -251,8 +266,17 @@ Write-Host ""
 Write-Host "  Checking compose integrity..."
 $composeOK = $false
 try {
-    & docker compose ps 2>&1 | Out-Null
-    if ($LASTEXITCODE -eq 0) { $composeOK = $true }
+    # B20 (2026-06-08): `& docker compose ps 2>&1 | Out-Null` surfaces docker
+    # stderr as NativeCommandError in PS 5.1. Use Start-Process + temp files.
+    $psCheckOut = Join-Path $env:TEMP "coderaft-pscheck-out-$(Get-Random).log"
+    $psCheckErr = Join-Path $env:TEMP "coderaft-pscheck-err-$(Get-Random).log"
+    $psCheckProc = Start-Process -FilePath "docker" -ArgumentList @("compose","ps") `
+        -NoNewWindow -Wait -PassThru `
+        -RedirectStandardOutput $psCheckOut `
+        -RedirectStandardError  $psCheckErr `
+        -ErrorAction SilentlyContinue
+    Remove-Item -Path $psCheckOut,$psCheckErr -ErrorAction SilentlyContinue
+    if ($psCheckProc.ExitCode -eq 0) { $composeOK = $true }
 } catch { }
 if (-not $composeOK) {
     Write-Host "  ⚠ docker-compose.override.yml appears corrupted — auto-recovery..."
@@ -262,12 +286,38 @@ if (-not $composeOK) {
         try { Remove-Item "docker-compose.override.yml" -ErrorAction SilentlyContinue } catch { }
         Write-Host "    ✓ override backed up + removed"
     }
-    try { & docker pull ghcr.io/liamj74/coderaft-dashboard-api:latest *>$null } catch { }
     try {
-        & docker compose up -d postgres redis dashboard-api 2>&1 | Out-Null
+        $pullOut  = Join-Path $env:TEMP "coderaft-pull-out-$(Get-Random).log"
+        $pullErr  = Join-Path $env:TEMP "coderaft-pull-err-$(Get-Random).log"
+        Start-Process -FilePath "docker" -ArgumentList @("pull","ghcr.io/liamj74/coderaft-dashboard-api:latest") `
+            -NoNewWindow -Wait `
+            -RedirectStandardOutput $pullOut `
+            -RedirectStandardError  $pullErr `
+            -ErrorAction SilentlyContinue | Out-Null
+        Remove-Item -Path $pullOut,$pullErr -ErrorAction SilentlyContinue
+    } catch { }
+    try {
+        # docker compose up -d: its stdout is desired output, but stderr
+        # surfaces as NativeCommandError in PS 5.1. Redirect stderr only.
+        $upHealErr = Join-Path $env:TEMP "coderaft-upheal-err-$(Get-Random).log"
+        $upHealOut = Join-Path $env:TEMP "coderaft-upheal-out-$(Get-Random).log"
+        $upHealProc = Start-Process -FilePath "docker" -ArgumentList @("compose","up","-d","postgres","redis","dashboard-api") `
+            -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput $upHealOut `
+            -RedirectStandardError  $upHealErr `
+            -ErrorAction SilentlyContinue
+        if (Test-Path $upHealOut) { Get-Content $upHealOut -ErrorAction SilentlyContinue | Out-Host }
+        Remove-Item -Path $upHealOut,$upHealErr -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 6
-        & docker compose ps 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) {
+        $psHealOut = Join-Path $env:TEMP "coderaft-psheal-out-$(Get-Random).log"
+        $psHealErr = Join-Path $env:TEMP "coderaft-psheal-err-$(Get-Random).log"
+        $psHealProc = Start-Process -FilePath "docker" -ArgumentList @("compose","ps") `
+            -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput $psHealOut `
+            -RedirectStandardError  $psHealErr `
+            -ErrorAction SilentlyContinue
+        Remove-Item -Path $psHealOut,$psHealErr -ErrorAction SilentlyContinue
+        if ($psHealProc.ExitCode -eq 0) {
             Write-Host "    ✓ compose repaired"
         } else {
             Write-Host "  ERROR: self-heal failed. Inspect docker-compose.override.yml manually."
@@ -291,7 +341,16 @@ $vaultMigrationSentinel = Join-Path $INSTALL_DIR "vault-data\.migrated"
 $vaultAgeKey = Join-Path $INSTALL_DIR "vault-keys\age.key"
 $vaultRunning = $false
 try {
-    $ps = & docker compose ps coderaft-vault 2>$null
+    # B20 (2026-06-08): `& docker compose ps ... 2>$null` → NativeCommandError PS 5.1
+    $vaultPsOut = Join-Path $env:TEMP "coderaft-vaultps-out-$(Get-Random).log"
+    $vaultPsErr = Join-Path $env:TEMP "coderaft-vaultps-err-$(Get-Random).log"
+    Start-Process -FilePath "docker" -ArgumentList @("compose","ps","coderaft-vault") `
+        -NoNewWindow -Wait `
+        -RedirectStandardOutput $vaultPsOut `
+        -RedirectStandardError  $vaultPsErr `
+        -ErrorAction SilentlyContinue | Out-Null
+    $ps = (Get-Content $vaultPsOut -ErrorAction SilentlyContinue) -join " "
+    Remove-Item -Path $vaultPsOut,$vaultPsErr -ErrorAction SilentlyContinue
     if ($ps -match "running") { $vaultRunning = $true }
 } catch { }
 
@@ -323,7 +382,17 @@ if ($vaultNeedsMigration) {
 
     # Postgres dump
     try {
-        $pgRunning = (& docker compose ps postgres 2>$null) -match "running"
+        # B20 (2026-06-08): `& docker compose ps ... 2>$null` → NativeCommandError PS 5.1
+        $pgPsOut = Join-Path $env:TEMP "coderaft-pgps-out-$(Get-Random).log"
+        $pgPsErr = Join-Path $env:TEMP "coderaft-pgps-err-$(Get-Random).log"
+        Start-Process -FilePath "docker" -ArgumentList @("compose","ps","postgres") `
+            -NoNewWindow -Wait `
+            -RedirectStandardOutput $pgPsOut `
+            -RedirectStandardError  $pgPsErr `
+            -ErrorAction SilentlyContinue | Out-Null
+        $pgPsText = (Get-Content $pgPsOut -ErrorAction SilentlyContinue) -join " "
+        Remove-Item -Path $pgPsOut,$pgPsErr -ErrorAction SilentlyContinue
+        $pgRunning = $pgPsText -match "running"
         if ($pgRunning) {
             $bakSql = Join-Path $vaultBak "auth_config.sql"
             $proc = Start-Process -FilePath "docker" `
@@ -335,14 +404,53 @@ if ($vaultNeedsMigration) {
 
     # Container-side files
     try {
-        $rvRunning = (& docker compose ps ravenscan 2>$null) -match "running"
-        if ($rvRunning) { & docker compose cp "ravenscan:.ravenscan/ravenscan.db" (Join-Path $vaultBak "ravenscan.db") 2>$null }
+        $rvPsOut = Join-Path $env:TEMP "coderaft-rvps-out-$(Get-Random).log"
+        $rvPsErr = Join-Path $env:TEMP "coderaft-rvps-err-$(Get-Random).log"
+        Start-Process -FilePath "docker" -ArgumentList @("compose","ps","ravenscan") `
+            -NoNewWindow -Wait `
+            -RedirectStandardOutput $rvPsOut `
+            -RedirectStandardError  $rvPsErr `
+            -ErrorAction SilentlyContinue | Out-Null
+        $rvRunning = ((Get-Content $rvPsOut -ErrorAction SilentlyContinue) -join " ") -match "running"
+        Remove-Item -Path $rvPsOut,$rvPsErr -ErrorAction SilentlyContinue
+        if ($rvRunning) {
+            $rvCpErr = Join-Path $env:TEMP "coderaft-rvcp-err-$(Get-Random).log"
+            $rvCpOut = Join-Path $env:TEMP "coderaft-rvcp-out-$(Get-Random).log"
+            Start-Process -FilePath "docker" -ArgumentList @("compose","cp","ravenscan:.ravenscan/ravenscan.db",(Join-Path $vaultBak "ravenscan.db")) `
+                -NoNewWindow -Wait `
+                -RedirectStandardOutput $rvCpOut `
+                -RedirectStandardError  $rvCpErr `
+                -ErrorAction SilentlyContinue | Out-Null
+            Remove-Item -Path $rvCpOut,$rvCpErr -ErrorAction SilentlyContinue
+        }
     } catch { }
     try {
-        $apiRunning = (& docker compose ps dashboard-api 2>$null) -match "running"
+        $apiPsOut = Join-Path $env:TEMP "coderaft-apips-out-$(Get-Random).log"
+        $apiPsErr = Join-Path $env:TEMP "coderaft-apips-err-$(Get-Random).log"
+        Start-Process -FilePath "docker" -ArgumentList @("compose","ps","dashboard-api") `
+            -NoNewWindow -Wait `
+            -RedirectStandardOutput $apiPsOut `
+            -RedirectStandardError  $apiPsErr `
+            -ErrorAction SilentlyContinue | Out-Null
+        $apiRunning = ((Get-Content $apiPsOut -ErrorAction SilentlyContinue) -join " ") -match "running"
+        Remove-Item -Path $apiPsOut,$apiPsErr -ErrorAction SilentlyContinue
         if ($apiRunning) {
-            & docker compose cp "dashboard-api:/data/vault.enc"   (Join-Path $vaultBak "dashboard-vault.enc") 2>$null
-            & docker compose cp "dashboard-api:/data/admin_token" (Join-Path $vaultBak "admin_token") 2>$null
+            $cp1Out = Join-Path $env:TEMP "coderaft-cp1-out-$(Get-Random).log"
+            $cp1Err = Join-Path $env:TEMP "coderaft-cp1-err-$(Get-Random).log"
+            Start-Process -FilePath "docker" -ArgumentList @("compose","cp","dashboard-api:/data/vault.enc",(Join-Path $vaultBak "dashboard-vault.enc")) `
+                -NoNewWindow -Wait `
+                -RedirectStandardOutput $cp1Out `
+                -RedirectStandardError  $cp1Err `
+                -ErrorAction SilentlyContinue | Out-Null
+            Remove-Item -Path $cp1Out,$cp1Err -ErrorAction SilentlyContinue
+            $cp2Out = Join-Path $env:TEMP "coderaft-cp2-out-$(Get-Random).log"
+            $cp2Err = Join-Path $env:TEMP "coderaft-cp2-err-$(Get-Random).log"
+            Start-Process -FilePath "docker" -ArgumentList @("compose","cp","dashboard-api:/data/admin_token",(Join-Path $vaultBak "admin_token")) `
+                -NoNewWindow -Wait `
+                -RedirectStandardOutput $cp2Out `
+                -RedirectStandardError  $cp2Err `
+                -ErrorAction SilentlyContinue | Out-Null
+            Remove-Item -Path $cp2Out,$cp2Err -ErrorAction SilentlyContinue
         }
     } catch { }
     Write-Host "  ✓ Pre-flight backup complete"
@@ -355,19 +463,54 @@ if ($vaultNeedsMigration) {
     function Invoke-VaultMigrationRollback {
         param([string]$Reason)
         Write-Host "  ✗ Vault migration failed: $Reason — rolling back..." -ForegroundColor Red
-        try { & docker compose down 2>$null } catch { }
+        try {
+            # B20 (2026-06-08): all docker commands in rollback helper → Start-Process
+            $rbDownOut = Join-Path $env:TEMP "coderaft-rbdown-out-$(Get-Random).log"
+            $rbDownErr = Join-Path $env:TEMP "coderaft-rbdown-err-$(Get-Random).log"
+            Start-Process -FilePath "docker" -ArgumentList @("compose","down") `
+                -NoNewWindow -Wait `
+                -RedirectStandardOutput $rbDownOut `
+                -RedirectStandardError  $rbDownErr `
+                -ErrorAction SilentlyContinue | Out-Null
+            Remove-Item -Path $rbDownOut,$rbDownErr -ErrorAction SilentlyContinue
+        } catch { }
         if (Test-Path (Join-Path $vaultBak "env"))   { Copy-Item (Join-Path $vaultBak "env") $envPath -Force -ErrorAction SilentlyContinue }
         if (Test-Path (Join-Path $vaultBak "env.enc")) { Copy-Item (Join-Path $vaultBak "env.enc") $envEncPath -Force -ErrorAction SilentlyContinue }
         if (Test-Path (Join-Path $vaultBak "age.key")) { Copy-Item (Join-Path $vaultBak "age.key") $ageKeyPath -Force -ErrorAction SilentlyContinue }
         $authSql = Join-Path $vaultBak "auth_config.sql"
         if (Test-Path $authSql) {
             try {
-                & docker compose up -d postgres 2>$null
+                $rbPgOut = Join-Path $env:TEMP "coderaft-rbpg-out-$(Get-Random).log"
+                $rbPgErr = Join-Path $env:TEMP "coderaft-rbpg-err-$(Get-Random).log"
+                Start-Process -FilePath "docker" -ArgumentList @("compose","up","-d","postgres") `
+                    -NoNewWindow -Wait `
+                    -RedirectStandardOutput $rbPgOut `
+                    -RedirectStandardError  $rbPgErr `
+                    -ErrorAction SilentlyContinue | Out-Null
+                Remove-Item -Path $rbPgOut,$rbPgErr -ErrorAction SilentlyContinue
                 Start-Sleep -Seconds 5
-                Get-Content -Raw $authSql | & docker compose exec -T postgres psql -U coderaft coderaft 2>$null
+                # pipe SQL into psql via Start-Process stdin redirect
+                $rbPsqlOut = Join-Path $env:TEMP "coderaft-rbpsql-out-$(Get-Random).log"
+                $rbPsqlErr = Join-Path $env:TEMP "coderaft-rbpsql-err-$(Get-Random).log"
+                Start-Process -FilePath "docker" -ArgumentList @("compose","exec","-T","postgres","psql","-U","coderaft","coderaft") `
+                    -NoNewWindow -Wait `
+                    -RedirectStandardInput  $authSql `
+                    -RedirectStandardOutput $rbPsqlOut `
+                    -RedirectStandardError  $rbPsqlErr `
+                    -ErrorAction SilentlyContinue | Out-Null
+                Remove-Item -Path $rbPsqlOut,$rbPsqlErr -ErrorAction SilentlyContinue
             } catch { }
         }
-        try { & docker compose up -d 2>$null } catch { }
+        try {
+            $rbUpOut = Join-Path $env:TEMP "coderaft-rbup-out-$(Get-Random).log"
+            $rbUpErr = Join-Path $env:TEMP "coderaft-rbup-err-$(Get-Random).log"
+            Start-Process -FilePath "docker" -ArgumentList @("compose","up","-d") `
+                -NoNewWindow -Wait `
+                -RedirectStandardOutput $rbUpOut `
+                -RedirectStandardError  $rbUpErr `
+                -ErrorAction SilentlyContinue | Out-Null
+            Remove-Item -Path $rbUpOut,$rbUpErr -ErrorAction SilentlyContinue
+        } catch { }
         Write-Host ""
         Write-Host ""
         Write-Host "  Rollback complete. Backup directory: $vaultBak" -ForegroundColor Yellow
@@ -417,7 +560,14 @@ if ($vaultNeedsMigration) {
             }
         }
 
-        & $ageKeygen.Path -o $vaultAgeKey 2>$null
+        # B20 (2026-06-08): `& age-keygen -o ... 2>$null` → NativeCommandError PS 5.1
+        $ageGenStderr = Join-Path $env:TEMP "coderaft-agegen-err-$(Get-Random).txt"
+        $ageGenProc = Start-Process -FilePath $ageKeygen.Path `
+            -ArgumentList @("-o", $vaultAgeKey) `
+            -NoNewWindow -Wait -PassThru `
+            -RedirectStandardError $ageGenStderr `
+            -ErrorAction SilentlyContinue
+        Remove-Item -Path $ageGenStderr -ErrorAction SilentlyContinue
         if (-not (Test-Path $vaultAgeKey)) { Invoke-VaultMigrationRollback "age-keygen failed" }
 
         $recoveryPhrase = ""
@@ -425,8 +575,25 @@ if ($vaultNeedsMigration) {
             $privKey = (Get-Content $vaultAgeKey | Where-Object { $_ -match '^AGE-SECRET-KEY-' } | Select-Object -First 1)
             if ($privKey) {
                 try {
-                    $recoveryPhrase = ($privKey | & docker run --rm -i `
-                        ghcr.io/liamj74/coderaft-vault:latest -mnemonic-from-key /dev/stdin 2>$null) -join ""
+                    # B20 (2026-06-08): `& docker run --rm -i ... 2>$null` pipes stdin
+                    # AND surfaces docker stderr as NativeCommandError in PS 5.1.
+                    $mnKeyFile  = Join-Path $env:TEMP "coderaft-mn-key-$(Get-Random).txt"
+                    $mnOut      = Join-Path $env:TEMP "coderaft-mn-out-$(Get-Random).txt"
+                    $mnErr      = Join-Path $env:TEMP "coderaft-mn-err-$(Get-Random).txt"
+                    [System.IO.File]::WriteAllText($mnKeyFile, "$privKey`n", [System.Text.UTF8Encoding]::new($false))
+                    Start-Process -FilePath "docker" -ArgumentList @(
+                        "run","--rm",
+                        "-v","${mnKeyFile}:/input.key:ro",
+                        "ghcr.io/liamj74/coderaft-vault:latest",
+                        "-mnemonic-from-key","/input.key"
+                    ) -NoNewWindow -Wait `
+                        -RedirectStandardOutput $mnOut `
+                        -RedirectStandardError  $mnErr `
+                        -ErrorAction SilentlyContinue | Out-Null
+                    if (Test-Path $mnOut) {
+                        $recoveryPhrase = ((Get-Content $mnOut -ErrorAction SilentlyContinue) -join "").Trim()
+                    }
+                    Remove-Item -Path $mnKeyFile,$mnOut,$mnErr -ErrorAction SilentlyContinue
                 } catch { $recoveryPhrase = "" }
             }
         }
@@ -511,11 +678,41 @@ chmod 600 *.key 2>/dev/null || true
     # Use --user to keep file ownership readable on Linux hosts; on Windows/Mac
     # Docker Desktop handles UID translation transparently.
     $absTlsDir = (Resolve-Path -LiteralPath $tlsDir).Path
-    # Use stdin to avoid quoting nightmares with the heredoc inside the script.
-    $opensslOut = $opensslScript | & docker run --rm -i `
-        -v "${absTlsDir}:/work" `
-        alpine:3.20 sh 2>&1
-    $opensslOut | Tee-Object -FilePath $migrationLog -Append | Out-Host
+    # B20 (2026-06-08): `$opensslScript | & docker run --rm -i ... 2>&1` pipes
+    # stdin AND surfaces docker stderr as NativeCommandError in PS 5.1.
+    # Write the script to a temp file, mount it, run sh against it.
+    $opensslScriptFile2 = Join-Path $env:TEMP "coderaft-openssl2-$(Get-Random).sh"
+    $opensslScriptLF2 = $opensslScript -replace "`r`n", "`n"
+    [System.IO.File]::WriteAllText($opensslScriptFile2, $opensslScriptLF2, [System.Text.UTF8Encoding]::new($false))
+
+    # Pre-pull alpine silently
+    $mPullOut = Join-Path $env:TEMP "coderaft-mpull-out-$(Get-Random).log"
+    $mPullErr = Join-Path $env:TEMP "coderaft-mpull-err-$(Get-Random).log"
+    Start-Process -FilePath "docker" -ArgumentList @("pull","alpine:3.20") `
+        -NoNewWindow -Wait `
+        -RedirectStandardOutput $mPullOut `
+        -RedirectStandardError  $mPullErr `
+        -ErrorAction SilentlyContinue | Out-Null
+    Remove-Item -Path $mPullOut,$mPullErr -ErrorAction SilentlyContinue
+
+    $mRunOut = Join-Path $env:TEMP "coderaft-mrun-out-$(Get-Random).log"
+    $mRunErr = Join-Path $env:TEMP "coderaft-mrun-err-$(Get-Random).log"
+    $mRunProc = Start-Process -FilePath "docker" -ArgumentList @(
+        "run","--rm",
+        "-v","${opensslScriptFile2}:/script.sh:ro",
+        "-v","${absTlsDir}:/work",
+        "alpine:3.20","sh","/script.sh"
+    ) -NoNewWindow -Wait -PassThru `
+        -RedirectStandardOutput $mRunOut `
+        -RedirectStandardError  $mRunErr `
+        -ErrorAction Stop
+    if (Test-Path $mRunOut) {
+        $mRunContent = Get-Content $mRunOut -ErrorAction SilentlyContinue
+        if ($mRunContent) {
+            $mRunContent | Tee-Object -FilePath $migrationLog -Append | Out-Host
+        }
+    }
+    Remove-Item -Path $mRunOut,$mRunErr,$opensslScriptFile2 -ErrorAction SilentlyContinue
     if (-not (Test-Path (Join-Path $tlsDir "vault.crt"))) {
         Invoke-VaultMigrationRollback "openssl-in-alpine cert generation failed (see $migrationLog)"
     }
@@ -614,9 +811,17 @@ services:
 
     if ($env:CODERAFT_TEST_MODE -ne "1") {
         Write-Host "  Pulling vault image..."
-        $pullOut = & docker pull ghcr.io/liamj74/coderaft-vault:latest 2>&1
-        $pullOut | Tee-Object -FilePath $migrationLog -Append | Out-Host
-        if ($LASTEXITCODE -ne 0) { Invoke-VaultMigrationRollback "docker pull failed (see $migrationLog)" }
+        # B20 (2026-06-08): `& docker pull ... 2>&1` → NativeCommandError PS 5.1
+        $vPullOut = Join-Path $env:TEMP "coderaft-vpull-out-$(Get-Random).log"
+        $vPullErr = Join-Path $env:TEMP "coderaft-vpull-err-$(Get-Random).log"
+        $vPullProc = Start-Process -FilePath "docker" -ArgumentList @("pull","ghcr.io/liamj74/coderaft-vault:latest") `
+            -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput $vPullOut `
+            -RedirectStandardError  $vPullErr `
+            -ErrorAction SilentlyContinue
+        if (Test-Path $vPullOut) { Get-Content $vPullOut -ErrorAction SilentlyContinue | Tee-Object -FilePath $migrationLog -Append | Out-Host }
+        Remove-Item -Path $vPullOut,$vPullErr -ErrorAction SilentlyContinue
+        if ($vPullProc.ExitCode -ne 0) { Invoke-VaultMigrationRollback "docker pull failed (see $migrationLog)" }
     }
 
     Write-Host "  Starting vault container..."
@@ -625,11 +830,37 @@ services:
     # from the host bind mounts (the TLS PKI bootstrap regenerated them this
     # run). --force-recreate alone has been observed to leave the container
     # in "Running" state on Docker Desktop Windows, with stale certs in mem.
-    & docker compose @vaultComposeArgs stop coderaft-vault 2>&1 | Tee-Object -FilePath $migrationLog -Append | Out-Null
-    & docker compose @vaultComposeArgs rm -f coderaft-vault 2>&1 | Tee-Object -FilePath $migrationLog -Append | Out-Null
-    $upOut = & docker compose @vaultComposeArgs up -d coderaft-vault 2>&1
-    $upOut | Tee-Object -FilePath $migrationLog -Append | Out-Host
-    $upExit = $LASTEXITCODE
+    # B20 (2026-06-08): all docker calls via Start-Process to avoid NativeCommandError PS 5.1
+    $vStopOut = Join-Path $env:TEMP "coderaft-vstop-out-$(Get-Random).log"
+    $vStopErr = Join-Path $env:TEMP "coderaft-vstop-err-$(Get-Random).log"
+    Start-Process -FilePath "docker" -ArgumentList (@("compose") + $vaultComposeArgs + @("stop","coderaft-vault")) `
+        -NoNewWindow -Wait `
+        -RedirectStandardOutput $vStopOut `
+        -RedirectStandardError  $vStopErr `
+        -ErrorAction SilentlyContinue | Out-Null
+    if (Test-Path $vStopOut) { Get-Content $vStopOut -ErrorAction SilentlyContinue | Tee-Object -FilePath $migrationLog -Append | Out-Null }
+    Remove-Item -Path $vStopOut,$vStopErr -ErrorAction SilentlyContinue
+
+    $vRmOut = Join-Path $env:TEMP "coderaft-vrm-out-$(Get-Random).log"
+    $vRmErr = Join-Path $env:TEMP "coderaft-vrm-err-$(Get-Random).log"
+    Start-Process -FilePath "docker" -ArgumentList (@("compose") + $vaultComposeArgs + @("rm","-f","coderaft-vault")) `
+        -NoNewWindow -Wait `
+        -RedirectStandardOutput $vRmOut `
+        -RedirectStandardError  $vRmErr `
+        -ErrorAction SilentlyContinue | Out-Null
+    if (Test-Path $vRmOut) { Get-Content $vRmOut -ErrorAction SilentlyContinue | Tee-Object -FilePath $migrationLog -Append | Out-Null }
+    Remove-Item -Path $vRmOut,$vRmErr -ErrorAction SilentlyContinue
+
+    $vUpOut = Join-Path $env:TEMP "coderaft-vup-out-$(Get-Random).log"
+    $vUpErr = Join-Path $env:TEMP "coderaft-vup-err-$(Get-Random).log"
+    $vUpProc = Start-Process -FilePath "docker" -ArgumentList (@("compose") + $vaultComposeArgs + @("up","-d","coderaft-vault")) `
+        -NoNewWindow -Wait -PassThru `
+        -RedirectStandardOutput $vUpOut `
+        -RedirectStandardError  $vUpErr `
+        -ErrorAction Stop
+    if (Test-Path $vUpOut) { Get-Content $vUpOut -ErrorAction SilentlyContinue | Tee-Object -FilePath $migrationLog -Append | Out-Host }
+    Remove-Item -Path $vUpOut,$vUpErr -ErrorAction SilentlyContinue
+    $upExit = $vUpProc.ExitCode
     Pop-Location -ErrorAction SilentlyContinue
     if ($upExit -ne 0) { Invoke-VaultMigrationRollback "docker compose up coderaft-vault failed (see $migrationLog)" }
 
@@ -639,15 +870,24 @@ services:
     $absTlsDir = (Resolve-Path -LiteralPath $tlsDir).Path
     # Detect compose project name from the running vault container — it
     # determines the network name (<project>_coderaft-vault-net).
-    $vaultProject = (& docker inspect coderaft-coderaft-vault-1 --format '{{ index .Config.Labels "com.docker.compose.project" }}' 2>$null) -join ""
+    # B20-inspect (2026-06-08): `--format '{{ index ... "..." }}'` → quote mangling in PS 5.1
+    $inspFmt2   = '{{ index .Config.Labels "com.docker.compose.project" }}'
+    $inspOut2   = Join-Path $env:TEMP "coderaft-insp2-out-$(Get-Random).log"
+    $inspErr2   = Join-Path $env:TEMP "coderaft-insp2-err-$(Get-Random).log"
+    Start-Process -FilePath "docker" -ArgumentList @("inspect","coderaft-coderaft-vault-1","--format",$inspFmt2) `
+        -NoNewWindow -Wait `
+        -RedirectStandardOutput $inspOut2 `
+        -RedirectStandardError  $inspErr2 `
+        -ErrorAction SilentlyContinue | Out-Null
+    $vaultProject = ((Get-Content $inspOut2 -ErrorAction SilentlyContinue) -join "").Trim()
+    Remove-Item -Path $inspOut2,$inspErr2 -ErrorAction SilentlyContinue
     if (-not $vaultProject) { $vaultProject = "coderaft" }
     $vaultNetwork = "${vaultProject}_coderaft-vault-net"
 
     function Invoke-VaultCurl {
         param([string]$Method, [string]$Path, [string]$JsonBody = "")
-        # IMPORTANT: do NOT name this variable $args — that's a PowerShell
-        # automatic variable (function varargs) and the splat @args would
-        # silently pull from it, dropping our crafted values. Use $dockerArgs.
+        # B20 (2026-06-08): `& docker @dockerArgs 2>&1` surfaces stderr as
+        # NativeCommandError in PS 5.1. Use Start-Process + split temp files.
         $dockerArgs = @(
             "run", "--rm",
             "--user", "0:0",
@@ -663,8 +903,17 @@ services:
         if ($JsonBody) {
             $dockerArgs += @("-H", "Content-Type: application/json", "-d", $JsonBody)
         }
-        $resp = & docker @dockerArgs 2>&1
-        return ($resp -join "")
+        $curlOut = Join-Path $env:TEMP "coderaft-vc-out-$(Get-Random).log"
+        $curlErr = Join-Path $env:TEMP "coderaft-vc-err-$(Get-Random).log"
+        Start-Process -FilePath "docker" -ArgumentList $dockerArgs `
+            -NoNewWindow -Wait `
+            -RedirectStandardOutput $curlOut `
+            -RedirectStandardError  $curlErr `
+            -ErrorAction SilentlyContinue | Out-Null
+        $body = ""
+        if (Test-Path $curlOut) { $body = ((Get-Content $curlOut -ErrorAction SilentlyContinue) -join "") }
+        Remove-Item -Path $curlOut,$curlErr -ErrorAction SilentlyContinue
+        return $body
     }
 
     # Wait for vault to be reachable (any TLS handshake completes, even sealed)
@@ -871,10 +1120,19 @@ if (Test-Path ".env") {
 switch ($hostOsValue) {
     { @("windows", "macos") -contains $_ } {
         try {
-            & docker run --rm --add-host=host.docker.internal:host-gateway `
-                curlimages/curl:8.10.1 -fsS --connect-timeout 3 --max-time 4 `
-                "http://host.docker.internal:7777/health" 2>&1 | Out-Null
-            if ($LASTEXITCODE -eq 0) {
+            # B20 (2026-06-08): `& docker run ... 2>&1 | Out-Null` → NativeCommandError PS 5.1
+            $capOut = Join-Path $env:TEMP "coderaft-cap-out-$(Get-Random).log"
+            $capErr = Join-Path $env:TEMP "coderaft-cap-err-$(Get-Random).log"
+            $capProc = Start-Process -FilePath "docker" -ArgumentList @(
+                "run","--rm","--add-host=host.docker.internal:host-gateway",
+                "curlimages/curl:8.10.1","-fsS","--connect-timeout","3","--max-time","4",
+                "http://host.docker.internal:7777/health"
+            ) -NoNewWindow -Wait -PassThru `
+                -RedirectStandardOutput $capOut `
+                -RedirectStandardError  $capErr `
+                -ErrorAction SilentlyContinue
+            Remove-Item -Path $capOut,$capErr -ErrorAction SilentlyContinue
+            if ($capProc.ExitCode -eq 0) {
                 Write-Host "  ✓ Native capture daemon reachable (CODERAFT_HOST_OS=$hostOsValue)"
             } else {
                 Write-Host "  ⚠ CODERAFT_HOST_OS=$hostOsValue but the native daemon is not answering on 127.0.0.1:7777."
@@ -904,7 +1162,16 @@ $BACKUP_FILE = Join-Path $BACKUP_DIR "preupdate-$timestamp.sql"
 
 $postgresRunning = $false
 try {
-    $psOutput = & docker compose ps postgres --quiet 2>$null
+    # B20 (2026-06-08): `& docker compose ps ... 2>$null` → NativeCommandError PS 5.1
+    $pgQOut = Join-Path $env:TEMP "coderaft-pgq-out-$(Get-Random).log"
+    $pgQErr = Join-Path $env:TEMP "coderaft-pgq-err-$(Get-Random).log"
+    Start-Process -FilePath "docker" -ArgumentList @("compose","ps","postgres","--quiet") `
+        -NoNewWindow -Wait `
+        -RedirectStandardOutput $pgQOut `
+        -RedirectStandardError  $pgQErr `
+        -ErrorAction SilentlyContinue | Out-Null
+    $psOutput = (Get-Content $pgQOut -ErrorAction SilentlyContinue) -join ""
+    Remove-Item -Path $pgQOut,$pgQErr -ErrorAction SilentlyContinue
     if ($psOutput) { $postgresRunning = $true }
 } catch { }
 
@@ -1065,8 +1332,17 @@ function Update-License {
             if (Test-Path $ageKey) {
                 $env:SOPS_AGE_KEY_FILE = $ageKey
                 try {
-                    & $sopsCmd.Path --encrypt --input-type dotenv --output-type dotenv $envFile > "$envEnc.tmp" 2>$null
-                    if ($LASTEXITCODE -eq 0) { Move-Item -Force "$envEnc.tmp" $envEnc } else { Remove-Item -Force "$envEnc.tmp" -ErrorAction SilentlyContinue }
+                    # B20 (2026-06-08): `& $sopsCmd.Path ... > file 2>$null` → NativeCommandError PS 5.1
+                    $sopsEncTmp = "$envEnc.tmp"
+                    $sopsEncErr = Join-Path $env:TEMP "coderaft-sopsenc-err-$(Get-Random).log"
+                    $sopsProc = Start-Process -FilePath $sopsCmd.Path `
+                        -ArgumentList @("--encrypt","--input-type","dotenv","--output-type","dotenv",$envFile) `
+                        -NoNewWindow -Wait -PassThru `
+                        -RedirectStandardOutput $sopsEncTmp `
+                        -RedirectStandardError  $sopsEncErr `
+                        -ErrorAction SilentlyContinue
+                    Remove-Item -Path $sopsEncErr -ErrorAction SilentlyContinue
+                    if ($sopsProc.ExitCode -eq 0) { Move-Item -Force $sopsEncTmp $envEnc } else { Remove-Item -Force $sopsEncTmp -ErrorAction SilentlyContinue }
                 } catch { }
             }
         }
@@ -1130,34 +1406,94 @@ try { Update-LocalHttpsCerts } catch { }
 # Force full removal: containers, tag, image-by-ID.
 Write-Host ""
 Write-Host "  Aggressive Coderaft image cache invalidation..."
-$ComposeImages = & docker @ComposeArgs config --images 2>$null
+# B20 (2026-06-08): all `& docker ... 2>$null` / `2>&1 | Out-Null` → NativeCommandError PS 5.1
+# Use Start-Process + split temp files throughout this block.
+$ciOut = Join-Path $env:TEMP "coderaft-ci-out-$(Get-Random).log"
+$ciErr = Join-Path $env:TEMP "coderaft-ci-err-$(Get-Random).log"
+Start-Process -FilePath "docker" -ArgumentList (@() + $ComposeArgs + @("config","--images")) `
+    -NoNewWindow -Wait `
+    -RedirectStandardOutput $ciOut `
+    -RedirectStandardError  $ciErr `
+    -ErrorAction SilentlyContinue | Out-Null
+$ComposeImages = Get-Content $ciOut -ErrorAction SilentlyContinue
+Remove-Item -Path $ciOut,$ciErr -ErrorAction SilentlyContinue
+
 foreach ($img in $ComposeImages) {
     if ($img -like "ghcr.io/liamj74/*") {
         # 1. Stop containers running on this image
-        $containerIds = & docker ps -q --filter "ancestor=$img" 2>$null
+        $psqOut = Join-Path $env:TEMP "coderaft-psq-out-$(Get-Random).log"
+        $psqErr = Join-Path $env:TEMP "coderaft-psq-err-$(Get-Random).log"
+        Start-Process -FilePath "docker" -ArgumentList @("ps","-q","--filter","ancestor=$img") `
+            -NoNewWindow -Wait `
+            -RedirectStandardOutput $psqOut `
+            -RedirectStandardError  $psqErr `
+            -ErrorAction SilentlyContinue | Out-Null
+        $containerIds = (Get-Content $psqOut -ErrorAction SilentlyContinue) | Where-Object { $_ }
+        Remove-Item -Path $psqOut,$psqErr -ErrorAction SilentlyContinue
         if ($containerIds) {
-            & docker stop $containerIds 2>&1 | Out-Null
-            & docker rm -f $containerIds 2>&1 | Out-Null
+            $stopOut = Join-Path $env:TEMP "coderaft-stop-out-$(Get-Random).log"
+            $stopErr = Join-Path $env:TEMP "coderaft-stop-err-$(Get-Random).log"
+            Start-Process -FilePath "docker" -ArgumentList (@("stop") + $containerIds) `
+                -NoNewWindow -Wait `
+                -RedirectStandardOutput $stopOut `
+                -RedirectStandardError  $stopErr `
+                -ErrorAction SilentlyContinue | Out-Null
+            Remove-Item -Path $stopOut,$stopErr -ErrorAction SilentlyContinue
+            $rmcOut = Join-Path $env:TEMP "coderaft-rmc-out-$(Get-Random).log"
+            $rmcErr = Join-Path $env:TEMP "coderaft-rmc-err-$(Get-Random).log"
+            Start-Process -FilePath "docker" -ArgumentList (@("rm","-f") + $containerIds) `
+                -NoNewWindow -Wait `
+                -RedirectStandardOutput $rmcOut `
+                -RedirectStandardError  $rmcErr `
+                -ErrorAction SilentlyContinue | Out-Null
+            Remove-Item -Path $rmcOut,$rmcErr -ErrorAction SilentlyContinue
         }
         # 2. Untag (silent if the image doesn't exist locally — first update)
-        # Wrap in try/catch to handle $ErrorActionPreference='Stop' raising
-        # NativeCommandError when docker.exe writes to stderr on cache miss
-        # (e.g. ghcr.io/liamj74/redfox-gateway:0.2.0 on a machine that has
-        # never deployed RedFox).
         try {
-            & docker image inspect $img 2>$null | Out-Null
-            if ($LASTEXITCODE -eq 0) {
-                & docker rmi -f $img 2>$null | Out-Null
+            $inspCiOut = Join-Path $env:TEMP "coderaft-inspci-out-$(Get-Random).log"
+            $inspCiErr = Join-Path $env:TEMP "coderaft-inspci-err-$(Get-Random).log"
+            $inspCiProc = Start-Process -FilePath "docker" -ArgumentList @("image","inspect",$img) `
+                -NoNewWindow -Wait -PassThru `
+                -RedirectStandardOutput $inspCiOut `
+                -RedirectStandardError  $inspCiErr `
+                -ErrorAction SilentlyContinue
+            Remove-Item -Path $inspCiOut,$inspCiErr -ErrorAction SilentlyContinue
+            if ($inspCiProc.ExitCode -eq 0) {
+                $rmiOut = Join-Path $env:TEMP "coderaft-rmi-out-$(Get-Random).log"
+                $rmiErr = Join-Path $env:TEMP "coderaft-rmi-err-$(Get-Random).log"
+                Start-Process -FilePath "docker" -ArgumentList @("rmi","-f",$img) `
+                    -NoNewWindow -Wait `
+                    -RedirectStandardOutput $rmiOut `
+                    -RedirectStandardError  $rmiErr `
+                    -ErrorAction SilentlyContinue | Out-Null
+                Remove-Item -Path $rmiOut,$rmiErr -ErrorAction SilentlyContinue
             }
         } catch {
             # Image not in local cache — skip silently
         }
         $LASTEXITCODE = 0
         # 3. Remove by ID (in case the image survives untagged)
-        $imageIds = & docker images --format "{{.ID}}" $img 2>$null
+        $imgIdOut = Join-Path $env:TEMP "coderaft-imgid-out-$(Get-Random).log"
+        $imgIdErr = Join-Path $env:TEMP "coderaft-imgid-err-$(Get-Random).log"
+        Start-Process -FilePath "docker" -ArgumentList @("images","--format","{{.ID}}",$img) `
+            -NoNewWindow -Wait `
+            -RedirectStandardOutput $imgIdOut `
+            -RedirectStandardError  $imgIdErr `
+            -ErrorAction SilentlyContinue | Out-Null
+        $imageIds = (Get-Content $imgIdOut -ErrorAction SilentlyContinue) | Where-Object { $_ }
+        Remove-Item -Path $imgIdOut,$imgIdErr -ErrorAction SilentlyContinue
         if ($imageIds) {
             foreach ($iid in $imageIds) {
-                if ($iid) { & docker rmi -f $iid 2>&1 | Out-Null }
+                if ($iid) {
+                    $rmiIdOut = Join-Path $env:TEMP "coderaft-rmiid-out-$(Get-Random).log"
+                    $rmiIdErr = Join-Path $env:TEMP "coderaft-rmiid-err-$(Get-Random).log"
+                    Start-Process -FilePath "docker" -ArgumentList @("rmi","-f",$iid) `
+                        -NoNewWindow -Wait `
+                        -RedirectStandardOutput $rmiIdOut `
+                        -RedirectStandardError  $rmiIdErr `
+                        -ErrorAction SilentlyContinue | Out-Null
+                    Remove-Item -Path $rmiIdOut,$rmiIdErr -ErrorAction SilentlyContinue
+                }
             }
         }
         $LASTEXITCODE = 0

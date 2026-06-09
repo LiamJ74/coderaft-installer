@@ -193,9 +193,26 @@ function Invoke-VaultBootstrap {
         $privKey = (Get-Content "vault-keys\age.key" | Where-Object { $_ -match '^AGE-SECRET-KEY-' } | Select-Object -First 1)
         if ($privKey) {
             try {
-                $recoveryPhrase = ($privKey | & docker run --rm -i `
-                    ghcr.io/liamj74/coderaft-vault:latest `
-                    -mnemonic-from-key /dev/stdin 2>$null) -join ""
+                # B20 (2026-06-08): `& docker run --rm -i ... 2>$null` pipes stdin
+                # AND surfaces docker stderr as NativeCommandError in PS 5.1.
+                # Write the key to a temp file, mount it, run without stdin pipe.
+                $mnemonicKeyFile = Join-Path $env:TEMP "coderaft-vault-mnemonickey-$(Get-Random).txt"
+                $mnemonicStdout  = Join-Path $env:TEMP "coderaft-vault-mnemonicout-$(Get-Random).txt"
+                $mnemonicStderr  = Join-Path $env:TEMP "coderaft-vault-mnemonicerr-$(Get-Random).txt"
+                [System.IO.File]::WriteAllText($mnemonicKeyFile, "$privKey`n", [System.Text.UTF8Encoding]::new($false))
+                $mnemonicProc = Start-Process -FilePath "docker" -ArgumentList @(
+                    "run", "--rm",
+                    "-v", "${mnemonicKeyFile}:/input.key:ro",
+                    "ghcr.io/liamj74/coderaft-vault:latest",
+                    "-mnemonic-from-key", "/input.key"
+                ) -NoNewWindow -Wait -PassThru `
+                    -RedirectStandardOutput $mnemonicStdout `
+                    -RedirectStandardError  $mnemonicStderr `
+                    -ErrorAction SilentlyContinue
+                if (Test-Path $mnemonicStdout) {
+                    $recoveryPhrase = ((Get-Content $mnemonicStdout -ErrorAction SilentlyContinue) -join "").Trim()
+                }
+                Remove-Item -Path $mnemonicKeyFile,$mnemonicStdout,$mnemonicStderr -ErrorAction SilentlyContinue
             } catch { $recoveryPhrase = "" }
         }
     }
