@@ -315,12 +315,46 @@ chmod 600 *.key 2>/dev/null || true
     } else {
         $absTlsDir = $absTlsDir.Path
     }
-    $opensslOut = $opensslScript | & docker run --rm -i `
-        -v "${absTlsDir}:/work" `
-        alpine:3.20 sh 2>&1
-    $opensslOut | Out-Host
-    if (-not (Test-Path (Join-Path $tlsDir "vault.crt"))) {
-        Write-Host "  ✗ Alpine openssl cert generation failed" -ForegroundColor Red
+    # B20-docker (2026-06-09): the previous form
+    #   $opensslScript | & docker run --rm -i ... 2>&1
+    # surfaced docker's image-pull progress (and any alpine sh stderr) as a
+    # red NativeCommandError block in PowerShell 5.1, alarming users. The
+    # only reliable suppression is Start-Process with -RedirectStandardError.
+    # We write the script to a temp file, mount it, and run sh against it so
+    # we don't need stdin piping.
+    $opensslScriptFile = Join-Path $env:TEMP "coderaft-openssl-$(Get-Random).sh"
+    # IMPORTANT: write with Unix line endings, otherwise sh barfs on CRLF.
+    $opensslScriptLF = $opensslScript -replace "`r`n", "`n"
+    [System.IO.File]::WriteAllText($opensslScriptFile, $opensslScriptLF, [System.Text.UTF8Encoding]::new($false))
+
+    # Pre-pull alpine silently so `docker run` doesn't emit pull progress on
+    # stderr (which PS would still treat as NativeCommandError).
+    $pullLog = Join-Path $env:TEMP "coderaft-docker-pull-$(Get-Random).log"
+    Start-Process -FilePath "docker" -ArgumentList @("pull","alpine:3.20") `
+        -NoNewWindow -Wait `
+        -RedirectStandardError $pullLog `
+        -RedirectStandardOutput $pullLog `
+        -ErrorAction SilentlyContinue | Out-Null
+    Remove-Item -Path $pullLog -ErrorAction SilentlyContinue
+
+    $runLog = Join-Path $env:TEMP "coderaft-docker-run-$(Get-Random).log"
+    $dockerProc = Start-Process -FilePath "docker" -ArgumentList @(
+        "run","--rm",
+        "-v","${opensslScriptFile}:/script.sh:ro",
+        "-v","${absTlsDir}:/work",
+        "alpine:3.20","sh","/script.sh"
+    ) -NoNewWindow -Wait -PassThru `
+        -RedirectStandardError $runLog `
+        -RedirectStandardOutput $runLog `
+        -ErrorAction Stop
+    if (Test-Path $runLog) {
+        $runOutput = Get-Content $runLog -ErrorAction SilentlyContinue
+        if ($runOutput) { $runOutput | Out-Host }
+        Remove-Item -Path $runLog -ErrorAction SilentlyContinue
+    }
+    Remove-Item -Path $opensslScriptFile -ErrorAction SilentlyContinue
+    if ($dockerProc.ExitCode -ne 0 -or -not (Test-Path (Join-Path $tlsDir "vault.crt"))) {
+        Write-Host "  ✗ Alpine openssl cert generation failed (docker exit $($dockerProc.ExitCode))" -ForegroundColor Red
         exit 1
     }
 
