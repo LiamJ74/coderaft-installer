@@ -634,7 +634,13 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
-      coderaft-vault: { condition: service_healthy }
+      # B-VAULT-DEP (2026-06-09): coderaft-vault starts sealed and needs the
+      # installer/update script to POST /v1/unseal before it can pass its
+      # own healthcheck. With `service_healthy` here, compose would kill the
+      # whole stack waiting for vault before the unseal step ever runs.
+      # Use `service_started` so dashboard-api boots; it gracefully degrades
+      # to "vault unavailable" until unseal completes, then reconnects.
+      coderaft-vault: { condition: service_started }
     environment:
       # B15 (2026-05-19): Node.js résout IPv6 d'abord par défaut. Le container
       # Docker n'a pas d'IPv6 → ENETUNREACH → fallback IPv4 lent ou timeout
