@@ -600,11 +600,17 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
+    # B-HEALTH (2026-06-09): le healthcheck pointait vers l'admin API Caddy
+    # (port 2019) qu'on désactive volontairement (`admin off` dans Caddyfile,
+    # sécurité). On check le listener HTTP réel (:80) avec 127.0.0.1 pour
+    # éviter le piège IPv6-first (localhost résout ::1 d'abord, nginx/caddy
+    # écoute IPv4 → connection refused). Cf bug récurrent B15 côté Node.
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:2019/config/", "||", "exit", "0"]
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:80/"]
       interval: 30s
       timeout: 5s
       retries: 3
+      start_period: 10s
     security_opt: [no-new-privileges:true]
     restart: unless-stopped
 
