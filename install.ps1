@@ -804,9 +804,25 @@ function Invoke-VaultUnsealFresh {
     $vaultNetwork = "${vaultProject}_coderaft-vault-net"
     $absTlsDir = (Resolve-Path -LiteralPath "vault-tls").Path
 
+    # Pre-pull curlimages/curl silently (avoids pull progress on stderr
+    # surfacing as NativeCommandError when the curl sidecar is first used).
+    $curlPullOut = Join-Path $env:TEMP "coderaft-curl-pull-out-$(Get-Random).log"
+    $curlPullErr = Join-Path $env:TEMP "coderaft-curl-pull-err-$(Get-Random).log"
+    Start-Process -FilePath "docker" -ArgumentList @("pull","curlimages/curl:latest") `
+        -NoNewWindow -Wait `
+        -RedirectStandardOutput $curlPullOut `
+        -RedirectStandardError $curlPullErr `
+        -ErrorAction SilentlyContinue | Out-Null
+    Remove-Item -Path $curlPullOut,$curlPullErr -ErrorAction SilentlyContinue
+
     function Invoke-VaultCurlFresh {
         param([string]$Method, [string]$Path, [string]$JsonBody = "")
-        # A5 fix: do NOT name this $args — that is a PS automatic variable.
+        # B20-vaultcurl (2026-06-09): the previous `& docker @args 2>&1`
+        # surfaced docker stderr (pull progress, TLS handshake diagnostics,
+        # whatever) as NativeCommandError in PowerShell 5.1, polluting $resp
+        # and breaking the `"sealed":(true|false)` regex match — the unseal
+        # then thought the vault was unreachable. Use Start-Process with
+        # split stdout/stderr files; we only consume stdout.
         $dockerArgs = @(
             "run", "--rm",
             "--user", "0:0",
@@ -822,8 +838,19 @@ function Invoke-VaultUnsealFresh {
         if ($JsonBody) {
             $dockerArgs += @("-H", "Content-Type: application/json", "-d", $JsonBody)
         }
-        $resp = & docker @dockerArgs 2>&1
-        return ($resp -join "")
+        $curlStdout = Join-Path $env:TEMP "coderaft-vault-curl-out-$(Get-Random).log"
+        $curlStderr = Join-Path $env:TEMP "coderaft-vault-curl-err-$(Get-Random).log"
+        Start-Process -FilePath "docker" -ArgumentList $dockerArgs `
+            -NoNewWindow -Wait `
+            -RedirectStandardOutput $curlStdout `
+            -RedirectStandardError $curlStderr `
+            -ErrorAction SilentlyContinue | Out-Null
+        $body = ""
+        if (Test-Path $curlStdout) {
+            $body = ((Get-Content $curlStdout -ErrorAction SilentlyContinue) -join "")
+        }
+        Remove-Item -Path $curlStdout,$curlStderr -ErrorAction SilentlyContinue
+        return $body
     }
 
     Write-Host "  Waiting for vault to be reachable..."
