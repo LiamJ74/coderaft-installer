@@ -265,8 +265,14 @@ vault_bootstrap() {
     mkdir -p vault-keys vault-tls vault-config
 
     # ── Step 1: Generate vault age key (or reuse existing) ──────────────────
+    # B-VAULT-BOOT (2026-06-09): le return 0 anticipé skipait aussi TLS PKI +
+    # config.yaml quand age.key existait déjà → vault container fail healthcheck
+    # car /etc/coderaft-vault/config.yaml manquant. Skip uniquement la génération
+    # de la key et toujours continuer vers TLS + config (ces étapes sont
+    # idempotentes via leurs propres "skip si déjà existant" en interne).
     if [ -f vault-keys/age.key ]; then
-        echo "  ✓ Vault age key already exists — skipping key bootstrap"
+        echo "  ✓ Vault age key already exists — skipping key generation"
+        vault_bootstrap_tls
         return 0
     fi
 

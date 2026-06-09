@@ -118,8 +118,13 @@ function Invoke-VaultBootstrap {
     New-Item -ItemType Directory -Force -Path "vault-config" | Out-Null
 
     # ── Step 1: Generate vault age key ──────────────────────────────────────
+    # B-VAULT-BOOT (2026-06-09): le `return` anticipé skipait aussi TLS PKI +
+    # config.yaml quand age.key existait déjà → vault container fail healthcheck
+    # car C:\...\vault-config\config.yaml manquant. Skip uniquement la
+    # génération de la key et toujours continuer vers TLS + config.
     if (Test-Path "vault-keys\age.key") {
-        Write-Host "  ✓ Vault age key already exists — skipping key bootstrap"
+        Write-Host "  ✓ Vault age key already exists — skipping key generation"
+        Invoke-VaultBootstrapTLS
         return
     }
 
