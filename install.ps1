@@ -922,13 +922,21 @@ function Invoke-VaultUnsealFresh {
     function Invoke-VaultCurlFresh {
         param([string]$Method, [string]$Path, [string]$JsonBody = "")
         # B20-vaultcurl (2026-06-09): the previous `& docker @args 2>&1`
-        # surfaced docker stderr (pull progress, TLS handshake diagnostics,
-        # whatever) as NativeCommandError in PowerShell 5.1, polluting $resp
-        # and breaking the `"sealed":(true|false)` regex match — the unseal
-        # then thought the vault was unreachable. Use Start-Process with
-        # split stdout/stderr files; we only consume stdout.
+        # surfaced docker stderr as NativeCommandError in PowerShell 5.1.
+        # Use Start-Process with split stdout/stderr files.
+        #
+        # B-UNSEAL-BODY (2026-06-09): passing the JSON body inline via
+        # `-d $JsonBody` argument got mangled by the PS → docker.exe → curl
+        # arg chain — the {, ", } in the JSON were either stripped or
+        # double-escaped, and vault replied {"error":"invalid request body"}.
+        # Write the body to a temp file and feed it via stdin (-d @- in curl),
+        # routed through Start-Process -RedirectStandardInput. This is
+        # quote-safe for any JSON payload.
         $dockerArgs = @(
-            "run", "--rm",
+            "run", "--rm"
+        )
+        if ($JsonBody) { $dockerArgs += @("-i") }  # need stdin for body
+        $dockerArgs += @(
             "--user", "0:0",
             "--network", $vaultNetwork,
             "-v", "${absTlsDir}:/tls:ro",
@@ -939,21 +947,33 @@ function Invoke-VaultUnsealFresh {
             "-sS", "-X", $Method,
             "https://coderaft-vault:8200$Path"
         )
+        $bodyFile = $null
         if ($JsonBody) {
-            $dockerArgs += @("-H", "Content-Type: application/json", "-d", $JsonBody)
+            $bodyFile = Join-Path $env:TEMP "coderaft-vault-body-$(Get-Random).json"
+            [System.IO.File]::WriteAllText($bodyFile, $JsonBody, [System.Text.UTF8Encoding]::new($false))
+            $dockerArgs += @("-H", "Content-Type: application/json", "--data-binary", "@-")
         }
+
         $curlStdout = Join-Path $env:TEMP "coderaft-vault-curl-out-$(Get-Random).log"
         $curlStderr = Join-Path $env:TEMP "coderaft-vault-curl-err-$(Get-Random).log"
-        Start-Process -FilePath "docker" -ArgumentList $dockerArgs `
-            -NoNewWindow -Wait `
-            -RedirectStandardOutput $curlStdout `
-            -RedirectStandardError $curlStderr `
-            -ErrorAction SilentlyContinue | Out-Null
+        $spArgs = @{
+            FilePath               = "docker"
+            ArgumentList           = $dockerArgs
+            NoNewWindow            = $true
+            Wait                   = $true
+            RedirectStandardOutput = $curlStdout
+            RedirectStandardError  = $curlStderr
+            ErrorAction            = "SilentlyContinue"
+        }
+        if ($bodyFile) { $spArgs['RedirectStandardInput'] = $bodyFile }
+        Start-Process @spArgs | Out-Null
+
         $body = ""
         if (Test-Path $curlStdout) {
             $body = ((Get-Content $curlStdout -ErrorAction SilentlyContinue) -join "")
         }
         Remove-Item -Path $curlStdout,$curlStderr -ErrorAction SilentlyContinue
+        if ($bodyFile) { Remove-Item -Path $bodyFile -ErrorAction SilentlyContinue }
         return $body
     }
 
