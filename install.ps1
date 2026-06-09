@@ -157,15 +157,23 @@ function Invoke-VaultBootstrap {
     }
 
     Write-Host "  Generating vault master key..."
-    # B20 (2026-06-09): age-keygen emits a "world-readable file" warning on
-    # stderr because Windows has no POSIX chmod equivalent. `2>$null` does NOT
-    # suppress native-command stderr in PowerShell; the warning still surfaces
-    # as a NativeCommandError. Redirect stderr to the success stream and pipe
-    # to Out-Null to silence the cosmetic warning. We tighten ACLs further
-    # below so the "world-readable" concern is mooted.
-    & $ageKeygen.Path -o "vault-keys\age.key" 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path "vault-keys\age.key")) {
-        Write-Host "  ✗ age-keygen failed" -ForegroundColor Red
+    # B20 (2026-06-09): age-keygen emits "warning: writing secret key to a
+    # world-readable file" on stderr because Windows has no POSIX chmod.
+    # Neither `2>$null` nor `2>&1 | Out-Null` reliably suppress native-command
+    # stderr in PowerShell 5.1 (the default on Windows) — they still surface
+    # as NativeCommandError red blocks. The only robust approach is
+    # Start-Process with -RedirectStandardError to a temp file we discard.
+    # ACL tightening immediately after addresses the underlying "world-readable"
+    # concern, so silencing the warning loses nothing.
+    $ageStderr = Join-Path $env:TEMP "coderaft-age-stderr-$(Get-Random).txt"
+    $ageProc = Start-Process -FilePath $ageKeygen.Path `
+        -ArgumentList "-o","vault-keys\age.key" `
+        -NoNewWindow -Wait -PassThru `
+        -RedirectStandardError $ageStderr `
+        -ErrorAction Stop
+    Remove-Item -Path $ageStderr -ErrorAction SilentlyContinue
+    if ($ageProc.ExitCode -ne 0 -or -not (Test-Path "vault-keys\age.key")) {
+        Write-Host "  ✗ age-keygen failed (exit $($ageProc.ExitCode))" -ForegroundColor Red
         exit 1
     }
     # Restrict permissions (owner read-only)
