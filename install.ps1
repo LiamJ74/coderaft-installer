@@ -657,20 +657,36 @@ function Setup-LocalHttps {
 
     if (-not (Get-Command mkcert -ErrorAction SilentlyContinue)) {
         Write-Host "  mkcert not found."
+        # B-MKCERT-PM (2026-06-09): `*> $null` does not suppress native-command
+        # stderr in PS 5.1. Use Start-Process with split stdout/stderr files
+        # (compat PS 5.1 + 7) for both choco and scoop. Choco/scoop install
+        # may require admin too — if it fails, just fallback.
+        $pmOut = Join-Path $env:TEMP "coderaft-pm-out-$(Get-Random).log"
+        $pmErr = Join-Path $env:TEMP "coderaft-pm-err-$(Get-Random).log"
         if (Get-Command choco -ErrorAction SilentlyContinue) {
             Write-Host "  Installing mkcert via Chocolatey (choco install mkcert)…"
-            try {
-                choco install mkcert -y --no-progress *> $null
-            } catch {
+            $cmgrProc = Start-Process -FilePath "choco" `
+                -ArgumentList @("install","mkcert","-y","--no-progress") `
+                -NoNewWindow -Wait -PassThru `
+                -RedirectStandardOutput $pmOut `
+                -RedirectStandardError $pmErr `
+                -ErrorAction SilentlyContinue
+            if ($cmgrProc.ExitCode -ne 0) {
                 Write-Host "  ⚠ choco install mkcert failed — fallback to http://localhost:3000" -ForegroundColor Yellow
+                Remove-Item -Path $pmOut,$pmErr -ErrorAction SilentlyContinue
                 return $false
             }
         } elseif (Get-Command scoop -ErrorAction SilentlyContinue) {
             Write-Host "  Installing mkcert via Scoop (scoop install mkcert)…"
-            try {
-                scoop install mkcert *> $null
-            } catch {
+            $cmgrProc = Start-Process -FilePath "scoop" `
+                -ArgumentList @("install","mkcert") `
+                -NoNewWindow -Wait -PassThru `
+                -RedirectStandardOutput $pmOut `
+                -RedirectStandardError $pmErr `
+                -ErrorAction SilentlyContinue
+            if ($cmgrProc.ExitCode -ne 0) {
                 Write-Host "  ⚠ scoop install mkcert failed — fallback to http://localhost:3000" -ForegroundColor Yellow
+                Remove-Item -Path $pmOut,$pmErr -ErrorAction SilentlyContinue
                 return $false
             }
         } else {
@@ -679,20 +695,81 @@ function Setup-LocalHttps {
             Write-Host "    Continuing in HTTP-only mode (http://localhost:3000)."
             return $false
         }
+        Remove-Item -Path $pmOut,$pmErr -ErrorAction SilentlyContinue
+        # Refresh PATH so the just-installed mkcert is visible in this session.
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" +
+                    [System.Environment]::GetEnvironmentVariable("Path","User")
     }
 
-    Write-Host "  Installing mkcert local CA (one-time)…"
+    # B-MKCERT (2026-06-09): `mkcert -install` writes to the system Root
+    # Certificate Authorities store, which requires Administrator privileges
+    # on Windows — otherwise it fails silently. We detect elevation and
+    # auto-elevate ONLY the mkcert -install step via Start-Process -Verb
+    # RunAs (single UAC prompt). All native command calls use Start-Process
+    # with split stdout/stderr files for PS 5.1 + 7 compatibility.
+    $isAdmin = $false
     try {
-        & mkcert -install *> $null
-    } catch {
-        Write-Host "  ⚠ mkcert -install failed — local HTTPS will not be trusted." -ForegroundColor Yellow
+        $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object System.Security.Principal.WindowsPrincipal($currentIdentity)
+        $isAdmin = $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch { $isAdmin = $false }
+
+    $mkcertCmd = (Get-Command mkcert -ErrorAction SilentlyContinue).Source
+    if (-not $mkcertCmd) {
+        Write-Host "  ⚠ mkcert not on PATH after install — fallback to http://localhost:3000" -ForegroundColor Yellow
+        return $false
     }
+
+    Write-Host "  Installing mkcert local CA (one-time, may prompt for elevation)…"
+    $mkcertOut = Join-Path $env:TEMP "coderaft-mkcert-install-out-$(Get-Random).log"
+    $mkcertErr = Join-Path $env:TEMP "coderaft-mkcert-install-err-$(Get-Random).log"
+    $installArgs = @{
+        FilePath               = $mkcertCmd
+        ArgumentList           = @("-install")
+        Wait                   = $true
+        WindowStyle            = "Hidden"
+        PassThru               = $true
+        ErrorAction            = "SilentlyContinue"
+    }
+    if ($isAdmin) {
+        # Already elevated — capture output to temp files (PS 5.1 + 7 compat).
+        $installArgs['NoNewWindow']             = $true
+        $installArgs['RedirectStandardOutput']  = $mkcertOut
+        $installArgs['RedirectStandardError']   = $mkcertErr
+        $installArgs.Remove('WindowStyle')
+    } else {
+        # Not elevated — single UAC prompt via -Verb RunAs.
+        # Note: -Verb RunAs is incompatible with -NoNewWindow / -RedirectStandard*
+        # so we can't capture stdout/stderr here. We rely on the exit code only.
+        $installArgs['Verb'] = "RunAs"
+    }
+    try {
+        $mkcertProc = Start-Process @installArgs
+        if ($mkcertProc.ExitCode -ne 0) {
+            Write-Host "  ⚠ mkcert -install failed (exit $($mkcertProc.ExitCode)) — local HTTPS will not be trusted." -ForegroundColor Yellow
+        } else {
+            Write-Host "  ✓ mkcert local CA installed" -ForegroundColor Green
+        }
+    } catch {
+        Write-Host "  ⚠ mkcert -install cancelled or failed — local HTTPS will not be trusted." -ForegroundColor Yellow
+    }
+    Remove-Item -Path $mkcertOut,$mkcertErr -ErrorAction SilentlyContinue
 
     Write-Host "  Generating local cert for coderaft.local…"
-    try {
-        & mkcert -cert-file $certPath -key-file $keyPath `
-            "coderaft.local" "*.coderaft.local" "localhost" "127.0.0.1" "::1" *> $null
-    } catch {
+    # cert generation does NOT require admin, just writes files. Use
+    # Start-Process for stderr suppression (PS 5.1 + 7 compat).
+    $certOut = Join-Path $env:TEMP "coderaft-mkcert-cert-out-$(Get-Random).log"
+    $certErr = Join-Path $env:TEMP "coderaft-mkcert-cert-err-$(Get-Random).log"
+    $certProc = Start-Process -FilePath $mkcertCmd -ArgumentList @(
+        "-cert-file", $certPath,
+        "-key-file", $keyPath,
+        "coderaft.local", "*.coderaft.local", "localhost", "127.0.0.1", "::1"
+    ) -NoNewWindow -Wait -PassThru `
+        -RedirectStandardOutput $certOut `
+        -RedirectStandardError $certErr `
+        -ErrorAction SilentlyContinue
+    Remove-Item -Path $certOut,$certErr -ErrorAction SilentlyContinue
+    if ($certProc.ExitCode -ne 0 -or -not (Test-Path $certPath)) {
         Write-Host "  ⚠ mkcert cert generation failed — fallback to http://localhost:3000" -ForegroundColor Yellow
         Remove-Item -ErrorAction SilentlyContinue $certPath, $keyPath
         return $false
