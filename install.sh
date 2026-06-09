@@ -1105,68 +1105,21 @@ else
 fi
 
 
-# ── Native capture daemon install (macOS only — Linux uses Docker, Windows handled by install.ps1) ──
-if [ "${CODERAFT_NEEDS_NATIVE_CAPTURE}" = "1" ] && [ "${SKIP_NATIVE_CAPTURE:-0}" != "1" ]; then
-    echo ""
-    echo "  ── Live capture daemon (native) ─────────────────────"
-    echo "  Detected ${CODERAFT_OS} — installing the native capture daemon"
-    echo "  so Ravenscan can see your real Wi-Fi/Ethernet interfaces."
-    echo "  (Set SKIP_NATIVE_CAPTURE=1 to skip — capture will be limited"
-    echo "   to the Docker bridge until the daemon is installed manually.)"
-    echo ""
-
-    # Source: public ravenscan-installer repo (mirrors the same pattern
-    # used for the other Coderaft installers — source repos are private,
-    # release artifacts live in the matching public installer repo).
-    # Bumping the tag here is a deliberate release decision.
-    CAPTURE_BASE_URL="${CAPTURE_BASE_URL:-https://github.com/LiamJ74/ravenscan-installer/releases/download/capture-v0.1.0}"
-    # Release uses Go convention (darwin/linux/windows) — map macos → darwin
-    CAPTURE_OS_NAME="${CODERAFT_OS/macos/darwin}"
-    CAPTURE_BIN_NAME="ravenscan-capture-host-${CAPTURE_OS_NAME}-${CODERAFT_ARCH}"
-
-    CAPTURE_TMP_DIR="$(mktemp -d)"
-    trap 'rm -rf "$CAPTURE_TMP_DIR"' EXIT
-
-    echo "  Downloading ${CAPTURE_BIN_NAME} from ${CAPTURE_BASE_URL}…"
-    if curl -fsSL -o "${CAPTURE_TMP_DIR}/${CAPTURE_BIN_NAME}" \
-            "${CAPTURE_BASE_URL}/${CAPTURE_BIN_NAME}" \
-       && curl -fsSL -o "${CAPTURE_TMP_DIR}/install-macos.sh" \
-            "${CAPTURE_BASE_URL}/install-macos.sh" \
-       && curl -fsSL -o "${CAPTURE_TMP_DIR}/io.coderaft.ravenscan-capture.plist" \
-            "${CAPTURE_BASE_URL}/io.coderaft.ravenscan-capture.plist"; then
-
-        # Optional checksum verification when SHA256SUMS is published.
-        if curl -fsSL -o "${CAPTURE_TMP_DIR}/SHA256SUMS" \
-                "${CAPTURE_BASE_URL}/SHA256SUMS" 2>/dev/null; then
-            ( cd "${CAPTURE_TMP_DIR}" && \
-              shasum -a 256 -c --ignore-missing SHA256SUMS >/dev/null 2>&1 ) \
-              || { echo "  ✗ Capture daemon checksum mismatch — aborting"; exit 1; }
-            echo "  ✓ Checksum verified"
-        fi
-
-        chmod +x "${CAPTURE_TMP_DIR}/install-macos.sh" "${CAPTURE_TMP_DIR}/${CAPTURE_BIN_NAME}"
-        echo "  Installing daemon (sudo required for raw socket access)…"
-        if sudo -n true 2>/dev/null; then
-            sudo RAVENSCAN_CAPTURE_TOKEN="${RAVENSCAN_CAPTURE_TOKEN_VALUE}" \
-                bash -c "cd '${CAPTURE_TMP_DIR}' && ./install-macos.sh"
-        else
-            echo "  (you will be prompted for your password)"
-            sudo RAVENSCAN_CAPTURE_TOKEN="${RAVENSCAN_CAPTURE_TOKEN_VALUE}" \
-                bash -c "cd '${CAPTURE_TMP_DIR}' && ./install-macos.sh"
-        fi
-
-        # Tell the platform to talk to the host daemon instead of the
-        # Docker sidecar (which would only see the bridge network on Mac).
-        if ! grep -q '^RAVENSCAN_CAPTURE_SIDECAR_URL=' .env 2>/dev/null; then
-            echo "RAVENSCAN_CAPTURE_SIDECAR_URL=http://host.docker.internal:7777" >> .env
-        fi
-        echo "  ✓ Native capture daemon installed and running on 127.0.0.1:7777"
-    else
-        echo "  ⚠ Could not download the native capture daemon."
-        echo "    Live capture will work on the Docker bridge only until you"
-        echo "    install the daemon manually from the Settings page."
-    fi
-    echo ""
+# ── Native capture daemon — REMOVED FROM ONELINER (B-CAPTURE-DEFER) ─────────
+# 2026-06-09: per Liam, the capture daemon must NOT be installed at the
+# oneliner stage — only inside the Setup Wizard, AFTER license activation,
+# and only if Ravenscan is in the licensed products (bundle_products
+# contains "secaudit"). Installing it upfront prompts sudo for a product
+# the user may not even own a license for, violating the unified
+# architecture "oneliner = platform + deps only".
+#
+# The capture daemon install now lives in dashboard-api as a dedicated
+# endpoint, called from the Setup Wizard / Settings page when Ravenscan
+# is activated. See task #31.
+#
+# Skip flag retained for documentation; no-op now.
+if [ "${SKIP_NATIVE_CAPTURE:-0}" = "1" ]; then
+    echo "  ⓘ Capture daemon install skipped (SKIP_NATIVE_CAPTURE=1)"
 fi
 
 DASHBOARD_URL="http://localhost:3000"
