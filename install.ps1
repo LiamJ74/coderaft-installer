@@ -329,30 +329,33 @@ chmod 600 *.key 2>/dev/null || true
 
     # Pre-pull alpine silently so `docker run` doesn't emit pull progress on
     # stderr (which PS would still treat as NativeCommandError).
-    $pullLog = Join-Path $env:TEMP "coderaft-docker-pull-$(Get-Random).log"
+    # NOTE: Start-Process refuses identical stdout/stderr files — must use 2.
+    $pullStdout = Join-Path $env:TEMP "coderaft-docker-pull-out-$(Get-Random).log"
+    $pullStderr = Join-Path $env:TEMP "coderaft-docker-pull-err-$(Get-Random).log"
     Start-Process -FilePath "docker" -ArgumentList @("pull","alpine:3.20") `
         -NoNewWindow -Wait `
-        -RedirectStandardError $pullLog `
-        -RedirectStandardOutput $pullLog `
+        -RedirectStandardOutput $pullStdout `
+        -RedirectStandardError $pullStderr `
         -ErrorAction SilentlyContinue | Out-Null
-    Remove-Item -Path $pullLog -ErrorAction SilentlyContinue
+    Remove-Item -Path $pullStdout,$pullStderr -ErrorAction SilentlyContinue
 
-    $runLog = Join-Path $env:TEMP "coderaft-docker-run-$(Get-Random).log"
+    $runStdout = Join-Path $env:TEMP "coderaft-docker-run-out-$(Get-Random).log"
+    $runStderr = Join-Path $env:TEMP "coderaft-docker-run-err-$(Get-Random).log"
     $dockerProc = Start-Process -FilePath "docker" -ArgumentList @(
         "run","--rm",
         "-v","${opensslScriptFile}:/script.sh:ro",
         "-v","${absTlsDir}:/work",
         "alpine:3.20","sh","/script.sh"
     ) -NoNewWindow -Wait -PassThru `
-        -RedirectStandardError $runLog `
-        -RedirectStandardOutput $runLog `
+        -RedirectStandardOutput $runStdout `
+        -RedirectStandardError $runStderr `
         -ErrorAction Stop
-    if (Test-Path $runLog) {
-        $runOutput = Get-Content $runLog -ErrorAction SilentlyContinue
-        if ($runOutput) { $runOutput | Out-Host }
-        Remove-Item -Path $runLog -ErrorAction SilentlyContinue
+    if (Test-Path $runStdout) {
+        $stdoutContent = Get-Content $runStdout -ErrorAction SilentlyContinue
+        if ($stdoutContent) { $stdoutContent | Out-Host }
     }
-    Remove-Item -Path $opensslScriptFile -ErrorAction SilentlyContinue
+    # Discard stderr — known noisy (pull progress, alpine sh diagnostics).
+    Remove-Item -Path $runStdout,$runStderr,$opensslScriptFile -ErrorAction SilentlyContinue
     if ($dockerProc.ExitCode -ne 0 -or -not (Test-Path (Join-Path $tlsDir "vault.crt"))) {
         Write-Host "  ✗ Alpine openssl cert generation failed (docker exit $($dockerProc.ExitCode))" -ForegroundColor Red
         exit 1
