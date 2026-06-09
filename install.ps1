@@ -869,9 +869,19 @@ exit 1
 # NEVER `docker compose exec coderaft-vault sh`. Use curlimages/curl sidecar.
 # B10 fix: vault starts sealed — must POST /v1/unseal after container is up.
 function Invoke-VaultUnsealFresh {
-    $vaultAgeKey = "vault-keys\age.key"
+    # B-PATH (2026-06-09): the original `vault-keys\age.key` was a relative
+    # path. During the install run, the CWD can drift (Start-Process child
+    # processes, exceptions from -Verb RunAs that restore an unexpected
+    # location, etc.), so by the time the unseal runs the relative path
+    # resolves under whatever folder PowerShell happens to be in — observed
+    # 2026-06-09 on Liam's Windows resolving to a random OneDrive subfolder.
+    # Force-restore CWD to the install dir and use absolute paths.
+    if ($script:AbsoluteInstallDir -and (Test-Path $script:AbsoluteInstallDir)) {
+        Set-Location -LiteralPath $script:AbsoluteInstallDir
+    }
+    $vaultAgeKey = Join-Path (Get-Location) "vault-keys\age.key"
     if (-not (Test-Path $vaultAgeKey)) {
-        Write-Host "  ✗ vault-keys\age.key not found — cannot unseal" -ForegroundColor Red
+        Write-Host "  ✗ $vaultAgeKey not found — cannot unseal" -ForegroundColor Red
         return $false
     }
 
