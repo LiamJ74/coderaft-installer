@@ -98,7 +98,15 @@ if [ -z "$CODERAFT_UPDATE_REEXEC" ]; then
         fi
     done
     if [ "$REFRESHED" = "1" ] && [ -x "./update.sh" ]; then
-        echo "  Re-executing the updated script..."
+        echo ""
+        echo "  ╔════════════════════════════════════════════════════════════╗"
+        echo "  ║  ⓘ  Updater script itself was refreshed.                    ║"
+        echo "  ║                                                            ║"
+        echo "  ║     Re-running update with the latest version — this is    ║"
+        echo "  ║     normal, not a crash. The same update continues below.  ║"
+        echo "  ╚════════════════════════════════════════════════════════════╝"
+        echo ""
+        sleep 1
         export CODERAFT_UPDATE_REEXEC=1
         exec bash ./update.sh "$@"
     fi

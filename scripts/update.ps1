@@ -136,7 +136,15 @@ if (-not $env:CODERAFT_UPDATE_REEXEC) {
         }
     }
     if ($refreshed -and (Test-Path ".\update.ps1")) {
-        Write-Host "  Re-executing the updated script..."
+        Write-Host ""
+        Write-Host "  ╔════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+        Write-Host "  ║  ⓘ  Updater script itself was refreshed.                    ║" -ForegroundColor Cyan
+        Write-Host "  ║                                                            ║" -ForegroundColor Cyan
+        Write-Host "  ║     Re-running update with the latest version — this is    ║" -ForegroundColor Cyan
+        Write-Host "  ║     normal, not a crash. The same update continues below.  ║" -ForegroundColor Cyan
+        Write-Host "  ╚════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+        Write-Host ""
+        Start-Sleep -Seconds 1
         $env:CODERAFT_UPDATE_REEXEC = "1"
         & $PSBin -NoProfile -ExecutionPolicy Bypass -File ".\update.ps1"
         exit $LASTEXITCODE
