@@ -861,8 +861,24 @@ Write-Host "  Starting dashboard..."
 # B9 fix: explicit stop+rm for vault container before up so fresh certs
 # are picked up from bind mounts (--force-recreate alone can leave a
 # Running container with stale certs in Docker Desktop memory).
-& docker compose stop coderaft-vault 2>$null | Out-Null
-& docker compose rm -f coderaft-vault 2>$null | Out-Null
+# B20-compose (2026-06-09): `2>$null | Out-Null` does not suppress
+# native-command stderr in PowerShell 5.1; docker emits "No stopped
+# containers" on a fresh install and PS surfaces it as red
+# NativeCommandError. Use Start-Process with split stdout/stderr files
+# to discard the noise silently.
+function Invoke-DockerSilent {
+    param([string[]]$Arguments)
+    $stdout = Join-Path $env:TEMP "coderaft-docker-stdout-$(Get-Random).log"
+    $stderr = Join-Path $env:TEMP "coderaft-docker-stderr-$(Get-Random).log"
+    Start-Process -FilePath "docker" -ArgumentList $Arguments `
+        -NoNewWindow -Wait `
+        -RedirectStandardOutput $stdout `
+        -RedirectStandardError $stderr `
+        -ErrorAction SilentlyContinue | Out-Null
+    Remove-Item -Path $stdout,$stderr -ErrorAction SilentlyContinue
+}
+Invoke-DockerSilent -Arguments @("compose","stop","coderaft-vault")
+Invoke-DockerSilent -Arguments @("compose","rm","-f","coderaft-vault")
 docker compose up -d
 
 Write-Host ""
