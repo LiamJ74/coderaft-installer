@@ -55,19 +55,28 @@ Write-Host "  ✓ docker compose found" -ForegroundColor Green
 # `dockerDesktopLinuxEngine` does not exist). `docker info` is the cheapest
 # call that round-trips through the daemon: fast when up, clear failure
 # when down.
-$dockerInfoOut = Join-Path $env:TEMP "coderaft-docker-info-$(Get-Random).log"
+# B-DAEMON-CHECK-STREAMS (2026-06-11): the previous version aimed both
+# stdout and stderr at the SAME temp file via Start-Process. Windows can't
+# open the same path for two concurrent writers, so the 2nd redirect
+# silently fails — the file ends up empty even when docker info succeeds,
+# and the `^\s*\d` check rejects every install. Use two distinct files
+# and concatenate them when reading.
+$dockerInfoOut = Join-Path $env:TEMP "coderaft-docker-info-out-$(Get-Random).log"
+$dockerInfoErr = Join-Path $env:TEMP "coderaft-docker-info-err-$(Get-Random).log"
 Start-Process -FilePath "docker" -ArgumentList @("info","--format","{{.ServerVersion}}") `
     -NoNewWindow -Wait `
     -RedirectStandardOutput $dockerInfoOut `
-    -RedirectStandardError  $dockerInfoOut `
+    -RedirectStandardError  $dockerInfoErr `
     -ErrorAction SilentlyContinue | Out-Null
-$dockerInfoText = if (Test-Path $dockerInfoOut) { (Get-Content $dockerInfoOut -Raw -ErrorAction SilentlyContinue) } else { "" }
-Remove-Item -Path $dockerInfoOut -ErrorAction SilentlyContinue
-if ($dockerInfoText -notmatch '^\s*\d') {
+$dockerInfoStdout = if (Test-Path $dockerInfoOut) { (Get-Content $dockerInfoOut -Raw -ErrorAction SilentlyContinue) } else { "" }
+$dockerInfoStderr = if (Test-Path $dockerInfoErr) { (Get-Content $dockerInfoErr -Raw -ErrorAction SilentlyContinue) } else { "" }
+$dockerInfoText  = (("$dockerInfoStdout" + "`n" + "$dockerInfoStderr")).Trim()
+Remove-Item -Path $dockerInfoOut,$dockerInfoErr -ErrorAction SilentlyContinue
+if ($dockerInfoStdout.Trim() -notmatch '^\d') {
     Write-Host "  ✗ Docker daemon is not reachable." -ForegroundColor Red
     Write-Host ""
     Write-Host "    docker info output:" -ForegroundColor Yellow
-    foreach ($line in ($dockerInfoText -split "`r?`n")) {
+    foreach ($line in (($dockerInfoStdout + "`n" + $dockerInfoStderr) -split "`r?`n")) {
         if ($line.Trim()) { Write-Host "    $line" -ForegroundColor DarkYellow }
     }
     Write-Host ""
@@ -80,7 +89,7 @@ if ($dockerInfoText -notmatch '^\s*\d') {
     }
     exit 1
 }
-Write-Host "  ✓ Docker daemon reachable (server $($dockerInfoText.Trim()))" -ForegroundColor Green
+Write-Host "  ✓ Docker daemon reachable (server $($dockerInfoStdout.Trim()))" -ForegroundColor Green
 Write-Host ""
 
 # ── Install ──────────────────────────────────────────────────────────────────

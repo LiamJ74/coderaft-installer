@@ -1298,7 +1298,16 @@ if (Test-Path ".\docker-compose.override.yml") {
 # Include vault override if a migration has been run (sentinel) OR the file
 # is simply present on disk. Without this, the later `up -d --remove-orphans`
 # treats coderaft-vault as orphan and silently removes it after migration.
-if ((Test-Path ".\docker-compose.vault.yml") -or (Test-Path ".\vault-data\.migrated")) {
+# B-VAULT-OVERRIDE-DUP (2026-06-11): if `coderaft-vault:` is already defined
+# in the main docker-compose.yml (current install.ps1 always does), do NOT
+# load the override — and never reference the .vault.yml path if the file
+# is missing (we move it to .bak when not needed, which used to break
+# `docker compose pull` because the sentinel still existed).
+$vaultInMainTop = $false
+if (Test-Path ".\docker-compose.yml") {
+    $vaultInMainTop = (Select-String -Path ".\docker-compose.yml" -Pattern '^\s*coderaft-vault:\s*$' -Quiet -ErrorAction SilentlyContinue)
+}
+if (-not $vaultInMainTop -and (Test-Path ".\docker-compose.vault.yml")) {
     if ($ComposeArgs -notcontains ".\docker-compose.yml") {
         $ComposeArgs += @("-f", ".\docker-compose.yml")
     }
