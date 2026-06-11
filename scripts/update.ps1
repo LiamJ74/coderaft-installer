@@ -194,29 +194,54 @@ if (Test-Path $composePath) {
 # 'Internal server error' lors de l'activation licence. Patch in-place :
 # insère NODE_OPTIONS=--dns-result-order=ipv4first dans la section environment:
 # du dashboard-api.
+#
+# B-NODE-OPTIONS-FALLBACK (2026-06-11): the previous literal marker
+# `      - LICENSE_SERVER_URL=...` missed older compose files where the
+# line had different indentation or had been edited. Fall back to a regex
+# match on the `dashboard-api:` service block + its `environment:` key.
 $composePathB15 = Join-Path $INSTALL_DIR "docker-compose.yml"
 if (Test-Path $composePathB15) {
     $composeTextB15 = [System.IO.File]::ReadAllText($composePathB15, [System.Text.UTF8Encoding]::new($false))
     if ($composeTextB15 -notmatch 'NODE_OPTIONS=--dns-result-order=ipv4first') {
-        # Cible le bloc dashboard-api environment, AVANT la ligne LICENSE_SERVER_URL
+        $bakB15 = "$composePathB15.bak-" + (Get-Date -Format "yyyyMMddHHmmss")
+        $patched = $false
+
+        # Path A — literal marker (fast path, works on stock installs)
         $marker = '      - LICENSE_SERVER_URL=https://license.coderaft.io'
-        $replacement = '      - NODE_OPTIONS=--dns-result-order=ipv4first' + "`n" + $marker
         if ($composeTextB15.Contains($marker)) {
-            $bakB15 = "$composePathB15.bak-" + (Get-Date -Format "yyyyMMddHHmmss")
             try { Copy-Item -LiteralPath $composePathB15 -Destination $bakB15 -Force -ErrorAction SilentlyContinue } catch {}
-            # Replace only first occurrence (dashboard service has the same line, mais c'est pas grave
-            # de l'ajouter au dashboard SPA aussi puisque c'est juste un nginx).
+            $replacement = '      - NODE_OPTIONS=--dns-result-order=ipv4first' + "`n" + $marker
             $idx = $composeTextB15.IndexOf($marker)
-            if ($idx -ge 0) {
-                $composeTextB15 = $composeTextB15.Substring(0, $idx) + $replacement + $composeTextB15.Substring($idx + $marker.Length)
-                # Second occurrence (dashboard-api block)
-                $idx2 = $composeTextB15.IndexOf($marker, $idx + $replacement.Length)
-                if ($idx2 -ge 0) {
-                    $composeTextB15 = $composeTextB15.Substring(0, $idx2) + $replacement + $composeTextB15.Substring($idx2 + $marker.Length)
-                }
-                [System.IO.File]::WriteAllText($composePathB15, $composeTextB15, [System.Text.UTF8Encoding]::new($false))
-                Write-Host "  ✓ Self-heal docker-compose.yml — NODE_OPTIONS=ipv4first ajouté à dashboard-api (B15)"
+            $composeTextB15 = $composeTextB15.Substring(0, $idx) + $replacement + $composeTextB15.Substring($idx + $marker.Length)
+            $idx2 = $composeTextB15.IndexOf($marker, $idx + $replacement.Length)
+            if ($idx2 -ge 0) {
+                $composeTextB15 = $composeTextB15.Substring(0, $idx2) + $replacement + $composeTextB15.Substring($idx2 + $marker.Length)
             }
+            $patched = $true
+        }
+
+        # Path B — generic: find `dashboard-api:` then its `environment:` key
+        # and inject a `- NODE_OPTIONS=...` line preserving the local indent.
+        if (-not $patched) {
+            $pattern = '(?ms)^(\s*)dashboard-api:\s*\r?\n(?:\1\s+.*\r?\n)*?\1(\s+)environment:\s*\r?\n'
+            $m = [regex]::Match($composeTextB15, $pattern)
+            if ($m.Success) {
+                try { Copy-Item -LiteralPath $composePathB15 -Destination $bakB15 -Force -ErrorAction SilentlyContinue } catch {}
+                $envIndent = $m.Groups[1].Value + $m.Groups[2].Value
+                $insertion = $envIndent + '  - NODE_OPTIONS=--dns-result-order=ipv4first' + "`n"
+                $endOfEnvLine = $m.Index + $m.Length
+                $composeTextB15 = $composeTextB15.Substring(0, $endOfEnvLine) + $insertion + $composeTextB15.Substring($endOfEnvLine)
+                $patched = $true
+            }
+        }
+
+        if ($patched) {
+            [System.IO.File]::WriteAllText($composePathB15, $composeTextB15, [System.Text.UTF8Encoding]::new($false))
+            Write-Host "  ✓ Self-heal docker-compose.yml — NODE_OPTIONS=ipv4first ajouté à dashboard-api (B15)"
+        } elseif ($composeTextB15 -match '(?m)^\s*dashboard-api:') {
+            # dashboard-api is declared but we couldn't safely inject. Warn so the
+            # operator knows OIDC + license validation will hit ENETUNREACH.
+            Write-Host "  ⚠ Could not patch NODE_OPTIONS for dashboard-api in docker-compose.yml — Entra ID callback may fail with ENETUNREACH (B15). Re-run install.ps1 to regenerate." -ForegroundColor Yellow
         }
     }
 }
