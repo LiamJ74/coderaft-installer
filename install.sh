@@ -66,6 +66,21 @@ if ! docker compose version &> /dev/null; then
     exit 1
 fi
 echo "  ✓ docker compose found"
+
+# B-DAEMON-CHECK (2026-06-10): `docker compose version` only validates the
+# CLI plugin — the daemon may still be unreachable. `docker info` round-trips
+# through the daemon so we fail fast with a clear message instead of pulling
+# blindly and producing cryptic errors halfway through the install.
+if ! _docker_info=$(docker info --format '{{.ServerVersion}}' 2>&1); then
+    echo "  ✗ Docker daemon is not reachable."
+    echo ""
+    echo "    docker info: ${_docker_info}"
+    echo ""
+    echo "    Start Docker / Docker Desktop and wait for it to be running,"
+    echo "    then re-run this installer."
+    exit 1
+fi
+echo "  ✓ Docker daemon reachable (server ${_docker_info})"
 echo ""
 
 # ── Install ──────────────────────────────────────────────────────────────────
@@ -1086,17 +1101,27 @@ if [ "${CODERAFT_TEST_MODE:-0}" = "1" ]; then
     echo "  Compose YAML and vault PKI validated — test run complete."
 else
     echo ""
-    echo "  Pulling dashboard image..."
-    docker compose pull
+    echo "  Pulling platform images..."
+    if ! docker compose pull; then
+        echo ""
+        echo "  ✗ Image pull failed. Aborting install."
+        echo "    Check Docker daemon, network connectivity, or GHCR auth."
+        exit 1
+    fi
 
     echo ""
-    echo "  Starting dashboard..."
+    echo "  Starting platform..."
     # B9 fix: explicit stop+rm for vault container before up so fresh certs
     # are picked up from bind mounts (--force-recreate alone can leave a
     # Running container with stale certs in Docker Desktop memory).
     docker compose stop coderaft-vault 2>/dev/null || true
     docker compose rm -f coderaft-vault 2>/dev/null || true
-    docker compose up -d
+    if ! docker compose up -d; then
+        echo ""
+        echo "  ✗ docker compose up failed. Aborting install."
+        echo "    Run 'docker compose logs' to investigate."
+        exit 1
+    fi
 
     echo ""
     echo "  Unsealing vault..."

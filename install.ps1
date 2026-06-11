@@ -48,6 +48,39 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 Write-Host "  ✓ docker compose found" -ForegroundColor Green
+
+# B-DAEMON-CHECK (2026-06-10): `docker compose version` only validates the
+# CLI plugin — the daemon may still be unreachable (Docker Desktop not
+# started, or switched to Windows containers mode, whose Linux pipe
+# `dockerDesktopLinuxEngine` does not exist). `docker info` is the cheapest
+# call that round-trips through the daemon: fast when up, clear failure
+# when down.
+$dockerInfoOut = Join-Path $env:TEMP "coderaft-docker-info-$(Get-Random).log"
+Start-Process -FilePath "docker" -ArgumentList @("info","--format","{{.ServerVersion}}") `
+    -NoNewWindow -Wait `
+    -RedirectStandardOutput $dockerInfoOut `
+    -RedirectStandardError  $dockerInfoOut `
+    -ErrorAction SilentlyContinue | Out-Null
+$dockerInfoText = if (Test-Path $dockerInfoOut) { (Get-Content $dockerInfoOut -Raw -ErrorAction SilentlyContinue) } else { "" }
+Remove-Item -Path $dockerInfoOut -ErrorAction SilentlyContinue
+if ($dockerInfoText -notmatch '^\s*\d') {
+    Write-Host "  ✗ Docker daemon is not reachable." -ForegroundColor Red
+    Write-Host ""
+    Write-Host "    docker info output:" -ForegroundColor Yellow
+    foreach ($line in ($dockerInfoText -split "`r?`n")) {
+        if ($line.Trim()) { Write-Host "    $line" -ForegroundColor DarkYellow }
+    }
+    Write-Host ""
+    if ($dockerInfoText -match 'dockerDesktopLinuxEngine|named pipe') {
+        Write-Host "    Docker Desktop appears to be in Windows containers mode." -ForegroundColor Yellow
+        Write-Host "    Right-click the Docker tray icon → 'Switch to Linux containers...'" -ForegroundColor Yellow
+        Write-Host "    Then re-run this installer." -ForegroundColor Yellow
+    } else {
+        Write-Host "    Start Docker Desktop and wait for it to be 'Running', then re-run." -ForegroundColor Yellow
+    }
+    exit 1
+}
+Write-Host "  ✓ Docker daemon reachable (server $($dockerInfoText.Trim()))" -ForegroundColor Green
 Write-Host ""
 
 # ── Install ──────────────────────────────────────────────────────────────────
@@ -1026,11 +1059,17 @@ function Invoke-VaultUnsealFresh {
 # ── Pull & Start ─────────────────────────────────────────────────────────────
 
 Write-Host ""
-Write-Host "  Pulling dashboard image..."
+Write-Host "  Pulling platform images..."
 docker compose pull
+if ($LASTEXITCODE -ne 0) {
+    Write-Host ""
+    Write-Host "  ✗ Image pull failed (exit $LASTEXITCODE). Aborting install." -ForegroundColor Red
+    Write-Host "    Check Docker daemon, network connectivity, or GHCR auth." -ForegroundColor Yellow
+    exit 1
+}
 
 Write-Host ""
-Write-Host "  Starting dashboard..."
+Write-Host "  Starting platform..."
 # B9 fix: explicit stop+rm for vault container before up so fresh certs
 # are picked up from bind mounts (--force-recreate alone can leave a
 # Running container with stale certs in Docker Desktop memory).
@@ -1053,6 +1092,12 @@ function Invoke-DockerSilent {
 Invoke-DockerSilent -Arguments @("compose","stop","coderaft-vault")
 Invoke-DockerSilent -Arguments @("compose","rm","-f","coderaft-vault")
 docker compose up -d
+if ($LASTEXITCODE -ne 0) {
+    Write-Host ""
+    Write-Host "  ✗ docker compose up failed (exit $LASTEXITCODE). Aborting install." -ForegroundColor Red
+    Write-Host "    Run 'docker compose logs' to investigate." -ForegroundColor Yellow
+    exit 1
+}
 
 Write-Host ""
 Write-Host "  Unsealing vault..."
