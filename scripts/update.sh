@@ -762,46 +762,38 @@ ACLEOF
     chmod 600 vault-config/acl.yaml
 }
 
-# ── Banking-grade plaintext purge (auto) ──────────────────────────────────
-# When .env.enc exists, the plaintext .env MUST be purged (banking-grade,
-# no secrets at rest). The oneliner does the finalize itself: verifies the
-# decrypted .env.enc matches the plaintext, keeps a 24h .bak, then deletes
-# the plaintext. If anything looks off, falls back to a warning and lets the
-# operator finalize manually.
+# ── Banking-grade plaintext .env handling ──────────────────────────────────
+# B-PLAINTEXT-PURGE (2026-06-14): The previous block deleted .env when an
+# encrypted .env.enc was present AND matched. Looks "banking-grade" but
+# breaks the platform: docker-compose v2 reads only .env (plaintext) for
+# variable substitution — it does NOT decrypt .env.enc. Purging on this
+# update left POSTGRES_PASSWORD / REDIS_PASSWORD / DASHBOARD_SECRET /
+# HOST_PROJECT_DIR empty → redis healthcheck failed (no AUTH) → every
+# dependent service refused to start. Liam had to manually restore from
+# the backup .bak to recover.
+#
+# The real "no plaintext at rest" goal needs an init container or a
+# vault-backed secrets driver (planned in #16 audit bancaire). Until that
+# is shipped, .env stays on disk with mode 0600 — file-system-level
+# protection — and .env.enc remains the authoritative audit-trail copy.
 echo ""
 echo "  Banking-grade secret check..."
-if [ -f "$INSTALL_DIR/.env.enc" ] && [ -f "$INSTALL_DIR/.env" ]; then
-    # Make sure we can actually decrypt
-    AGE_KEY="${SOPS_AGE_KEY_FILE:-$INSTALL_DIR/.coderaft-age.key}"
-    if [ ! -f "$AGE_KEY" ] && [ -f "/etc/coderaft/age.key" ]; then
-        AGE_KEY="/etc/coderaft/age.key"
-    fi
-    if [ ! -f "$AGE_KEY" ]; then
-        echo "  ⚠ .env + .env.enc coexist but age key not found at $AGE_KEY"
-        echo "    Plaintext .env left in place; investigate before next run."
-    elif ! command -v sops >/dev/null 2>&1; then
-        echo "  ⚠ sops binary missing on host — cannot finalize purge automatically"
-        echo "    Run:  curl -fsSL https://install.coderaft.io/migrate.sh | bash -s -- --finalize"
-    else
-        DECRYPTED=$(SOPS_AGE_KEY_FILE="$AGE_KEY" sops --decrypt --input-type dotenv --output-type dotenv "$INSTALL_DIR/.env.enc" 2>/dev/null || true)
-        if [ -z "$DECRYPTED" ]; then
-            echo "  ⚠ sops decrypt of .env.enc returned empty — leaving plaintext in place"
-        else
-            # Compare normalized sets of KEY=VALUE lines
-            BAK_DIR="$INSTALL_DIR/dashboard_data"
-            mkdir -p "$BAK_DIR"
-            BAK_FILE="$BAK_DIR/env-pre-finalize-$(date +%Y%m%d_%H%M%S).bak"
+if [ -f "$INSTALL_DIR/.env" ]; then
+    chmod 600 "$INSTALL_DIR/.env" 2>/dev/null || true
+    if [ -f "$INSTALL_DIR/.env.enc" ]; then
+        # Belt-and-braces: keep a daily snapshot of the plaintext so an
+        # operator-side mistake can be reverted within 24h.
+        BAK_DIR="$INSTALL_DIR/dashboard_data"
+        mkdir -p "$BAK_DIR"
+        BAK_FILE="$BAK_DIR/env-snapshot-$(date +%Y%m%d).bak"
+        if [ ! -f "$BAK_FILE" ]; then
             cp "$INSTALL_DIR/.env" "$BAK_FILE" 2>/dev/null || true
-            DIFF=$(diff <(grep -vE '^\s*(#|$)' "$INSTALL_DIR/.env" | sort) <(echo "$DECRYPTED" | grep -vE '^\s*(#|$)' | sort) 2>/dev/null || true)
-            if [ -z "$DIFF" ]; then
-                rm -f "$INSTALL_DIR/.env"
-                echo "  ✓ plaintext .env purged (backup: $BAK_FILE, kept 24h)"
-            else
-                echo "  ⚠ .env and .env.enc differ — refusing to purge plaintext."
-                echo "    Re-run:  curl -fsSL https://install.coderaft.io/migrate.sh | bash -s -- --finalize"
-                echo "    Backup written to $BAK_FILE"
-            fi
+            chmod 600 "$BAK_FILE" 2>/dev/null || true
         fi
+        find "$BAK_DIR" -name 'env-snapshot-*.bak' -mtime +7 -delete 2>/dev/null || true
+        echo "  ✓ .env protected (chmod 600) + .env.enc audit copy + daily snapshot in $BAK_DIR"
+    else
+        echo "  ✓ .env protected (chmod 600)"
     fi
 fi
 
