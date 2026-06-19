@@ -5,7 +5,7 @@
 #
 # Installs the CodeRaft Dashboard. The dashboard handles everything else:
 #   • License activation
-#   • Product deployment (EntraGuard, Ravenscan, RedFox)
+#   • Product deployment (WolfGuard, Ravenscan, RedFox)
 #   • Configuration & updates
 # =============================================================================
 

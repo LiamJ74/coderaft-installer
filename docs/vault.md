@@ -59,7 +59,7 @@ in `./vault-tls/`:
 | `ca.crt` / `ca.key` | Root CA (self-signed, 10y, mode 0600) |
 | `server.crt` / `server.key` | Vault server cert (SAN=coderaft-vault) |
 | `dashboard-api-client.{crt,key}` | Admin client cert (can list+read+write all) |
-| `entraguard-client.{crt,key}` | EntraGuard client cert (azure_*, license_key, entraguard_*) |
+| `entraguard-client.{crt,key}` | WolfGuard client cert (azure_*, license_key, entraguard_*) |
 | `ravenscan-client.{crt,key}` | Ravenscan client cert (ravenscan_*, neo4j_*) |
 | `redfox-client.{crt,key}` | RedFox client cert (redfox_*) |
 

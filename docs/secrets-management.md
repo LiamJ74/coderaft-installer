@@ -254,7 +254,7 @@ Les binaires sops arm64 Linux sont disponibles depuis la v3.8.0. Pas de bug conn
 
 | Produit | .env.enc | entrypoint | sops dans Dockerfile |
 |---------|----------|-----------|----------------------|
-| EntraGuard | `/opt/app/.env.enc` | `entrypoint.sh` | Stage `sops-downloader` |
+| WolfGuard | `/opt/app/.env.enc` | `entrypoint.sh` | Stage `sops-downloader` |
 | Ravenscan | `~/.ravenscan/.env.enc` | `entrypoint.sh` | Stage `sops-downloader` |
 | RedFox API | `/etc/redfox/.env.enc` | `apps/api/entrypoint.sh` | Stage `sops-downloader` |
 | License Server | `/app/.env.enc` | `entrypoint.sh` | Stage `sops-downloader` |
