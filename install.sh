@@ -683,9 +683,9 @@ services:
       # Vault integration (Phase 0.5 — products read secrets from the vault)
       - CODERAFT_VAULT_URL=https://coderaft-vault:8200
       # B12 fix: correct vault TLS filenames (client-ca.crt, not ca.crt)
-      - CODERAFT_VAULT_TLS_CA=/vault-tls/client-ca.crt
-      - CODERAFT_VAULT_TLS_CERT=/vault-tls/dashboard-api-client.crt
-      - CODERAFT_VAULT_TLS_KEY=/vault-tls/dashboard-api-client.key
+      - CODERAFT_VAULT_CA=/vault-tls/client-ca.crt
+      - CODERAFT_VAULT_CLIENT_CERT=/vault-tls/dashboard-api-client.crt
+      - CODERAFT_VAULT_CLIENT_KEY=/vault-tls/dashboard-api-client.key
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - dashboard_data:/data
