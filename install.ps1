@@ -198,6 +198,25 @@ function Invoke-VaultBootstrap {
         }
     }
 
+    # B-VAULT-DEK (2026-06-22): a stale 'coderaft_vault_data' volume from a
+    # prior install attempt holds a wrapped DEK that was sealed with the
+    # PREVIOUS age key. Generating a fresh age.key here without wiping the
+    # volume guarantees "unseal failed: bad master key" because vault tries
+    # to unwrap the old DEK with the new key. The age.key is brand new so
+    # there's no legitimate data to preserve at this point — wipe.
+    $stale = $null
+    try { $stale = docker volume inspect coderaft_vault_data 2>$null } catch {}
+    if ($stale) {
+        Write-Host "  Removing stale coderaft_vault_data volume from a previous install attempt..."
+        try {
+            docker volume rm -f coderaft_vault_data 2>$null | Out-Null
+            Write-Host "    ✓ stale vault data removed" -ForegroundColor Green
+        } catch {
+            Write-Host "    ⚠ could not remove coderaft_vault_data — vault unseal may fail with 'bad master key'" -ForegroundColor Yellow
+            Write-Host "      Manual fix: docker compose down; docker volume rm coderaft_vault_data; docker compose up -d" -ForegroundColor Yellow
+        }
+    }
+
     Write-Host "  Generating vault master key..."
     # B20 (2026-06-09): age-keygen emits "warning: writing secret key to a
     # world-readable file" on stderr because Windows has no POSIX chmod.

@@ -298,6 +298,21 @@ vault_bootstrap() {
         exit 1
     fi
 
+    # B-VAULT-DEK (2026-06-22): wipe a stale coderaft_vault_data volume left
+    # by a prior install attempt. Its wrapped DEK was sealed with the previous
+    # age key; a fresh age.key here will produce "unseal failed: bad master
+    # key" on the next /v1/unseal call. age.key didn't exist yet so there's
+    # no legitimate data to preserve.
+    if docker volume inspect coderaft_vault_data >/dev/null 2>&1; then
+        echo "  Removing stale coderaft_vault_data volume from a previous install attempt..."
+        if docker volume rm -f coderaft_vault_data >/dev/null 2>&1; then
+            echo "    ✓ stale vault data removed"
+        else
+            echo "    ⚠ could not remove coderaft_vault_data — vault unseal may fail with 'bad master key'"
+            echo "      Manual fix: docker compose down; docker volume rm coderaft_vault_data; docker compose up -d"
+        fi
+    fi
+
     echo "  Generating vault master key..."
     age-keygen -o vault-keys/age.key 2>/dev/null || {
         echo "  ✗ age-keygen failed"
