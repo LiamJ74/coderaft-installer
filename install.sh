@@ -659,6 +659,10 @@ services:
       - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
       - DASHBOARD_SECRET=${DASHBOARD_SECRET}
       - LICENSE_SERVER_URL=https://license.coderaft.io
+    # B-DASHBOARD-NET (2026-06-23): nginx inside this image proxies
+    # /api/entraguard/, /api/ravenscan/, /api/redfox/ to the product
+    # containers on coderaft-frontend / coderaft-backend.
+    networks: [default, coderaft-frontend, coderaft-backend]
     security_opt: [no-new-privileges:true]
     restart: unless-stopped
 
@@ -795,6 +799,9 @@ networks:
   # B-PRODUCT-DB-NET: backend network shared by data services (postgres,
   # redis, neo4j) and the dynamically-deployed products.
   coderaft-backend: {}
+  # B-DASHBOARD-NET: frontend network where the dashboard nginx and the
+  # product HTTP listeners (entraguard-api, ravenscan, redfox-api) meet.
+  coderaft-frontend: {}
 
 volumes:
   postgres_data:
