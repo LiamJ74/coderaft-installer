@@ -610,6 +610,13 @@ services:
       - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
       - DASHBOARD_SECRET=${DASHBOARD_SECRET}
       - LICENSE_SERVER_URL=https://license.coderaft.io
+    # B-DASHBOARD-NET (2026-06-23): the nginx inside this image proxies
+    # /api/entraguard/, /api/ravenscan/, /api/redfox/ to the product
+    # containers. Products live on coderaft-frontend (entraguard/ravenscan)
+    # and coderaft-backend (DB-talking services). Without these networks
+    # the wizard surfaces "Cannot reach WolfGuard API" (502) even though
+    # entraguard-api is healthy. Observed live 2026-06-23 on Windows host.
+    networks: [default, coderaft-frontend, coderaft-backend]
     security_opt: [no-new-privileges:true]
     restart: unless-stopped
 
@@ -738,6 +745,10 @@ networks:
   # the install.ps1 / install.sh templates can put data services on it
   # without dashboard-api having to compose them.
   coderaft-backend: {}
+  # B-DASHBOARD-NET: frontend network where the dashboard nginx and the
+  # product HTTP listeners (entraguard-api, ravenscan, redfox-api) meet.
+  # The dashboard joins it so its proxy can dial /api/<product>/* targets.
+  coderaft-frontend: {}
 
 volumes:
   postgres_data:
