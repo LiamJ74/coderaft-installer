@@ -11,12 +11,58 @@
 $ErrorActionPreference = 'Stop'
 $InstallDir = if ($env:INSTALL_DIR) { $env:INSTALL_DIR } else { 'coderaft' }
 
+# B-TRANSCRIPT (2026-06-23): capture full PowerShell session to a transcript
+# file so that we can diagnose crashes when the console window self-closes
+# (happens on `irm | iex` when a `Start-Process -ErrorAction Stop` throws —
+# the host treats the script-level exception as terminating and closes the
+# window before the user can read the error). Transcript is written to the
+# user's TEMP and the path is announced upfront so the operator can mail it
+# to support if anything goes wrong.
+$CoderaftTranscript = Join-Path $env:TEMP "coderaft-install-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+try {
+    Start-Transcript -Path $CoderaftTranscript -Force -ErrorAction SilentlyContinue | Out-Null
+} catch {
+    # Some hosts (older ISE, restricted modes) refuse Start-Transcript; we
+    # carry on without it rather than abort — the rest of the script still
+    # works, the operator just won't have a post-mortem log.
+    $CoderaftTranscript = $null
+}
+
 Write-Host ""
 Write-Host "  ╔══════════════════════════════════════════╗"
 Write-Host "  ║     CodeRaft Platform — Installer        ║"
 Write-Host "  ║   Security. Identity. Access. Unified.   ║"
 Write-Host "  ╚══════════════════════════════════════════╝"
 Write-Host ""
+if ($CoderaftTranscript) {
+    Write-Host "  Install log: $CoderaftTranscript"
+    Write-Host ""
+}
+
+# B-TRAP (2026-06-23): on `irm | iex`, an uncaught terminating exception
+# closes the host window before the user can read the error. The trap
+# below intercepts it, prints the full ErrorRecord (including the call
+# stack), stops the transcript, then re-throws so $LASTEXITCODE is still
+# set correctly for any caller. The 5-second sleep gives a real human a
+# fighting chance to screenshot the message even on a self-closing host.
+trap {
+    Write-Host ""
+    Write-Host "  ╔══════════════════════════════════════════╗" -ForegroundColor Red
+    Write-Host "  ║   INSTALL FAILED — uncaught exception    ║" -ForegroundColor Red
+    Write-Host "  ╚══════════════════════════════════════════╝" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  Error: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "  At:    $($_.InvocationInfo.PositionMessage)" -ForegroundColor Yellow
+    Write-Host ""
+    if ($CoderaftTranscript) {
+        Write-Host "  Full transcript saved to: $CoderaftTranscript" -ForegroundColor Yellow
+        Write-Host "  Please share this file with support." -ForegroundColor Yellow
+        try { Stop-Transcript | Out-Null } catch {}
+    }
+    Write-Host ""
+    Start-Sleep -Seconds 5
+    break
+}
 
 # ── OS detection ─────────────────────────────────────────────────────────────
 # Coderaft itself runs in Docker on every OS. The native capture daemon
