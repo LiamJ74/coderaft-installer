@@ -204,14 +204,38 @@ function Invoke-VaultBootstrap {
     # volume guarantees "unseal failed: bad master key" because vault tries
     # to unwrap the old DEK with the new key. The age.key is brand new so
     # there's no legitimate data to preserve at this point — wipe.
-    $stale = $null
-    try { $stale = docker volume inspect coderaft_vault_data 2>$null } catch {}
-    if ($stale) {
+    #
+    # B-VAULT-DEK-NATIVE (2026-06-23): the previous version used
+    #   try { $stale = docker volume inspect ... 2>$null } catch {}
+    # which CRASHES under PS 5.1: `$ErrorActionPreference = 'Stop'` turns the
+    # NativeCommandError emitted by `docker volume inspect <missing>` into a
+    # terminating error that the surrounding try/catch does NOT capture (the
+    # native-command error surfaces during pipeline binding, not after). Use
+    # Start-Process — same pattern as age-keygen below and as enforced by the
+    # B20-sweep across this script.
+    $volInspectOut = Join-Path $env:TEMP "coderaft-volinspect-stdout-$(Get-Random).txt"
+    $volInspectErr = Join-Path $env:TEMP "coderaft-volinspect-stderr-$(Get-Random).txt"
+    $volInspectProc = Start-Process -FilePath "docker" `
+        -ArgumentList "volume","inspect","coderaft_vault_data" `
+        -NoNewWindow -Wait -PassThru `
+        -RedirectStandardOutput $volInspectOut `
+        -RedirectStandardError  $volInspectErr `
+        -ErrorAction SilentlyContinue
+    Remove-Item -Path $volInspectOut,$volInspectErr -ErrorAction SilentlyContinue
+    if ($volInspectProc.ExitCode -eq 0) {
         Write-Host "  Removing stale coderaft_vault_data volume from a previous install attempt..."
-        try {
-            docker volume rm -f coderaft_vault_data 2>$null | Out-Null
+        $volRmOut = Join-Path $env:TEMP "coderaft-volrm-stdout-$(Get-Random).txt"
+        $volRmErr = Join-Path $env:TEMP "coderaft-volrm-stderr-$(Get-Random).txt"
+        $volRmProc = Start-Process -FilePath "docker" `
+            -ArgumentList "volume","rm","-f","coderaft_vault_data" `
+            -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput $volRmOut `
+            -RedirectStandardError  $volRmErr `
+            -ErrorAction SilentlyContinue
+        Remove-Item -Path $volRmOut,$volRmErr -ErrorAction SilentlyContinue
+        if ($volRmProc.ExitCode -eq 0) {
             Write-Host "    ✓ stale vault data removed" -ForegroundColor Green
-        } catch {
+        } else {
             Write-Host "    ⚠ could not remove coderaft_vault_data — vault unseal may fail with 'bad master key'" -ForegroundColor Yellow
             Write-Host "      Manual fix: docker compose down; docker volume rm coderaft_vault_data; docker compose up -d" -ForegroundColor Yellow
         }
