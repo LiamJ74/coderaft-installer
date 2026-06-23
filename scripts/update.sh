@@ -7,6 +7,17 @@
 #
 set -e
 
+# B-SH-GUARD (2026-06-23): the openssl steps below use bash process
+# substitution `<(printf ...)`. Invoking this script via `sh update.sh`
+# on macOS (where /bin/sh is bash in POSIX mode) crashes with
+# "syntax error near unexpected token `('". Refuse explicitly so the
+# operator gets an actionable message instead of an opaque syntax error.
+if [ -z "${BASH_VERSION:-}" ]; then
+    echo "ERROR: update.sh requires bash (uses process substitution)." >&2
+    echo "Run with: bash update.sh   (NOT sh update.sh)" >&2
+    exit 1
+fi
+
 DASHBOARD_API="${DASHBOARD_API:-http://localhost:3000}"
 ADMIN_TOKEN="${ADMIN_TOKEN:-}"
 BACKUP_DIR="${BACKUP_DIR:-./dashboard_data/backups}"
