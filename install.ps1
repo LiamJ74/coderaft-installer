@@ -705,6 +705,12 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    # B-PRODUCT-DB-NET (2026-06-23): products (entraguard, ravenscan, redfox)
+    # are added dynamically by dashboard-api and attached to coderaft-backend.
+    # Without postgres also being on that network, every product's first DNS
+    # lookup of "postgres" returns ENOENT and alembic migrations crash with
+    # "Name or service not known". Observed live on Windows host 2026-06-23.
+    networks: [coderaft-backend]
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
@@ -718,12 +724,20 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    # B-PRODUCT-DB-NET: same reason as postgres above — product workers also
+    # connect to redis://redis:6379 and must resolve the hostname.
+    networks: [coderaft-backend]
     restart: unless-stopped
 
 networks:
   # Internal network for vault <-> product communication. No external port.
   coderaft-vault-net:
     internal: true
+  # B-PRODUCT-DB-NET: backend network shared by data services (postgres,
+  # redis, neo4j) and the dynamically-deployed products. Declared here so
+  # the install.ps1 / install.sh templates can put data services on it
+  # without dashboard-api having to compose them.
+  coderaft-backend: {}
 
 volumes:
   postgres_data:
