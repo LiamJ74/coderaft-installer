@@ -1620,6 +1620,68 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
+# ── B-NETWORK-HEAL (2026-06-24) ───────────────────────────────────────────
+# install.ps1 PR #11/#13 added coderaft-backend + coderaft-frontend networks
+# and attached postgres / redis / dashboard to them. Pre-existing installs
+# created before those PRs keep using coderaft_default — every product
+# deployed dynamically by dashboard-api ends up unable to resolve the
+# "postgres" / "redis" / "entraguard-api" hostnames, surfacing as 500
+# errors at sign-in and product setup time.
+#
+# update.ps1 does NOT rewrite the user's docker-compose.yml (intentional —
+# we don't want to clobber operator-tuned configs). Instead we self-heal
+# by ensuring the networks exist and attaching the long-running data
+# containers to them. Idempotent: re-running this block is a no-op when
+# the connections are already in place.
+Write-Host ""
+Write-Host "  Self-healing data-service networks..."
+$projectPrefix = ($env:COMPOSE_PROJECT_NAME) ? $env:COMPOSE_PROJECT_NAME : "coderaft"
+$backendNet  = "${projectPrefix}_coderaft-backend"
+$frontendNet = "${projectPrefix}_coderaft-frontend"
+
+function Ensure-Network {
+    param([string]$name)
+    & docker network inspect $name *> $null
+    if ($LASTEXITCODE -ne 0) {
+        & docker network create $name *> $null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "    + created $name"
+        }
+    }
+}
+
+function Ensure-Attached {
+    param(
+        [string]$network,
+        [string]$container,
+        [string]$alias = ""
+    )
+    # Already attached? `docker inspect` returns the network name when present.
+    $attached = & docker inspect $container --format "{{range `$k,`$v := .NetworkSettings.Networks}}{{`$k}} {{end}}" 2>$null
+    if ($LASTEXITCODE -ne 0) { return }   # container doesn't exist
+    if ($attached -match [regex]::Escape($network)) { return }
+    if ($alias) {
+        & docker network connect --alias $alias $network $container 2>$null | Out-Null
+    } else {
+        & docker network connect $network $container 2>$null | Out-Null
+    }
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "    + ${container} -> ${network}$( if ($alias) { ' (alias=' + $alias + ')' } )"
+    }
+}
+
+Ensure-Network $backendNet
+Ensure-Network $frontendNet
+
+# Postgres + Redis MUST keep their service-name aliases so the products
+# can resolve `postgres:5432` / `redis:6379` after dashboard-api hot-deploys
+# them. `docker network connect` without --alias only registers the full
+# container name (coderaft-postgres-1), not the short one.
+Ensure-Attached -network $backendNet  -container "${projectPrefix}-postgres-1" -alias "postgres"
+Ensure-Attached -network $backendNet  -container "${projectPrefix}-redis-1"    -alias "redis"
+Ensure-Attached -network $frontendNet -container "${projectPrefix}-dashboard-1"
+Ensure-Attached -network $backendNet  -container "${projectPrefix}-dashboard-1"
+
 # ── Post-update healthcheck ───────────────────────────────────────────────
 Write-Host ""
 Write-Host "  Post-update health check..."
