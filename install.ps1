@@ -11,6 +11,30 @@
 $ErrorActionPreference = 'Stop'
 $InstallDir = if ($env:INSTALL_DIR) { $env:INSTALL_DIR } else { 'coderaft' }
 
+# B-CWD-SANITIZE (2026-07-16): `irm | iex` inherits the caller's CWD. When
+# the user runs an elevated PowerShell (or auto-elevates via UAC) but sits
+# inside another user's profile (e.g. `PS C:\Users\ljsantos\coderaft>` in
+# an `Administrator:` window), `System.Diagnostics.Process.Start()` fails
+# to launch child processes with Win32 error 0x8007007B
+# ("La syntaxe du nom de fichier, de répertoire ou de volume est
+# incorrecte.") because the elevated account can't access the CWD to
+# resolve its own working directory. Also happens after a partial
+# `Remove-Item -Recurse -Force .` that stranded the current shell inside
+# a deleted directory, or after `icacls /reset` on a profile subfolder
+# that stripped the Administrators ACE.
+# Fix: move to the CURRENT account's USERPROFILE before anything else.
+# The install still lands in `.\coderaft\` unless INSTALL_DIR is set, so
+# behaviour under normal usage (running from the user's home) is
+# unchanged.
+try {
+    if ($env:USERPROFILE -and (Test-Path -LiteralPath $env:USERPROFILE)) {
+        Set-Location -LiteralPath $env:USERPROFILE -ErrorAction Stop
+    }
+} catch {
+    # Fallback to SystemDrive root if USERPROFILE itself is unreadable.
+    try { Set-Location -LiteralPath ($env:SystemDrive + '\') -ErrorAction Stop } catch {}
+}
+
 # B-TRANSCRIPT (2026-06-23): capture full PowerShell session to a transcript
 # file so that we can diagnose crashes when the console window self-closes
 # (happens on `irm | iex` when a `Start-Process -ErrorAction Stop` throws —
