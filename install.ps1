@@ -620,11 +620,45 @@ services:
     security_opt: [no-new-privileges:true]
     restart: unless-stopped
 
+  # F-003 (2026-06-21): ACL sidecar for the Docker socket. dashboard-api
+  # talks through this instead of mounting /var/run/docker.sock directly,
+  # so it cannot call POST /exec, /volumes, /secrets, /swarm.
+  # Allowed: list containers/images/networks, start/stop/restart products.
+  docker-proxy:
+    image: tecnativa/docker-socket-proxy:0.3.0
+    container_name: coderaft-docker-proxy
+    environment:
+      CONTAINERS: 1
+      IMAGES: 1
+      NETWORKS: 1
+      SERVICES: 1
+      TASKS: 1
+      INFO: 1
+      VERSION: 1
+      POST: 1
+      VOLUMES: 0
+      EXEC: 0
+      SECRETS: 0
+      SWARM: 0
+      NODES: 0
+      ALLOW_START: 1
+      ALLOW_STOP: 1
+      ALLOW_RESTARTS: 1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - docker-proxy-net
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETGID, SETUID, NET_BIND_SERVICE]
+    restart: unless-stopped
+
   dashboard-api:
     image: ghcr.io/liamj74/coderaft-dashboard-api:latest
     networks:
       - default
       - coderaft-vault-net
+      - docker-proxy-net
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
@@ -635,6 +669,7 @@ services:
       # Use `service_started` so dashboard-api boots; it gracefully degrades
       # to "vault unavailable" until unseal completes, then reconnects.
       coderaft-vault: { condition: service_started }
+      docker-proxy: { condition: service_started }
     environment:
       # B15 (2026-05-19): Node.js résout IPv6 d'abord par défaut. Le container
       # Docker n'a pas d'IPv6 → ENETUNREACH → fallback IPv4 lent ou timeout
@@ -648,6 +683,10 @@ services:
       - CONTAINER_COMPOSE_DIR=/host-compose
       - HOST_PROJECT_DIR=${HOST_PROJECT_DIR}
       - COMPOSE_PROJECT_NAME=coderaft
+      # F-003 (2026-06-21): talk to Docker via the scoped proxy, not the raw
+      # socket. Backported from the runtime compose. Blocks dashboard-api
+      # from calling POST /exec, /volumes, /secrets, /swarm.
+      - DOCKER_HOST=tcp://docker-proxy:2375
       # NOTE: Phase 0.5 keeps SOPS path for backward compat; Phase 5 removes it.
       - CODERAFT_VAULT_URL=https://coderaft-vault:8200
       # B12 fix: correct vault TLS filenames (client-ca.crt, not ca.crt)
@@ -655,7 +694,8 @@ services:
       - CODERAFT_VAULT_CLIENT_CERT=/vault-tls/dashboard-api-client.crt
       - CODERAFT_VAULT_CLIENT_KEY=/vault-tls/dashboard-api-client.key
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      # F-003 (2026-06-21): /var/run/docker.sock mount REMOVED — replaced by
+      # tcp://docker-proxy:2375 over the docker-proxy-net network below.
       - dashboard_data:/data
       - .:/host-compose
       # Age private key for SOPS decryption (legacy — kept for backward compat).
@@ -739,6 +779,10 @@ services:
 networks:
   # Internal network for vault <-> product communication. No external port.
   coderaft-vault-net:
+    internal: true
+  # F-003 (2026-06-21): private network for the docker-socket-proxy. Only
+  # dashboard-api joins it — external access to the daemon stays impossible.
+  docker-proxy-net:
     internal: true
   # B-PRODUCT-DB-NET: backend network shared by data services (postgres,
   # redis, neo4j) and the dynamically-deployed products. Declared here so
