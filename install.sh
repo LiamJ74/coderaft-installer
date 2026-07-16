@@ -681,7 +681,12 @@ services:
       INFO: 1
       VERSION: 1
       POST: 1
-      VOLUMES: 0
+      # F-003 follow-up (2026-07-16): VOLUMES=1 required so `docker compose up`
+      # can read/create named volumes for the product services. Volume read
+      # doesn't grant RCE — the RCE risk came from POST /containers/create
+      # with a `Binds:[/:/host]` (privileged mount) or POST /exec, both
+      # still blocked here.
+      VOLUMES: 1
       EXEC: 0
       SECRETS: 0
       SWARM: 0

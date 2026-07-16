@@ -636,7 +636,12 @@ services:
       INFO: 1
       VERSION: 1
       POST: 1
-      VOLUMES: 0
+      # F-003 follow-up (2026-07-16): VOLUMES=1 required so `docker compose up`
+      # can read/create named volumes for the product services. Volume read
+      # doesn't grant RCE — the RCE risk of exposing docker.sock came from
+      # POST /containers/create with a `Binds:[/:/host]` (privileged mount)
+      # or POST /exec, both still blocked here. Safe to open.
+      VOLUMES: 1
       EXEC: 0
       SECRETS: 0
       SWARM: 0
@@ -859,11 +864,33 @@ function Setup-LocalHttps {
         Write-Host "  mkcert not found."
         # B-MKCERT-PM (2026-06-09): `*> $null` does not suppress native-command
         # stderr in PS 5.1. Use Start-Process with split stdout/stderr files
-        # (compat PS 5.1 + 7) for both choco and scoop. Choco/scoop install
-        # may require admin too — if it fails, just fallback.
+        # (compat PS 5.1 + 7) for winget, choco, scoop.
+        # B-MKCERT-WINGET (2026-07-16): winget is bundled with Windows 10/11
+        # (App Installer, native, no elevation for --scope user) so it works
+        # on stock Windows where choco/scoop are absent. Try it first — if
+        # it isn't there we fall through to choco → scoop → manual → GitHub
+        # release binary fallback. On the user's install 2026-07-16 choco
+        # install failed and neither winget nor scoop was tried, leaving
+        # Caddy crashing forever with `/certs/coderaft.local.pem: no such
+        # file or directory`.
         $pmOut = Join-Path $env:TEMP "coderaft-pm-out-$(Get-Random).log"
         $pmErr = Join-Path $env:TEMP "coderaft-pm-err-$(Get-Random).log"
-        if (Get-Command choco -ErrorAction SilentlyContinue) {
+        $installedFromPM = $false
+        if (Get-Command winget -ErrorAction SilentlyContinue) {
+            Write-Host "  Installing mkcert via winget (winget install FiloSottile.mkcert)…"
+            $cmgrProc = Start-Process -FilePath "winget" `
+                -ArgumentList @("install","--id","FiloSottile.mkcert","-e","--accept-source-agreements","--accept-package-agreements","--silent","--scope","user") `
+                -NoNewWindow -Wait -PassThru `
+                -RedirectStandardOutput $pmOut `
+                -RedirectStandardError $pmErr `
+                -ErrorAction SilentlyContinue
+            if ($cmgrProc.ExitCode -eq 0) {
+                $installedFromPM = $true
+            } else {
+                Write-Host "  ⚠ winget install mkcert failed (exit $($cmgrProc.ExitCode)) — trying choco/scoop…" -ForegroundColor Yellow
+            }
+        }
+        if (-not $installedFromPM -and (Get-Command choco -ErrorAction SilentlyContinue)) {
             Write-Host "  Installing mkcert via Chocolatey (choco install mkcert)…"
             $cmgrProc = Start-Process -FilePath "choco" `
                 -ArgumentList @("install","mkcert","-y","--no-progress") `
@@ -871,12 +898,13 @@ function Setup-LocalHttps {
                 -RedirectStandardOutput $pmOut `
                 -RedirectStandardError $pmErr `
                 -ErrorAction SilentlyContinue
-            if ($cmgrProc.ExitCode -ne 0) {
-                Write-Host "  ⚠ choco install mkcert failed — fallback to http://localhost:3000" -ForegroundColor Yellow
-                Remove-Item -Path $pmOut,$pmErr -ErrorAction SilentlyContinue
-                return $false
+            if ($cmgrProc.ExitCode -eq 0) {
+                $installedFromPM = $true
+            } else {
+                Write-Host "  ⚠ choco install mkcert failed (exit $($cmgrProc.ExitCode)) — trying scoop…" -ForegroundColor Yellow
             }
-        } elseif (Get-Command scoop -ErrorAction SilentlyContinue) {
+        }
+        if (-not $installedFromPM -and (Get-Command scoop -ErrorAction SilentlyContinue)) {
             Write-Host "  Installing mkcert via Scoop (scoop install mkcert)…"
             $cmgrProc = Start-Process -FilePath "scoop" `
                 -ArgumentList @("install","mkcert") `
@@ -884,21 +912,44 @@ function Setup-LocalHttps {
                 -RedirectStandardOutput $pmOut `
                 -RedirectStandardError $pmErr `
                 -ErrorAction SilentlyContinue
-            if ($cmgrProc.ExitCode -ne 0) {
-                Write-Host "  ⚠ scoop install mkcert failed — fallback to http://localhost:3000" -ForegroundColor Yellow
-                Remove-Item -Path $pmOut,$pmErr -ErrorAction SilentlyContinue
-                return $false
+            if ($cmgrProc.ExitCode -eq 0) {
+                $installedFromPM = $true
+            } else {
+                Write-Host "  ⚠ scoop install mkcert failed (exit $($cmgrProc.ExitCode)) — trying direct binary…" -ForegroundColor Yellow
             }
-        } else {
-            Write-Host "  ⚠ Neither Chocolatey nor Scoop found — install mkcert manually:" -ForegroundColor Yellow
-            Write-Host "      https://github.com/FiloSottile/mkcert#installation"
-            Write-Host "    Continuing in HTTP-only mode (http://localhost:3000)."
-            return $false
         }
         Remove-Item -Path $pmOut,$pmErr -ErrorAction SilentlyContinue
+
+        # B-MKCERT-DIRECT (2026-07-16): last-resort fallback — download the
+        # signed mkcert binary from GitHub Releases into caddy_certs\ so we
+        # never leave the operator stuck on a machine without a package
+        # manager. mkcert is a single static Go binary (~5 MB) — no
+        # dependencies, no installer required.
+        if (-not $installedFromPM) {
+            Write-Host "  No package manager could install mkcert — downloading direct binary from GitHub…"
+            $mkcertVersion = "v1.4.4"
+            $mkcertArch = if ([Environment]::Is64BitOperatingSystem) { "amd64" } else { "386" }
+            $mkcertUrl = "https://github.com/FiloSottile/mkcert/releases/download/$mkcertVersion/mkcert-$mkcertVersion-windows-$mkcertArch.exe"
+            $mkcertLocal = Join-Path (Get-Location) "caddy_certs\mkcert.exe"
+            New-Item -ItemType Directory -Force -Path "caddy_certs" | Out-Null
+            try {
+                Invoke-WebRequest -Uri $mkcertUrl -OutFile $mkcertLocal -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+                Write-Host "    ✓ mkcert downloaded ($mkcertLocal)" -ForegroundColor Green
+                # Add it to the CURRENT session PATH so Get-Command finds it below.
+                $env:Path = "$(Split-Path -Parent $mkcertLocal);$env:Path"
+                $installedFromPM = $true
+            } catch {
+                Write-Host "  ⚠ Could not download mkcert from GitHub: $($_.Exception.Message)" -ForegroundColor Yellow
+                Write-Host "      Manual install: https://github.com/FiloSottile/mkcert#installation" -ForegroundColor Yellow
+                Write-Host "    Continuing in HTTP-only mode (http://localhost:3000)." -ForegroundColor Yellow
+                return $false
+            }
+        }
+
         # Refresh PATH so the just-installed mkcert is visible in this session.
         $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" +
-                    [System.Environment]::GetEnvironmentVariable("Path","User")
+                    [System.Environment]::GetEnvironmentVariable("Path","User") + ";" +
+                    $env:Path
     }
 
     # B-MKCERT (2026-06-09): `mkcert -install` writes to the system Root
@@ -1258,6 +1309,35 @@ function Invoke-DockerSilent {
 }
 Invoke-DockerSilent -Arguments @("compose","stop","coderaft-vault")
 Invoke-DockerSilent -Arguments @("compose","rm","-f","coderaft-vault")
+
+# B-AGE-KEY-DIR (2026-07-16): the dashboard-api service bind-mounts
+# `./.coderaft-age.key:/keys/age.key:ro`. If the host file does not
+# exist when `docker compose up` runs, Docker silently creates a
+# DIRECTORY at that host path and mounts it as `/keys/age.key` inside
+# the container — dashboard-api then crash-loops with
+# `age-keygen: /keys/age.key: is a directory`.
+# Ensure the host path is a regular file BEFORE compose up. On a
+# fresh install we have no encrypted `.env.enc` yet, so the key
+# content is unused — an empty file is enough to prevent Docker from
+# creating a directory. If a stale directory is left over from a
+# failed previous install attempt, remove it first.
+$AgeKeyHost = Join-Path (Get-Location) ".coderaft-age.key"
+if (Test-Path $AgeKeyHost -PathType Container) {
+    Remove-Item -LiteralPath $AgeKeyHost -Recurse -Force -ErrorAction SilentlyContinue
+}
+if (-not (Test-Path $AgeKeyHost -PathType Leaf)) {
+    # Prefer the freshly-generated vault-keys\age.key so SOPS re-encrypt
+    # (dashboard-api Settings → Secrets) works out of the box. Fallback
+    # to an empty file — dashboard-api only reads the key when .env.enc
+    # exists, and .env.enc is not part of a fresh install.
+    $VaultAgeKey = Join-Path (Get-Location) "vault-keys\age.key"
+    if (Test-Path $VaultAgeKey -PathType Leaf) {
+        Copy-Item -LiteralPath $VaultAgeKey -Destination $AgeKeyHost -Force
+    } else {
+        New-Item -Path $AgeKeyHost -ItemType File -Force | Out-Null
+    }
+}
+
 docker compose up -d
 if ($LASTEXITCODE -ne 0) {
     Write-Host ""
