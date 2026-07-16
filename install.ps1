@@ -1330,10 +1330,30 @@ if (-not (Test-Path $AgeKeyHost -PathType Leaf)) {
     # (dashboard-api Settings → Secrets) works out of the box. Fallback
     # to an empty file — dashboard-api only reads the key when .env.enc
     # exists, and .env.enc is not part of a fresh install.
+    #
+    # B-AGE-ACL (2026-07-16): vault-keys\age.key gets its ACL locked
+    # down to the user that created it (SetAccessRuleProtection($true,
+    # $false) + a single Read rule for the current identity). If a
+    # LATER install runs as a different Windows account — Administrator
+    # via UAC elevation, another admin, or a different SamAccountName —
+    # Copy-Item throws "Access to the path is denied" even though the
+    # process is elevated (Windows ACLs beat token privileges until an
+    # explicit takeown). Fall back to an empty file so the install
+    # keeps going. The empty file is only unused on a fresh install
+    # anyway (no .env.enc to decrypt).
     $VaultAgeKey = Join-Path (Get-Location) "vault-keys\age.key"
+    $copied = $false
     if (Test-Path $VaultAgeKey -PathType Leaf) {
-        Copy-Item -LiteralPath $VaultAgeKey -Destination $AgeKeyHost -Force
-    } else {
+        try {
+            Copy-Item -LiteralPath $VaultAgeKey -Destination $AgeKeyHost -Force -ErrorAction Stop
+            $copied = $true
+        } catch {
+            Write-Host "  ⚠ Could not copy vault-keys\age.key into .coderaft-age.key ($($_.Exception.Message.Trim()))." -ForegroundColor Yellow
+            Write-Host "    Falling back to an empty placeholder — SOPS re-encrypt from the dashboard will still work" -ForegroundColor Yellow
+            Write-Host "    once you copy the age key manually. Fresh installs do not need it." -ForegroundColor Yellow
+        }
+    }
+    if (-not $copied) {
         New-Item -Path $AgeKeyHost -ItemType File -Force | Out-Null
     }
 }
