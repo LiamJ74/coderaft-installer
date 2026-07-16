@@ -748,6 +748,14 @@ services:
       - default
       - coderaft-vault-net
       - docker-proxy-net
+      # B-BACKEND-NET (2026-07-16): postgres + redis live on the isolated
+      # coderaft-backend network (see PR #12). Without joining this net,
+      # dashboard-api resolves `postgres` to nothing and every DB call
+      # throws `getaddrinfo EAI_AGAIN postgres` — table bootstrap fails
+      # at startup, and every subsequent request (create-admin, save
+      # OIDC config, etc.) returns 500. Observed live 2026-07-16 during
+      # setup wizard.
+      - coderaft-backend
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
