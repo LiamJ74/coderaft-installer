@@ -258,6 +258,25 @@ function Invoke-VaultBootstrap {
     # génération de la key et toujours continuer vers TLS + config.
     if (Test-Path "vault-keys\age.key") {
         Write-Host "  ✓ Vault age key already exists — skipping key generation"
+        # B-VAULT-ACL-SELFHEAL (2026-07-16): a stale age.key left over from
+        # an earlier install may have an ACL that only grants its original
+        # creator Read, which breaks Docker Desktop bind-mount for the
+        # coderaft-vault container (`open /keys/age.key: permission
+        # denied`). Reset the ACL to inherit from the parent directory
+        # so Administrators + SYSTEM (both needed by Docker Desktop)
+        # get access again. `/reset` is idempotent and safe on a
+        # freshly-generated key.
+        try {
+            $resetOut = Join-Path $env:TEMP "coderaft-icacls-reset-out-$(Get-Random).log"
+            $resetErr = Join-Path $env:TEMP "coderaft-icacls-reset-err-$(Get-Random).log"
+            Start-Process -FilePath "icacls" `
+                -ArgumentList @("vault-keys\age.key","/reset") `
+                -NoNewWindow -Wait `
+                -RedirectStandardOutput $resetOut `
+                -RedirectStandardError  $resetErr `
+                -ErrorAction SilentlyContinue | Out-Null
+            Remove-Item -Path $resetOut,$resetErr -ErrorAction SilentlyContinue
+        } catch {}
         Invoke-VaultBootstrapTLS
         return
     }
@@ -353,14 +372,33 @@ function Invoke-VaultBootstrap {
         Write-Host "  ✗ age-keygen failed (exit $($ageProc.ExitCode))" -ForegroundColor Red
         exit 1
     }
-    # Restrict permissions (owner read-only)
-    $acl = Get-Acl "vault-keys\age.key"
-    $acl.SetAccessRuleProtection($true, $false)
-    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-        [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
-        "Read", "Allow")
-    $acl.AddAccessRule($rule)
-    Set-Acl "vault-keys\age.key" $acl -ErrorAction SilentlyContinue
+    # Restrict permissions (owner read-only) BUT keep Administrators +
+    # SYSTEM readable so Docker Desktop can bind-mount the file into the
+    # coderaft-vault container. Docker Desktop on Windows exposes host
+    # files via 9P/plan9 and enforces Windows ACL semantics — if the
+    # file only grants the user who created it, the container gets
+    # `open /keys/age.key: permission denied` even though it runs as
+    # root inside its own namespace. Same failure hits any later
+    # install that runs under a different Windows account (elevated
+    # Administrator vs. the original user).
+    # B-VAULT-ACL (2026-07-16): drop SetAccessRuleProtection so
+    # inheritance stays ON — the profile parent ACL grants
+    # Administrators + SYSTEM by default, which is what we need for
+    # Docker + cross-account admin. We still explicitly add the
+    # current user Read to cover profiles whose default ACL is
+    # locked down. Read-only for everyone means age-keygen output
+    # can't be overwritten by an unelevated process.
+    try {
+        $acl = Get-Acl "vault-keys\age.key"
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
+            "Read", "Allow")
+        $acl.AddAccessRule($rule)
+        Set-Acl "vault-keys\age.key" $acl -ErrorAction Stop
+    } catch {
+        Write-Host "  ⚠ Could not tighten ACL on vault-keys\age.key ($($_.Exception.Message.Trim()))." -ForegroundColor Yellow
+        Write-Host "    The vault will still start; inherited ACL from the parent directory applies." -ForegroundColor Yellow
+    }
 
     # ── Step 2: Compute BIP39 recovery phrase ───────────────────────────────
     # TODO (Phase 1 follow-up): verify -mnemonic-from-key sub-command exists
