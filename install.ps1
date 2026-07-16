@@ -11,28 +11,50 @@
 $ErrorActionPreference = 'Stop'
 $InstallDir = if ($env:INSTALL_DIR) { $env:INSTALL_DIR } else { 'coderaft' }
 
-# B-CWD-SANITIZE (2026-07-16): `irm | iex` inherits the caller's CWD. When
-# the user runs an elevated PowerShell (or auto-elevates via UAC) but sits
-# inside another user's profile (e.g. `PS C:\Users\ljsantos\coderaft>` in
-# an `Administrator:` window), `System.Diagnostics.Process.Start()` fails
-# to launch child processes with Win32 error 0x8007007B
-# ("La syntaxe du nom de fichier, de répertoire ou de volume est
-# incorrecte.") because the elevated account can't access the CWD to
-# resolve its own working directory. Also happens after a partial
-# `Remove-Item -Recurse -Force .` that stranded the current shell inside
-# a deleted directory, or after `icacls /reset` on a profile subfolder
-# that stripped the Administrators ACE.
-# Fix: move to the CURRENT account's USERPROFILE before anything else.
-# The install still lands in `.\coderaft\` unless INSTALL_DIR is set, so
-# behaviour under normal usage (running from the user's home) is
-# unchanged.
+# B-CWD-SANITIZE (2026-07-16): `irm | iex` inherits the caller's CWD.
+# When the user runs an elevated PowerShell (or auto-elevates via UAC)
+# from another user's profile (e.g. `PS C:\Users\ljsantos\coderaft>` in
+# an `Administrator:` window), `System.Diagnostics.Process.Start()`
+# fails to launch child processes with Win32 error 0x8007007B ("La
+# syntaxe du nom de fichier, de répertoire ou de volume est
+# incorrecte.") because CreateProcess can't use the inherited working
+# directory for the new process. Also happens after a partial
+# `Remove-Item -Recurse -Force .` (shell stranded in a deleted dir)
+# or after `icacls /reset` stripped the Administrators ACE from a
+# profile subfolder.
+#
+# We RESPECT the user's choice of install location — the install lands
+# in `.\coderaft\` (or $INSTALL_DIR) relative to the current CWD by
+# design. So we only fall back to USERPROFILE when the current CWD is
+# demonstrably unusable. Detection: try to create + delete a temp
+# file in the current directory. If the account can't do that, it
+# also can't spawn a child process with this CWD.
+$cwdUsable = $false
 try {
-    if ($env:USERPROFILE -and (Test-Path -LiteralPath $env:USERPROFILE)) {
-        Set-Location -LiteralPath $env:USERPROFILE -ErrorAction Stop
-    }
+    $cwdProbe = Join-Path (Get-Location) ".coderaft-cwd-probe-$(Get-Random)"
+    New-Item -Path $cwdProbe -ItemType File -Force -ErrorAction Stop | Out-Null
+    Remove-Item -Path $cwdProbe -Force -ErrorAction SilentlyContinue
+    $cwdUsable = $true
 } catch {
-    # Fallback to SystemDrive root if USERPROFILE itself is unreadable.
-    try { Set-Location -LiteralPath ($env:SystemDrive + '\') -ErrorAction Stop } catch {}
+    $cwdUsable = $false
+}
+if (-not $cwdUsable) {
+    Write-Host "  ⚠ Current directory ($((Get-Location).Path)) is not writable by this account." -ForegroundColor Yellow
+    Write-Host "    Falling back to $env:USERPROFILE. To install in-place instead," -ForegroundColor Yellow
+    Write-Host "    launch PowerShell under the account that owns this directory," -ForegroundColor Yellow
+    Write-Host "    or fix the ACL and re-run." -ForegroundColor Yellow
+    try {
+        if ($env:USERPROFILE -and (Test-Path -LiteralPath $env:USERPROFILE)) {
+            Set-Location -LiteralPath $env:USERPROFILE -ErrorAction Stop
+        } else {
+            Set-Location -LiteralPath ($env:SystemDrive + '\') -ErrorAction Stop
+        }
+    } catch {
+        # Last resort: SystemDrive root is world-readable on every
+        # Windows install; if even that fails the environment is
+        # broken beyond what an installer can fix.
+        try { Set-Location -LiteralPath 'C:\' -ErrorAction Stop } catch {}
+    }
 }
 
 # B-TRANSCRIPT (2026-06-23): capture full PowerShell session to a transcript
