@@ -1635,7 +1635,12 @@ if ($LASTEXITCODE -ne 0) {
 # the connections are already in place.
 Write-Host ""
 Write-Host "  Self-healing data-service networks..."
-$projectPrefix = ($env:COMPOSE_PROJECT_NAME) ? $env:COMPOSE_PROJECT_NAME : "coderaft"
+# B-PS51 (2026-07-17): PowerShell 5.1 (Windows PowerShell — default on
+# older Windows installs) does not support the `? :` ternary operator
+# (that syntax landed in PowerShell 7). Use an if/else expression which
+# parses on both 5.1 and 7+. Symptom before this fix:
+#   Unexpected token '?' in expression or statement.
+$projectPrefix = if ($env:COMPOSE_PROJECT_NAME) { $env:COMPOSE_PROJECT_NAME } else { "coderaft" }
 $backendNet  = "${projectPrefix}_coderaft-backend"
 $frontendNet = "${projectPrefix}_coderaft-frontend"
 
