@@ -25,6 +25,54 @@ HEALTHCHECK_RETRIES="${HEALTHCHECK_RETRIES:-30}"
 HEALTHCHECK_DELAY="${HEALTHCHECK_DELAY:-3}"
 INSTALL_DIR="${INSTALL_DIR:-$PWD}"
 
+# ── Argument parsing ───────────────────────────────────────────────────────
+# --product <slug>  Update ONE product only (granular update). Delegates to
+#                   the dashboard-api per-product endpoint, which snapshots
+#                   the product, pulls only its images, deploys any newly
+#                   declared service and auto-rolls-back on failure.
+#                   Clicking "Mettre à jour ce produit" in the dashboard is
+#                   the exact equivalent of `update.sh --product <slug>`.
+# Without --product: legacy behavior — full platform update (all licensed
+# products), unchanged.
+PRODUCT_SLUG="${CODERAFT_PRODUCT:-}"
+ORIG_ARGS=("$@")   # preserved for the self-update re-exec below
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --product)
+            PRODUCT_SLUG="${2:-}"
+            if [ -z "$PRODUCT_SLUG" ]; then
+                echo "ERROR: --product requires a slug (entra-audit | secaudit | redfox | mantisstrike | falconone)" >&2
+                exit 1
+            fi
+            shift 2
+            ;;
+        --product=*)
+            PRODUCT_SLUG="${1#--product=}"
+            shift
+            ;;
+        -h|--help)
+            echo "Usage: bash update.sh [--product <slug>]"
+            echo ""
+            echo "  (no flag)          Update the whole platform (all licensed products)."
+            echo "  --product <slug>   Update ONE product only via the dashboard-api"
+            echo "                     granular endpoint (per-product snapshot + auto-rollback)."
+            echo "                     Slugs: entra-audit, secaudit, redfox, mantisstrike, falconone"
+            exit 0
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+case "$PRODUCT_SLUG" in
+    ""|entra-audit|secaudit|redfox|mantisstrike|falconone) ;;
+    *)
+        echo "ERROR: unknown product slug '$PRODUCT_SLUG'" >&2
+        echo "Valid slugs: entra-audit, secaudit, redfox, mantisstrike, falconone" >&2
+        exit 1
+        ;;
+esac
+
 # ── ADMIN_TOKEN auto-discovery ────────────────────────────────────────────
 # Priority order:
 #   1. $ADMIN_TOKEN env var (already set above)
@@ -78,6 +126,82 @@ if [ -z "$ADMIN_TOKEN" ]; then
     unset discovered
 fi
 
+# ── Granular per-product update (--product <slug>) ─────────────────────────
+# Delegates the whole operation to dashboard-api:
+#   POST /api/dashboard/products/<slug>/update
+# then polls /update-status until the operation reaches a terminal state.
+# The endpoint captures a per-product snapshot first, pulls ONLY that
+# product's images, creates newly declared services, health-checks, and
+# auto-rolls-back on failure. Shared infra (postgres/redis/vault) untouched.
+if [ -n "$PRODUCT_SLUG" ]; then
+    echo ""
+    echo "  Granular update: product '$PRODUCT_SLUG' only"
+
+    if [ -z "$ADMIN_TOKEN" ]; then
+        echo "  ERROR: ADMIN_TOKEN not found — the per-product update needs the dashboard API." >&2
+        echo "  Set ADMIN_TOKEN, or ensure the dashboard-api container is running" >&2
+        echo "  (token auto-discovery reads /data/admin_token inside it)." >&2
+        exit 1
+    fi
+
+    RESP=$(curl -fsS -X POST "$DASHBOARD_API/api/dashboard/products/$PRODUCT_SLUG/update" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $ADMIN_TOKEN" \
+        -d '{"backup_data":true}' 2>&1) || {
+        echo "  ERROR: failed to start the update:" >&2
+        echo "    $RESP" >&2
+        echo "  (409 = another operation is already running; 403 = product not licensed)" >&2
+        exit 1
+    }
+    echo "  Update started. Waiting for completion (snapshot → backup → pull → recreate → health)…"
+
+    # Poll the operation status (terminal: healthy | rolled_back | rollback_failed | failed)
+    STATUS="in_progress"
+    LAST_PHASE=""
+    for _i in $(seq 1 200); do   # 200 × 3s = 10 min max
+        sleep 3
+        BODY=$(curl -fsS "$DASHBOARD_API/api/dashboard/products/$PRODUCT_SLUG/update-status" \
+            -H "Authorization: Bearer $ADMIN_TOKEN" 2>/dev/null) || continue
+        STATUS=$(printf '%s' "$BODY" | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
+        PHASE=$(printf '%s' "$BODY" | grep -o '"phase":"[^"]*"' | head -1 | cut -d'"' -f4)
+        if [ "$PHASE" != "$LAST_PHASE" ] && [ -n "$PHASE" ]; then
+            echo "    phase: $PHASE"
+            LAST_PHASE="$PHASE"
+        fi
+        [ "$STATUS" != "in_progress" ] && break
+    done
+
+    case "$STATUS" in
+        healthy)
+            echo ""
+            echo "  ✓ $PRODUCT_SLUG updated successfully — all services healthy."
+            exit 0
+            ;;
+        rolled_back)
+            echo ""
+            echo "  ✗ Update failed — automatic rollback restored the previous version." >&2
+            echo "    Details: docker compose logs, or the dashboard → Settings → Platform." >&2
+            exit 1
+            ;;
+        rollback_failed)
+            echo ""
+            echo "  ✗✗ Update AND rollback failed — manual intervention required." >&2
+            echo "     Snapshots: GET $DASHBOARD_API/api/dashboard/products/$PRODUCT_SLUG/snapshots" >&2
+            exit 2
+            ;;
+        failed)
+            echo ""
+            echo "  ✗ Update failed before any service was modified (e.g. backup failure)." >&2
+            exit 1
+            ;;
+        *)
+            echo ""
+            echo "  ? Update still running after 10 min — check the dashboard for live status." >&2
+            exit 1
+            ;;
+    esac
+fi
+
 # ── Docker platform detection ──────────────────────────────────────────────
 # Docker Desktop on Mac M-series resolves strictly to linux/arm64/v8 by
 # default, which fails on manifests that only expose linux/arm64. Same goes
@@ -119,7 +243,7 @@ if [ -z "$CODERAFT_UPDATE_REEXEC" ]; then
         echo ""
         sleep 1
         export CODERAFT_UPDATE_REEXEC=1
-        exec bash ./update.sh "$@"
+        exec bash ./update.sh "${ORIG_ARGS[@]}"
     fi
 fi
 

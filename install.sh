@@ -614,17 +614,26 @@ cat > docker-compose.yml << 'COMPOSE'
 # Products are deployed by the dashboard after license activation.
 
 services:
-  # Caddy local HTTPS reverse proxy.
-  # Terminates TLS using mkcert-generated certs (trusted locally) and forwards
-  # to the nginx SPA inside the `dashboard` container. Falls back to plain
-  # HTTP on :3000 if no certs are mounted (compat retrograde).
+  # Caddy HTTPS reverse proxy.
+  # TLS mode is env-driven (Setup Wizard → dashboard-api writes .env and
+  # recreates this service):
+  #   internal (default) — Caddy's own CA signs the cert (replaces mkcert,
+  #                        2026-07). CA root lives in the caddy_data volume:
+  #                        PRESERVE that volume or agents lose trust.
+  #   wildcard           — customer cert uploaded to ./caddy_certs/
+  #   acme               — Let's Encrypt (public deployments)
   caddy:
     image: caddy:2-alpine
     depends_on:
       dashboard: { condition: service_started }
     ports:
-      - "127.0.0.1:443:443"
-      - "127.0.0.1:80:80"
+      # CADDY_BIND_ADDR is widened to 0.0.0.0 by the Exposure wizard step.
+      - "${CADDY_BIND_ADDR:-127.0.0.1}:443:443"
+      - "${CADDY_BIND_ADDR:-127.0.0.1}:80:80"
+    environment:
+      - CODERAFT_HOSTNAME=${CODERAFT_HOSTNAME:-coderaft.local}
+      - CODERAFT_TLS_SITES=${CODERAFT_TLS_SITES:-coderaft.local, *.coderaft.local}
+      - CADDY_TLS_MODE_ARGS=${CADDY_TLS_MODE_ARGS:-internal}
     volumes:
       - ./caddy_certs:/certs:ro
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
@@ -687,6 +696,16 @@ services:
       # with a `Binds:[/:/host]` (privileged mount) or POST /exec, both
       # still blocked here.
       VOLUMES: 1
+      # F-003 follow-up 2 (2026-07-22): `docker compose pull` on a multi-arch
+      # image (mandatory for every Coderaft product image) queries
+      # GET /distribution/{name}/json to resolve the manifest for the local
+      # platform BEFORE pulling. That endpoint is its own ACL category in
+      # docker-socket-proxy — gated purely by GET, independent of POST — so
+      # without it every per-product update failed with
+      # "docker compose failed (code 1): denied" even though IMAGES=1 and
+      # POST=1 were already set. Read-only manifest metadata, same exposure
+      # class as IMAGES=1: no RCE surface, EXEC/SECRETS/SWARM/NODES stay 0.
+      DISTRIBUTION: 1
       EXEC: 0
       SECRETS: 0
       SWARM: 0
@@ -863,34 +882,49 @@ volumes:
   vault_data:
 COMPOSE
 
-# ── Caddyfile (local HTTPS) ──────────────────────────────────────────────────
-# If mkcert-generated certs exist in ./caddy_certs, Caddy will serve HTTPS
-# on https://coderaft.local (trusted, no browser warning). Otherwise it
-# silently no-ops and the user keeps using http://localhost:3000.
+# ── Caddyfile (env-templated TLS: internal CA / wildcard / ACME) ─────────────
+# The TLS mode is driven by env placeholders resolved at Caddy start:
+#   CODERAFT_TLS_SITES   site list (apex only in ACME mode — HTTP-01 cannot
+#                        issue wildcards)
+#   CADDY_TLS_MODE_ARGS  "internal" | "/certs/wildcard.crt /certs/wildcard.key"
+#                        | "<acme-contact-email>"
+# dashboard-api (Setup Wizard → TLS step) updates .env and recreates caddy.
+#
+# Migration 2026-07: mkcert removed. A legacy Caddyfile referencing
+# coderaft.local.pem is backed up and regenerated (the old mkcert certs in
+# caddy_certs/ are simply ignored by the new template).
+if [ -f Caddyfile ] && grep -q "coderaft.local.pem" Caddyfile 2>/dev/null; then
+    echo "  Migrating legacy mkcert Caddyfile → Caddy internal CA (backup: Caddyfile.mkcert.bak)"
+    mv Caddyfile Caddyfile.mkcert.bak
+fi
 if [ ! -f Caddyfile ]; then
     cat > Caddyfile << 'CADDY'
 {
-    # Disable Caddy's automatic public ACME issuance — we use mkcert for local trust.
-    auto_https off
+    # Admin API stays off (security). auto_https stays ON: Caddy manages the
+    # certificate for the configured sites (internal CA by default).
     admin off
+    servers {
+        # Trust X-Forwarded-* from private-range proxies (Exposure step:
+        # "external reverse proxy" mode).
+        trusted_proxies static private_ranges
+    }
 }
 
-# Local HTTPS via mkcert. Add to /etc/hosts:
-#   127.0.0.1 coderaft.local entraguard.coderaft.local ravenscan.coderaft.local redfox.coderaft.local
-(coderaft_tls) {
-    tls /certs/coderaft.local.pem /certs/coderaft.local-key.pem
-}
-
-https://coderaft.local, https://*.coderaft.local {
-    import coderaft_tls
+# Platform sites. TLS mode injected from .env by the Setup Wizard:
+#   internal (default) — Caddy self-signed CA (root.crt downloadable from
+#                        the dashboard: Setup → TLS → Download CA / GPO pack)
+#   wildcard           — tls /certs/wildcard.crt /certs/wildcard.key
+#   acme               — tls <email> (Let's Encrypt, public deployments)
+{$CODERAFT_TLS_SITES:coderaft.local, *.coderaft.local} {
+    tls {$CADDY_TLS_MODE_ARGS:internal}
     reverse_proxy dashboard:3000 {
         header_up X-Forwarded-Proto https
         header_up X-Forwarded-Host {host}
     }
 }
 
-# HTTP → HTTPS redirect for the same hosts
-http://coderaft.local, http://*.coderaft.local {
+# HTTP → HTTPS redirect for the platform hostnames
+http://{$CODERAFT_HOSTNAME:coderaft.local}, http://*.{$CODERAFT_HOSTNAME:coderaft.local} {
     redir https://{host}{uri} permanent
 }
 
@@ -901,86 +935,77 @@ http://coderaft.local, http://*.coderaft.local {
     reverse_proxy dashboard:3000
 }
 CADDY
-    echo "  ✓ Caddyfile generated"
+    echo "  ✓ Caddyfile generated (TLS: Caddy internal CA)"
 fi
 
-# ── mkcert local HTTPS setup ────────────────────────────────────────────────
-# We generate a locally-trusted cert for coderaft.local + wildcard. mkcert
-# installs a root CA into the OS / browser trust stores (one-time per machine).
-# Failure is non-fatal: the platform stays usable on http://localhost:3000.
-setup_local_https() {
+# ── Trust the Caddy internal CA (replaces mkcert, 2026-07) ──────────────────
+# Caddy (`tls internal`) generates a root CA on first start, stored in the
+# caddy_data volume — NEVER delete that volume between installs, or every
+# endpoint/agent that trusted the old CA breaks. We export root.crt and add
+# it to the OS trust store. Failure is non-fatal (dashboard also serves the
+# CA + a GPO push package: Setup → TLS).
+trust_caddy_ca() {
     if [ "${CODERAFT_SKIP_HTTPS:-0}" = "1" ]; then
-        echo "  CODERAFT_SKIP_HTTPS=1 — skipping local HTTPS setup"
+        echo "  CODERAFT_SKIP_HTTPS=1 — skipping CA trust setup"
         return 0
     fi
 
-    mkdir -p caddy_certs
-
-    # Reuse certs if already present and < 80 days old (mkcert default 825d, we
-    # rotate generously well before expiry).
-    if [ -f caddy_certs/coderaft.local.pem ] && [ -f caddy_certs/coderaft.local-key.pem ]; then
-        if find caddy_certs/coderaft.local.pem -mtime -80 2>/dev/null | grep -q .; then
-            echo "  ✓ Local HTTPS certs already present (caddy_certs/)"
-            return 0
+    local ca_container_path="/data/caddy/pki/authorities/local/root.crt"
+    echo "  Waiting for Caddy to generate its internal CA (max 30s)…"
+    local i ca_ready=0
+    for i in $(seq 1 15); do
+        if docker compose exec -T caddy test -f "$ca_container_path" >/dev/null 2>&1; then
+            ca_ready=1
+            break
         fi
-        echo "  Local HTTPS certs older than 80 days — regenerating"
-    fi
-
-    if ! command -v mkcert &>/dev/null; then
-        echo "  mkcert not found."
-        case "${CODERAFT_OS}" in
-            macos)
-                if command -v brew &>/dev/null; then
-                    echo "  Installing mkcert via Homebrew (brew install mkcert nss)…"
-                    brew install mkcert nss >/dev/null 2>&1 || {
-                        echo "  ⚠ brew install mkcert failed — fallback to http://localhost:3000"
-                        return 1
-                    }
-                else
-                    echo "  ⚠ Homebrew not installed — install mkcert manually:"
-                    echo "      https://github.com/FiloSottile/mkcert#installation"
-                    echo "    Continuing in HTTP-only mode (http://localhost:3000)."
-                    return 1
-                fi
-                ;;
-            linux)
-                if command -v apt-get &>/dev/null; then
-                    echo "  Installing mkcert via apt…"
-                    sudo apt-get update -qq >/dev/null 2>&1 || true
-                    sudo apt-get install -y libnss3-tools mkcert >/dev/null 2>&1 || {
-                        echo "  ⚠ apt install mkcert failed — fallback to http://localhost:3000"
-                        return 1
-                    }
-                else
-                    echo "  ⚠ Auto-install mkcert only supported via apt — install manually:"
-                    echo "      https://github.com/FiloSottile/mkcert#installation"
-                    echo "    Continuing in HTTP-only mode (http://localhost:3000)."
-                    return 1
-                fi
-                ;;
-            *)
-                echo "  ⚠ Unsupported OS for mkcert auto-install — HTTP-only mode."
-                return 1
-                ;;
-        esac
-    fi
-
-    echo "  Installing mkcert local CA (one-time, may prompt for sudo)…"
-    mkcert -install >/dev/null 2>&1 || {
-        echo "  ⚠ mkcert -install failed — local HTTPS will not be trusted."
-    }
-
-    echo "  Generating local cert for coderaft.local…"
-    mkcert \
-        -cert-file caddy_certs/coderaft.local.pem \
-        -key-file  caddy_certs/coderaft.local-key.pem \
-        coderaft.local "*.coderaft.local" localhost 127.0.0.1 ::1 >/dev/null 2>&1 || {
-        echo "  ⚠ mkcert cert generation failed — fallback to http://localhost:3000"
-        rm -f caddy_certs/coderaft.local.pem caddy_certs/coderaft.local-key.pem
+        sleep 2
+    done
+    if [ "$ca_ready" = "0" ]; then
+        echo "  ⚠ Caddy CA not found after 30s — browsers will warn on https://coderaft.local."
+        echo "    Download it later from the dashboard: Setup → TLS → Download CA."
         return 1
-    }
-    chmod 600 caddy_certs/coderaft.local-key.pem
-    echo "  ✓ Local HTTPS cert generated (valid 825d)"
+    fi
+
+    if ! docker compose cp "caddy:${ca_container_path}" caddy-root.crt >/dev/null 2>&1; then
+        echo "  ⚠ Could not export the Caddy root CA — skipping trust install."
+        return 1
+    fi
+
+    echo "  Installing the Coderaft root CA into the system trust store (may prompt for sudo)…"
+    case "${CODERAFT_OS}" in
+        macos)
+            if sudo security add-trusted-cert -d -r trustRoot \
+                -k /Library/Keychains/System.keychain caddy-root.crt >/dev/null 2>&1; then
+                echo "  ✓ CA trusted (System keychain)"
+            else
+                echo "  ⚠ Could not add the CA to the System keychain — trust it manually:"
+                echo "      sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain caddy-root.crt"
+            fi
+            ;;
+        linux)
+            if [ -d /usr/local/share/ca-certificates ] && command -v update-ca-certificates &>/dev/null; then
+                if sudo cp caddy-root.crt /usr/local/share/ca-certificates/coderaft-caddy-root.crt >/dev/null 2>&1 \
+                    && sudo update-ca-certificates >/dev/null 2>&1; then
+                    echo "  ✓ CA trusted (update-ca-certificates)"
+                else
+                    echo "  ⚠ update-ca-certificates failed — trust caddy-root.crt manually."
+                fi
+            elif [ -d /etc/pki/ca-trust/source/anchors ] && command -v update-ca-trust &>/dev/null; then
+                if sudo cp caddy-root.crt /etc/pki/ca-trust/source/anchors/coderaft-caddy-root.crt >/dev/null 2>&1 \
+                    && sudo update-ca-trust >/dev/null 2>&1; then
+                    echo "  ✓ CA trusted (update-ca-trust)"
+                else
+                    echo "  ⚠ update-ca-trust failed — trust caddy-root.crt manually."
+                fi
+            else
+                echo "  ⚠ No known CA trust tool found — trust caddy-root.crt manually."
+            fi
+            echo "    Note: Firefox uses its own store — enable security.enterprise_roots.enabled."
+            ;;
+        *)
+            echo "  ⚠ Unknown OS — trust caddy-root.crt manually."
+            ;;
+    esac
 }
 
 # ── /etc/hosts entries ──────────────────────────────────────────────────────
@@ -1010,17 +1035,16 @@ ensure_hosts_entry() {
     fi
 }
 
-setup_local_https || true
-if [ -f caddy_certs/coderaft.local.pem ]; then
-    ensure_hosts_entry || true
-fi
+# Hosts entry no longer depends on mkcert certs — coderaft.local must resolve
+# for the default (internal CA) TLS mode to be reachable by name.
+ensure_hosts_entry || true
 
 # Helper scripts
 cat > start.sh << 'EOF'
 #!/bin/bash
 echo "Starting CodeRaft..."
 docker compose up -d
-if [ -f caddy_certs/coderaft.local.pem ] && grep -q "coderaft.local" /etc/hosts 2>/dev/null; then
+if grep -q "coderaft.local" /etc/hosts 2>/dev/null; then
     echo "  Dashboard: https://coderaft.local"
 else
     echo "  Dashboard: http://localhost:3000"
@@ -1217,6 +1241,10 @@ else
     }
 
     echo ""
+    echo "  Setting up HTTPS trust (Caddy internal CA)..."
+    trust_caddy_ca || true
+
+    echo ""
     echo "  Waiting for dashboard to be ready..."
     sleep 10
 fi
@@ -1240,7 +1268,7 @@ if [ "${SKIP_NATIVE_CAPTURE:-0}" = "1" ]; then
 fi
 
 DASHBOARD_URL="http://localhost:3000"
-if [ -f caddy_certs/coderaft.local.pem ] && grep -q "coderaft.local" /etc/hosts 2>/dev/null; then
+if grep -q "coderaft.local" /etc/hosts 2>/dev/null; then
     DASHBOARD_URL="https://coderaft.local"
 fi
 

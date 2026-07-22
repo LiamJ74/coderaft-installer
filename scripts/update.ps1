@@ -4,8 +4,29 @@
 # snapshot, pulls new images, runs a post-update healthcheck and triggers
 # rollback.ps1 automatically if the dashboard API doesn't come back up.
 # Mirrors the logic of update.sh (Linux) with Windows adaptations.
+#
+# Granular per-product update:
+#   .\update.ps1 -Product falconone       (or $env:CODERAFT_PRODUCT="falconone")
+# delegates to POST /api/dashboard/products/<slug>/update on dashboard-api
+# (per-product snapshot, pull only that product's images, auto-deploy of
+# newly declared services, auto-rollback on failure). Without -Product,
+# the legacy full-platform update runs unchanged. Equivalent of clicking
+# "Mettre à jour ce produit" in the dashboard, and of `update.sh --product`.
+
+param(
+    [string]$Product = ""
+)
 
 $ErrorActionPreference = "Stop"
+
+# -Product param wins; env var fallback for `iex (irm ...)` invocations
+# where parameters cannot be passed.
+$PRODUCT_SLUG = if ($Product) { $Product } elseif ($env:CODERAFT_PRODUCT) { $env:CODERAFT_PRODUCT } else { "" }
+if ($PRODUCT_SLUG -and ($PRODUCT_SLUG -notin @("entra-audit", "secaudit", "redfox", "mantisstrike", "falconone"))) {
+    Write-Host "ERROR: unknown product slug '$PRODUCT_SLUG'" -ForegroundColor Red
+    Write-Host "Valid slugs: entra-audit, secaudit, redfox, mantisstrike, falconone"
+    exit 1
+}
 
 $DASHBOARD_API       = if ($env:DASHBOARD_API)       { $env:DASHBOARD_API }       else { "http://localhost:3000" }
 $ADMIN_TOKEN         = if ($env:ADMIN_TOKEN)         { $env:ADMIN_TOKEN }         else { "" }
@@ -13,6 +34,19 @@ $BACKUP_DIR          = if ($env:BACKUP_DIR)          { $env:BACKUP_DIR }        
 $HEALTHCHECK_RETRIES = if ($env:HEALTHCHECK_RETRIES) { [int]$env:HEALTHCHECK_RETRIES } else { 30 }
 $HEALTHCHECK_DELAY   = if ($env:HEALTHCHECK_DELAY)   { [int]$env:HEALTHCHECK_DELAY }   else { 3 }
 $INSTALL_DIR         = if ($env:INSTALL_DIR)         { $env:INSTALL_DIR }         else { (Get-Location).Path }
+
+# ── Windows Defender exclusion ───────────────────────────────────────────
+# `docker compose pull` writes fresh signed binaries into the install dir
+# on every update. Defender can quarantine a just-pulled executable mid-
+# recreate, leaving the stack half-deployed. Re-asserting the exclusion at
+# each update run keeps it in effect (Defender occasionally clears manual
+# exclusions on cumulative updates). Requires elevation — silent-skip if
+# absent (Server Core, 3rd-party AV, or non-admin re-run).
+try {
+    Add-MpPreference -ExclusionPath $INSTALL_DIR -ErrorAction Stop 2>$null
+} catch {
+    # Defender missing / not elevated / already excluded — ignore.
+}
 
 # ── ADMIN_TOKEN auto-discovery ────────────────────────────────────────────
 # Priority order:
@@ -94,6 +128,81 @@ if (-not $ADMIN_TOKEN) {
     $discovered = Find-AdminToken
     if ($discovered) { $ADMIN_TOKEN = $discovered }
     Remove-Variable -Name discovered -ErrorAction SilentlyContinue
+}
+
+# ── Granular per-product update (-Product <slug>) ──────────────────────────
+# Delegates the whole operation to dashboard-api, then polls the status.
+# Shared infra (postgres/redis/vault) is never touched by this path.
+if ($PRODUCT_SLUG) {
+    Write-Host ""
+    Write-Host "  Granular update: product '$PRODUCT_SLUG' only"
+
+    if (-not $ADMIN_TOKEN) {
+        Write-Host "  ERROR: ADMIN_TOKEN not found - the per-product update needs the dashboard API." -ForegroundColor Red
+        Write-Host "  Set `$env:ADMIN_TOKEN, or ensure the dashboard-api container is running."
+        exit 1
+    }
+
+    $headers = @{ Authorization = "Bearer $ADMIN_TOKEN"; "Content-Type" = "application/json" }
+    try {
+        Invoke-RestMethod -Method Post `
+            -Uri "$DASHBOARD_API/api/dashboard/products/$PRODUCT_SLUG/update" `
+            -Headers $headers `
+            -Body '{"backup_data":true}' `
+            -TimeoutSec 30 | Out-Null
+    } catch {
+        Write-Host "  ERROR: failed to start the update: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "  (409 = another operation is already running; 403 = product not licensed)"
+        exit 1
+    }
+    Write-Host "  Update started. Waiting for completion (snapshot -> backup -> pull -> recreate -> health)..."
+
+    $status = "in_progress"
+    $lastPhase = ""
+    for ($i = 0; $i -lt 200; $i++) {   # 200 x 3s = 10 min max
+        Start-Sleep -Seconds 3
+        try {
+            $op = Invoke-RestMethod -Method Get `
+                -Uri "$DASHBOARD_API/api/dashboard/products/$PRODUCT_SLUG/update-status" `
+                -Headers @{ Authorization = "Bearer $ADMIN_TOKEN" } `
+                -TimeoutSec 10
+            $status = $op.status
+            if ($op.phase -and $op.phase -ne $lastPhase) {
+                Write-Host "    phase: $($op.phase)"
+                $lastPhase = $op.phase
+            }
+            if ($status -ne "in_progress") { break }
+        } catch { }
+    }
+
+    switch ($status) {
+        "healthy" {
+            Write-Host ""
+            Write-Host "  [OK] $PRODUCT_SLUG updated successfully - all services healthy." -ForegroundColor Green
+            exit 0
+        }
+        "rolled_back" {
+            Write-Host ""
+            Write-Host "  [FAIL] Update failed - automatic rollback restored the previous version." -ForegroundColor Red
+            exit 1
+        }
+        "rollback_failed" {
+            Write-Host ""
+            Write-Host "  [CRITICAL] Update AND rollback failed - manual intervention required." -ForegroundColor Red
+            Write-Host "  Snapshots: GET $DASHBOARD_API/api/dashboard/products/$PRODUCT_SLUG/snapshots"
+            exit 2
+        }
+        "failed" {
+            Write-Host ""
+            Write-Host "  [FAIL] Update failed before any service was modified (e.g. backup failure)." -ForegroundColor Red
+            exit 1
+        }
+        default {
+            Write-Host ""
+            Write-Host "  [?] Update still running after 10 min - check the dashboard for live status." -ForegroundColor Yellow
+            exit 1
+        }
+    }
 }
 
 # Detect the current PowerShell binary (compat PS5 'powershell.exe' + PS7 'pwsh.exe')
@@ -1618,6 +1727,40 @@ if ($LASTEXITCODE -ne 0) {
 if ($LASTEXITCODE -ne 0) {
     Write-Host "  ERROR: docker compose up failed."
     exit 1
+}
+
+# ── #137 fix: refresh certs/server-ca.pem from Caddy internal CA ─────────
+# entraguard-api mounts certs/server-ca.pem into the container and hands
+# it to endpoint agents at /register (as `ca_cert`) so agents can verify
+# the Caddy front cert on their report loop. Any operator that ran an
+# install BEFORE this fix landed has no server-ca.pem — refresh it every
+# update so the file exists (idempotent, non-fatal on failure).
+Write-Host "  Refreshing certs\server-ca.pem from Caddy internal CA…"
+try {
+    New-Item -ItemType Directory -Force -Path (Join-Path (Get-Location) "certs") | Out-Null
+    $caContainerPath = "/data/caddy/pki/authorities/local/root.crt"
+    $ok = $false
+    for ($i = 0; $i -lt 20; $i++) {
+        & docker @ComposeArgs exec -T caddy test -f $caContainerPath 2>$null
+        if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+        Start-Sleep -Seconds 2
+    }
+    if ($ok) {
+        $caLocal = Join-Path (Get-Location) "certs\server-ca.pem"
+        & docker @ComposeArgs cp "caddy:$caContainerPath" $caLocal 2>$null
+        if ($LASTEXITCODE -eq 0 -and (Test-Path $caLocal)) {
+            Write-Host "  ✓ certs\server-ca.pem refreshed (entraguard-api will pick it up on next call)"
+            # Restart entraguard-api so the (bind-mounted) new CA is
+            # visible without waiting for the next container recreate.
+            & docker @ComposeArgs restart entraguard-api 2>$null | Out-Null
+        } else {
+            Write-Host "  ⚠ docker cp for Caddy CA failed (exit $LASTEXITCODE)" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "  ⚠ Caddy CA not found after 40s — endpoint agents may see x509 errors until it's exported." -ForegroundColor Yellow
+    }
+} catch {
+    Write-Host "  ⚠ CA refresh skipped: $($_.Exception.Message)" -ForegroundColor Yellow
 }
 
 # ── B-NETWORK-HEAL (2026-06-24) ───────────────────────────────────────────

@@ -62,6 +62,10 @@ in `./vault-tls/`:
 | `entraguard-client.{crt,key}` | WolfGuard client cert (azure_*, license_key, entraguard_*) |
 | `ravenscan-client.{crt,key}` | Ravenscan client cert (ravenscan_*, neo4j_*) |
 | `redfox-client.{crt,key}` | RedFox client cert (redfox_*) |
+| `mantisstrike-client.{crt,key}` | MantisStrike client cert (mantisstrike_*) — generated when product activated |
+| `falconone-client.{crt,key}` | FalconOne client cert (falconone_*) — generated when product activated |
+
+All 5 products also receive `read:platform/identity/oidc` ACL permission — see [Platform Identity Architecture](../../coderaft-platform/docs/identity-architecture.md).
 
 ACL rules live in `./vault-config/acl.yaml`.
 

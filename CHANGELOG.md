@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — TLS : mkcert supprimé, Caddy internal CA (2026-07-20)
+- **mkcert retiré entièrement** (`install.sh` + `install.ps1`) : plus de
+  cascade winget→choco→scoop→GitHub Release. Caddy génère lui-même son CA
+  (`tls internal`) au premier démarrage, dans le volume `caddy_data`
+  (**à préserver entre installs** — sinon les endpoints qui trustaient
+  l'ancien CA cassent).
+- Caddyfile **templatisé par env vars** : `CODERAFT_TLS_SITES`,
+  `CADDY_TLS_MODE_ARGS` (`internal` | `/certs/wildcard.crt /certs/wildcard.key`
+  | `<email ACME>`), `CODERAFT_HOSTNAME`, `CADDY_BIND_ADDR`. Les 3 modes TLS
+  (auto-signé / wildcard client / Let's Encrypt) se pilotent depuis le
+  Setup Wizard du dashboard (dashboard-api réécrit `.env` et recrée caddy).
+- Après `docker compose up` : attente (30 s max) de
+  `/data/caddy/pki/authorities/local/root.crt`, export via
+  `docker compose cp`, installation dans le trust store OS
+  (Import-Certificate / security add-trusted-cert / update-ca-certificates).
+- Migration : un Caddyfile legacy référençant `coderaft.local.pem` est
+  backupé en `Caddyfile.mkcert.bak` puis regénéré.
+- Nouveau test d'intégration : `tests/test-tls-caddy-modes.sh` (validation
+  des 3 modes + handshake TLS live contre caddy:2-alpine réel).
+- Docs : `docs/local-https.md` réécrit (internal CA, GPO/Intune push,
+  troubleshooting).
+
 ### Fixed — Windows install (2026-07-16)
 - `install.ps1` : `docker-proxy` ACL `VOLUMES: 1` (au lieu de `0`) — sans ça
   `docker compose up` échoue avec `403 PR--` sur `/volumes/*` quand

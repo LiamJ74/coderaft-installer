@@ -190,6 +190,21 @@ Write-Host "  Installing to: $InstallDir"
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 Set-Location $InstallDir
 
+# Windows Defender: exclude the install dir up-front. Docker Compose extracts
+# encrypted secrets (age keys, vault TLS bundles) and lays out product binaries
+# under this path — without the exclusion, Defender may quarantine a fresh
+# signed executable mid-pull and leave the stack half-deployed. Requires the
+# elevated context we already have (self-elevation happens earlier). Wrapped in
+# try/catch so a Defender-less system (Server Core, 3rd-party AV, etc.) still
+# installs cleanly.
+try {
+    $Absolute = (Get-Location).Path
+    Add-MpPreference -ExclusionPath $Absolute -ErrorAction Stop
+    Write-Host "  Windows Defender exclusion added for $Absolute"
+} catch {
+    Write-Host "  (Windows Defender exclusion skipped: $_)"
+}
+
 function New-HexSecret($length) {
     $bytes = New-Object byte[] $length
     [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
@@ -662,17 +677,26 @@ $Compose = @'
 # Products are deployed by the dashboard after license activation.
 
 services:
-  # Caddy local HTTPS reverse proxy.
-  # Terminates TLS using mkcert-generated certs (trusted locally) and forwards
-  # to the nginx SPA inside the `dashboard` container. Falls back to plain
-  # HTTP on :3000 if no certs are mounted (compat retrograde).
+  # Caddy HTTPS reverse proxy.
+  # TLS mode is env-driven (Setup Wizard → dashboard-api writes .env and
+  # recreates this service):
+  #   internal (default) — Caddy's own CA signs the cert (replaces mkcert,
+  #                        2026-07). CA root lives in the caddy_data volume:
+  #                        PRESERVE that volume or agents lose trust.
+  #   wildcard           — customer cert uploaded to ./caddy_certs/
+  #   acme               — Let's Encrypt (public deployments)
   caddy:
     image: caddy:2-alpine
     depends_on:
       dashboard: { condition: service_started }
     ports:
-      - "127.0.0.1:443:443"
-      - "127.0.0.1:80:80"
+      # CADDY_BIND_ADDR is widened to 0.0.0.0 by the Exposure wizard step.
+      - "${CADDY_BIND_ADDR:-127.0.0.1}:443:443"
+      - "${CADDY_BIND_ADDR:-127.0.0.1}:80:80"
+    environment:
+      - CODERAFT_HOSTNAME=${CODERAFT_HOSTNAME:-coderaft.local}
+      - CODERAFT_TLS_SITES=${CODERAFT_TLS_SITES:-coderaft.local, *.coderaft.local}
+      - CADDY_TLS_MODE_ARGS=${CADDY_TLS_MODE_ARGS:-internal}
     volumes:
       - ./caddy_certs:/certs:ro
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
@@ -726,6 +750,11 @@ services:
       # POST /containers/create with a `Binds:[/:/host]` (privileged mount)
       # or POST /exec, both still blocked here. Safe to open.
       VOLUMES: 1
+      # #Y1 fix (2026-07-22): DISTRIBUTION=1 required for `docker compose pull`
+      # multi-arch. It calls GET /distribution/{name}/json to resolve the right
+      # platform manifest before pulling. Read-only registry metadata — same
+      # exposure class as IMAGES=1 already granted. EXEC/SECRETS/SWARM stay 0.
+      DISTRIBUTION: 1
       EXEC: 0
       SECRETS: 0
       SWARM: 0
@@ -900,156 +929,121 @@ volumes:
 '@
 [System.IO.File]::WriteAllText("$(Get-Location)\docker-compose.yml", $Compose, [System.Text.UTF8Encoding]::new($false))
 
-# ── Caddyfile (local HTTPS) ──────────────────────────────────────────────────
+# ── Caddyfile (env-templated TLS: internal CA / wildcard / ACME) ─────────────
+# TLS mode is driven by env placeholders resolved at Caddy start:
+#   CODERAFT_TLS_SITES   site list (apex only in ACME mode)
+#   CADDY_TLS_MODE_ARGS  "internal" | "/certs/wildcard.crt /certs/wildcard.key"
+#                        | "<acme-contact-email>"
+# dashboard-api (Setup Wizard → TLS step) updates .env and recreates caddy.
 $Caddyfile = @'
 {
-    auto_https off
+    # Admin API stays off (security). auto_https stays ON: Caddy manages the
+    # certificate for the configured sites (internal CA by default).
     admin off
+    servers {
+        # Trust X-Forwarded-* from private-range proxies (Exposure step:
+        # "external reverse proxy" mode).
+        trusted_proxies static private_ranges
+    }
 }
 
-(coderaft_tls) {
-    tls /certs/coderaft.local.pem /certs/coderaft.local-key.pem
-}
-
-https://coderaft.local, https://*.coderaft.local {
-    import coderaft_tls
+# Platform sites. TLS mode injected from .env by the Setup Wizard.
+{$CODERAFT_TLS_SITES:coderaft.local, *.coderaft.local} {
+    tls {$CADDY_TLS_MODE_ARGS:internal}
     reverse_proxy dashboard:3000 {
         header_up X-Forwarded-Proto https
         header_up X-Forwarded-Host {host}
     }
 }
 
-http://coderaft.local, http://*.coderaft.local {
+# HTTP → HTTPS redirect for the platform hostnames
+http://{$CODERAFT_HOSTNAME:coderaft.local}, http://*.{$CODERAFT_HOSTNAME:coderaft.local} {
     redir https://{host}{uri} permanent
 }
 
+# Fallback: anything else (IP access, localhost) stays plain HTTP.
 :80 {
     reverse_proxy dashboard:3000
 }
 '@
-if (-not (Test-Path "$(Get-Location)\Caddyfile")) {
-    [System.IO.File]::WriteAllText("$(Get-Location)\Caddyfile", $Caddyfile, [System.Text.UTF8Encoding]::new($false))
-    Write-Host "  ✓ Caddyfile generated"
+# Migration 2026-07: mkcert removed. A legacy Caddyfile referencing
+# coderaft.local.pem is backed up and regenerated.
+$CaddyfilePath = "$(Get-Location)\Caddyfile"
+if ((Test-Path $CaddyfilePath) -and (Select-String -Path $CaddyfilePath -Pattern "coderaft\.local\.pem" -Quiet)) {
+    Write-Host "  Migrating legacy mkcert Caddyfile -> Caddy internal CA (backup: Caddyfile.mkcert.bak)"
+    Move-Item -Force $CaddyfilePath "$(Get-Location)\Caddyfile.mkcert.bak"
+}
+if (-not (Test-Path $CaddyfilePath)) {
+    [System.IO.File]::WriteAllText($CaddyfilePath, $Caddyfile, [System.Text.UTF8Encoding]::new($false))
+    Write-Host "  ✓ Caddyfile generated (TLS: Caddy internal CA)"
 }
 
-# ── Local HTTPS via mkcert ───────────────────────────────────────────────────
-function Setup-LocalHttps {
+# ── Trust the Caddy internal CA (replaces mkcert, 2026-07) ───────────────────
+# Caddy (`tls internal`) generates a root CA on first start, stored in the
+# caddy_data volume — NEVER delete that volume between installs, or every
+# endpoint/agent that trusted the old CA breaks. We export root.crt and
+# import it into the Windows LocalMachine\Root store (single UAC prompt when
+# not elevated). Failure is non-fatal: the dashboard also serves the CA and
+# a GPO push package (Setup → TLS).
+function Install-CaddyRootCA {
     if ($env:CODERAFT_SKIP_HTTPS -eq "1") {
-        Write-Host "  CODERAFT_SKIP_HTTPS=1 — skipping local HTTPS setup"
+        Write-Host "  CODERAFT_SKIP_HTTPS=1 — skipping CA trust setup"
         return $false
     }
 
-    New-Item -ItemType Directory -Force -Path "caddy_certs" | Out-Null
-
-    $certPath = "caddy_certs\coderaft.local.pem"
-    $keyPath  = "caddy_certs\coderaft.local-key.pem"
-    if ((Test-Path $certPath) -and (Test-Path $keyPath)) {
-        $age = (Get-Date) - (Get-Item $certPath).LastWriteTime
-        if ($age.TotalDays -lt 80) {
-            Write-Host "  ✓ Local HTTPS certs already present (caddy_certs\)" -ForegroundColor Green
-            return $true
-        }
-        Write-Host "  Local HTTPS certs older than 80 days — regenerating"
+    # B20-style native-command handling: Start-Process with split
+    # stdout/stderr files (PS 5.1 surfaces native stderr as red
+    # NativeCommandError otherwise). Exit code via -PassThru.
+    function Invoke-DockerExitCode {
+        param([string[]]$Arguments)
+        $out = Join-Path $env:TEMP "coderaft-ca-out-$(Get-Random).log"
+        $err = Join-Path $env:TEMP "coderaft-ca-err-$(Get-Random).log"
+        $proc = Start-Process -FilePath "docker" -ArgumentList $Arguments `
+            -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput $out `
+            -RedirectStandardError $err `
+            -ErrorAction SilentlyContinue
+        Remove-Item -Path $out,$err -ErrorAction SilentlyContinue
+        if ($proc) { return $proc.ExitCode } else { return 1 }
     }
 
-    if (-not (Get-Command mkcert -ErrorAction SilentlyContinue)) {
-        Write-Host "  mkcert not found."
-        # B-MKCERT-PM (2026-06-09): `*> $null` does not suppress native-command
-        # stderr in PS 5.1. Use Start-Process with split stdout/stderr files
-        # (compat PS 5.1 + 7) for winget, choco, scoop.
-        # B-MKCERT-WINGET (2026-07-16): winget is bundled with Windows 10/11
-        # (App Installer, native, no elevation for --scope user) so it works
-        # on stock Windows where choco/scoop are absent. Try it first — if
-        # it isn't there we fall through to choco → scoop → manual → GitHub
-        # release binary fallback. On the user's install 2026-07-16 choco
-        # install failed and neither winget nor scoop was tried, leaving
-        # Caddy crashing forever with `/certs/coderaft.local.pem: no such
-        # file or directory`.
-        $pmOut = Join-Path $env:TEMP "coderaft-pm-out-$(Get-Random).log"
-        $pmErr = Join-Path $env:TEMP "coderaft-pm-err-$(Get-Random).log"
-        $installedFromPM = $false
-        if (Get-Command winget -ErrorAction SilentlyContinue) {
-            Write-Host "  Installing mkcert via winget (winget install FiloSottile.mkcert)…"
-            $cmgrProc = Start-Process -FilePath "winget" `
-                -ArgumentList @("install","--id","FiloSottile.mkcert","-e","--accept-source-agreements","--accept-package-agreements","--silent","--scope","user") `
-                -NoNewWindow -Wait -PassThru `
-                -RedirectStandardOutput $pmOut `
-                -RedirectStandardError $pmErr `
-                -ErrorAction SilentlyContinue
-            if ($cmgrProc.ExitCode -eq 0) {
-                $installedFromPM = $true
-            } else {
-                Write-Host "  ⚠ winget install mkcert failed (exit $($cmgrProc.ExitCode)) — trying choco/scoop…" -ForegroundColor Yellow
-            }
-        }
-        if (-not $installedFromPM -and (Get-Command choco -ErrorAction SilentlyContinue)) {
-            Write-Host "  Installing mkcert via Chocolatey (choco install mkcert)…"
-            $cmgrProc = Start-Process -FilePath "choco" `
-                -ArgumentList @("install","mkcert","-y","--no-progress") `
-                -NoNewWindow -Wait -PassThru `
-                -RedirectStandardOutput $pmOut `
-                -RedirectStandardError $pmErr `
-                -ErrorAction SilentlyContinue
-            if ($cmgrProc.ExitCode -eq 0) {
-                $installedFromPM = $true
-            } else {
-                Write-Host "  ⚠ choco install mkcert failed (exit $($cmgrProc.ExitCode)) — trying scoop…" -ForegroundColor Yellow
-            }
-        }
-        if (-not $installedFromPM -and (Get-Command scoop -ErrorAction SilentlyContinue)) {
-            Write-Host "  Installing mkcert via Scoop (scoop install mkcert)…"
-            $cmgrProc = Start-Process -FilePath "scoop" `
-                -ArgumentList @("install","mkcert") `
-                -NoNewWindow -Wait -PassThru `
-                -RedirectStandardOutput $pmOut `
-                -RedirectStandardError $pmErr `
-                -ErrorAction SilentlyContinue
-            if ($cmgrProc.ExitCode -eq 0) {
-                $installedFromPM = $true
-            } else {
-                Write-Host "  ⚠ scoop install mkcert failed (exit $($cmgrProc.ExitCode)) — trying direct binary…" -ForegroundColor Yellow
-            }
-        }
-        Remove-Item -Path $pmOut,$pmErr -ErrorAction SilentlyContinue
-
-        # B-MKCERT-DIRECT (2026-07-16): last-resort fallback — download the
-        # signed mkcert binary from GitHub Releases into caddy_certs\ so we
-        # never leave the operator stuck on a machine without a package
-        # manager. mkcert is a single static Go binary (~5 MB) — no
-        # dependencies, no installer required.
-        if (-not $installedFromPM) {
-            Write-Host "  No package manager could install mkcert — downloading direct binary from GitHub…"
-            $mkcertVersion = "v1.4.4"
-            $mkcertArch = if ([Environment]::Is64BitOperatingSystem) { "amd64" } else { "386" }
-            $mkcertUrl = "https://github.com/FiloSottile/mkcert/releases/download/$mkcertVersion/mkcert-$mkcertVersion-windows-$mkcertArch.exe"
-            $mkcertLocal = Join-Path (Get-Location) "caddy_certs\mkcert.exe"
-            New-Item -ItemType Directory -Force -Path "caddy_certs" | Out-Null
-            try {
-                Invoke-WebRequest -Uri $mkcertUrl -OutFile $mkcertLocal -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
-                Write-Host "    ✓ mkcert downloaded ($mkcertLocal)" -ForegroundColor Green
-                # Add it to the CURRENT session PATH so Get-Command finds it below.
-                $env:Path = "$(Split-Path -Parent $mkcertLocal);$env:Path"
-                $installedFromPM = $true
-            } catch {
-                Write-Host "  ⚠ Could not download mkcert from GitHub: $($_.Exception.Message)" -ForegroundColor Yellow
-                Write-Host "      Manual install: https://github.com/FiloSottile/mkcert#installation" -ForegroundColor Yellow
-                Write-Host "    Continuing in HTTP-only mode (http://localhost:3000)." -ForegroundColor Yellow
-                return $false
-            }
-        }
-
-        # Refresh PATH so the just-installed mkcert is visible in this session.
-        $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" +
-                    [System.Environment]::GetEnvironmentVariable("Path","User") + ";" +
-                    $env:Path
+    $caContainerPath = "/data/caddy/pki/authorities/local/root.crt"
+    Write-Host "  Waiting for Caddy to generate its internal CA (max 30s)…"
+    $caReady = $false
+    for ($i = 0; $i -lt 15; $i++) {
+        $code = Invoke-DockerExitCode -Arguments @("compose","exec","-T","caddy","test","-f",$caContainerPath)
+        if ($code -eq 0) { $caReady = $true; break }
+        Start-Sleep -Seconds 2
+    }
+    if (-not $caReady) {
+        Write-Host "  ⚠ Caddy CA not found after 30s — browsers will warn on https://coderaft.local." -ForegroundColor Yellow
+        Write-Host "    Download it later from the dashboard: Setup → TLS → Download CA." -ForegroundColor Yellow
+        return $false
     }
 
-    # B-MKCERT (2026-06-09): `mkcert -install` writes to the system Root
-    # Certificate Authorities store, which requires Administrator privileges
-    # on Windows — otherwise it fails silently. We detect elevation and
-    # auto-elevate ONLY the mkcert -install step via Start-Process -Verb
-    # RunAs (single UAC prompt). All native command calls use Start-Process
-    # with split stdout/stderr files for PS 5.1 + 7 compatibility.
+    $caLocal = Join-Path (Get-Location) "caddy-root.crt"
+    $cpCode = Invoke-DockerExitCode -Arguments @("compose","cp","caddy:$caContainerPath",$caLocal)
+    if ($cpCode -ne 0 -or -not (Test-Path $caLocal)) {
+        Write-Host "  ⚠ Could not export the Caddy root CA — skipping trust install." -ForegroundColor Yellow
+        return $false
+    }
+
+    # #137 fix: also expose the CA at ./certs/server-ca.pem — mounted into
+    # entraguard-api (via PRODUCT_SERVICES) so WolfGuard's /register
+    # response returns THIS CA (the one Caddy serves) to endpoint agents
+    # instead of the WolfGuard Endpoint CA (used server-side only for
+    # signing client certs). Without this the agent's TLS handshake to
+    # coderaft.local fails with `x509: certificate signed by unknown
+    # authority` on every report.
+    try {
+        $certsDir = Join-Path (Get-Location) "certs"
+        New-Item -ItemType Directory -Force -Path $certsDir | Out-Null
+        Copy-Item -LiteralPath $caLocal -Destination (Join-Path $certsDir "server-ca.pem") -Force
+        Write-Host "  ✓ Server CA exposed at certs\server-ca.pem for entraguard-api"
+    } catch {
+        Write-Host "  ⚠ Could not copy CA to certs\server-ca.pem: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+
     $isAdmin = $false
     try {
         $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
@@ -1057,68 +1051,34 @@ function Setup-LocalHttps {
         $isAdmin = $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
     } catch { $isAdmin = $false }
 
-    $mkcertCmd = (Get-Command mkcert -ErrorAction SilentlyContinue).Source
-    if (-not $mkcertCmd) {
-        Write-Host "  ⚠ mkcert not on PATH after install — fallback to http://localhost:3000" -ForegroundColor Yellow
-        return $false
-    }
-
-    Write-Host "  Installing mkcert local CA (one-time, may prompt for elevation)…"
-    $mkcertOut = Join-Path $env:TEMP "coderaft-mkcert-install-out-$(Get-Random).log"
-    $mkcertErr = Join-Path $env:TEMP "coderaft-mkcert-install-err-$(Get-Random).log"
-    $installArgs = @{
-        FilePath               = $mkcertCmd
-        ArgumentList           = @("-install")
-        Wait                   = $true
-        WindowStyle            = "Hidden"
-        PassThru               = $true
-        ErrorAction            = "SilentlyContinue"
-    }
+    Write-Host "  Importing the Coderaft root CA into LocalMachine\Root (may prompt for elevation)…"
     if ($isAdmin) {
-        # Already elevated — capture output to temp files (PS 5.1 + 7 compat).
-        $installArgs['NoNewWindow']             = $true
-        $installArgs['RedirectStandardOutput']  = $mkcertOut
-        $installArgs['RedirectStandardError']   = $mkcertErr
-        $installArgs.Remove('WindowStyle')
-    } else {
-        # Not elevated — single UAC prompt via -Verb RunAs.
-        # Note: -Verb RunAs is incompatible with -NoNewWindow / -RedirectStandard*
-        # so we can't capture stdout/stderr here. We rely on the exit code only.
-        $installArgs['Verb'] = "RunAs"
-    }
-    try {
-        $mkcertProc = Start-Process @installArgs
-        if ($mkcertProc.ExitCode -ne 0) {
-            Write-Host "  ⚠ mkcert -install failed (exit $($mkcertProc.ExitCode)) — local HTTPS will not be trusted." -ForegroundColor Yellow
-        } else {
-            Write-Host "  ✓ mkcert local CA installed" -ForegroundColor Green
+        try {
+            Import-Certificate -FilePath $caLocal -CertStoreLocation Cert:\LocalMachine\Root -ErrorAction Stop | Out-Null
+            Write-Host "  ✓ CA trusted (LocalMachine\Root)" -ForegroundColor Green
+            return $true
+        } catch {
+            Write-Host "  ⚠ Import-Certificate failed: $($_.Exception.Message)" -ForegroundColor Yellow
+            return $false
         }
-    } catch {
-        Write-Host "  ⚠ mkcert -install cancelled or failed — local HTTPS will not be trusted." -ForegroundColor Yellow
-    }
-    Remove-Item -Path $mkcertOut,$mkcertErr -ErrorAction SilentlyContinue
-
-    Write-Host "  Generating local cert for coderaft.local…"
-    # cert generation does NOT require admin, just writes files. Use
-    # Start-Process for stderr suppression (PS 5.1 + 7 compat).
-    $certOut = Join-Path $env:TEMP "coderaft-mkcert-cert-out-$(Get-Random).log"
-    $certErr = Join-Path $env:TEMP "coderaft-mkcert-cert-err-$(Get-Random).log"
-    $certProc = Start-Process -FilePath $mkcertCmd -ArgumentList @(
-        "-cert-file", $certPath,
-        "-key-file", $keyPath,
-        "coderaft.local", "*.coderaft.local", "localhost", "127.0.0.1", "::1"
-    ) -NoNewWindow -Wait -PassThru `
-        -RedirectStandardOutput $certOut `
-        -RedirectStandardError $certErr `
-        -ErrorAction SilentlyContinue
-    Remove-Item -Path $certOut,$certErr -ErrorAction SilentlyContinue
-    if ($certProc.ExitCode -ne 0 -or -not (Test-Path $certPath)) {
-        Write-Host "  ⚠ mkcert cert generation failed — fallback to http://localhost:3000" -ForegroundColor Yellow
-        Remove-Item -ErrorAction SilentlyContinue $certPath, $keyPath
+    } else {
+        # Single UAC prompt — same pattern as the old mkcert -install elevation.
+        try {
+            $importCmd = "Import-Certificate -FilePath '$caLocal' -CertStoreLocation Cert:\LocalMachine\Root"
+            $proc = Start-Process -FilePath "powershell" `
+                -ArgumentList @("-NoProfile","-ExecutionPolicy","Bypass","-Command",$importCmd) `
+                -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
+            if ($proc.ExitCode -eq 0) {
+                Write-Host "  ✓ CA trusted (LocalMachine\Root)" -ForegroundColor Green
+                return $true
+            }
+            Write-Host "  ⚠ CA import exited with code $($proc.ExitCode) — trust caddy-root.crt manually." -ForegroundColor Yellow
+        } catch {
+            Write-Host "  ⚠ CA import cancelled or failed — trust caddy-root.crt manually:" -ForegroundColor Yellow
+            Write-Host "      Import-Certificate -FilePath caddy-root.crt -CertStoreLocation Cert:\LocalMachine\Root" -ForegroundColor Yellow
+        }
         return $false
     }
-    Write-Host "  ✓ Local HTTPS cert generated (valid 825d)" -ForegroundColor Green
-    return $true
 }
 
 # ── hosts file entries ──────────────────────────────────────────────────────
@@ -1160,18 +1120,16 @@ function Ensure-HostsEntry {
     }
 }
 
-$httpsReady = Setup-LocalHttps
-if ($httpsReady) {
-    Ensure-HostsEntry
-}
+# Hosts entry no longer depends on mkcert certs — coderaft.local must resolve
+# for the default (internal CA) TLS mode to be reachable by name.
+Ensure-HostsEntry
 
 # Helper scripts
 Set-Content -Path 'start.ps1' -Value @'
 Write-Host "Starting CodeRaft..."
 docker compose up -d
 $Url = "http://localhost:3000"
-if ((Test-Path "caddy_certs\coderaft.local.pem") -and `
-    ((Get-Content "$env:WINDIR\System32\drivers\etc\hosts" -ErrorAction SilentlyContinue) -match "coderaft\.local")) {
+if ((Get-Content "$env:WINDIR\System32\drivers\etc\hosts" -ErrorAction SilentlyContinue) -match "coderaft\.local") {
     $Url = "https://coderaft.local"
 }
 Write-Host "  Dashboard: $Url"
@@ -1467,6 +1425,10 @@ if (-not $vaultOk) {
 }
 
 Write-Host ""
+Write-Host "  Setting up HTTPS trust (Caddy internal CA)..."
+$null = Install-CaddyRootCA
+
+Write-Host ""
 Write-Host "  Waiting for dashboard to be ready..."
 Start-Sleep -Seconds 10
 
@@ -1489,8 +1451,7 @@ if ($env:SKIP_NATIVE_CAPTURE -eq "1") {
 }
 
 $DashboardUrl = "http://localhost:3000"
-if ((Test-Path "caddy_certs\coderaft.local.pem") -and `
-    ((Get-Content "$env:WINDIR\System32\drivers\etc\hosts" -ErrorAction SilentlyContinue) -match "coderaft\.local")) {
+if ((Get-Content "$env:WINDIR\System32\drivers\etc\hosts" -ErrorAction SilentlyContinue) -match "coderaft\.local") {
     $DashboardUrl = "https://coderaft.local"
 }
 
