@@ -353,6 +353,50 @@ if (Test-Path $composePathB15) {
             Write-Host "  ⚠ Could not patch NODE_OPTIONS for dashboard-api in docker-compose.yml — Entra ID callback may fail with ENETUNREACH (B15). Re-run install.ps1 to regenerate." -ForegroundColor Yellow
         }
     }
+
+    # B-IPV6-KILL-SELFHEAL (2026-07-23): NODE_OPTIONS=ipv4first is honored
+    # only for Node's own resolver — some libs (openid-client, passport-*)
+    # still surface AAAA records to Microsoft Entra endpoints and fail with
+    # ENETUNREACH. Kill IPv6 at the sysctl level so the container has no
+    # v6 stack at all. Idempotent — skips if `sysctls:` already present in
+    # the dashboard-api block. Line-based state machine so any indent style
+    # (2-space, 4-space, tab) is handled the same way — regex flavour of
+    # PowerShell is finicky with multi-line lookaheads.
+    if ($composeTextB15 -notmatch '(?ms)dashboard-api:[^\S\n]*\r?\n(?:[^\S\n]+\S.*\r?\n)*?[^\S\n]+sysctls:') {
+        $lines = $composeTextB15 -split "`r?`n"
+        $out = New-Object System.Collections.ArrayList
+        $inDashApi = $false
+        $sysAdded = $false
+        $svcIndent = $null
+        foreach ($ln in $lines) {
+            if ($ln -match '^(\s+)dashboard-api:\s*$') {
+                $inDashApi = $true
+                $svcIndent = $matches[1]
+                [void]$out.Add($ln)
+                continue
+            }
+            # Leaving dashboard-api when a sibling service (same indent) starts.
+            if ($inDashApi -and $svcIndent -and $ln -match "^$svcIndent[a-zA-Z]") {
+                $inDashApi = $false
+            }
+            # Inject sysctls right before the environment: key of dashboard-api.
+            if ($inDashApi -and -not $sysAdded -and $ln -match '^(\s+)environment:\s*$') {
+                $keyIndent = $matches[1]
+                $itemIndent = $keyIndent + "  "
+                [void]$out.Add("$($keyIndent)sysctls:")
+                [void]$out.Add("$($itemIndent)- net.ipv6.conf.all.disable_ipv6=1")
+                [void]$out.Add("$($itemIndent)- net.ipv6.conf.default.disable_ipv6=1")
+                $sysAdded = $true
+            }
+            [void]$out.Add($ln)
+        }
+        if ($sysAdded) {
+            $bakIP6 = "$composePathB15.bak-ipv6-" + (Get-Date -Format "yyyyMMddHHmmss")
+            try { Copy-Item -LiteralPath $composePathB15 -Destination $bakIP6 -Force -ErrorAction SilentlyContinue } catch {}
+            [System.IO.File]::WriteAllLines($composePathB15, $out, [System.Text.UTF8Encoding]::new($false))
+            Write-Host "  ✓ Self-heal docker-compose.yml — sysctls IPv6 kill ajouté à dashboard-api"
+        }
+    }
 }
 
 # ── Self-heal: docker-compose.override.yml neo4j port (B26) ───────────────
@@ -472,6 +516,177 @@ if (-not $composeOK) {
     $LASTEXITCODE = 0
 } else {
     Write-Host "  ✓ compose OK"
+}
+
+# ── FalconOne agents mTLS PKI (#170) ─────────────────────────────────────────
+# Distinct CA/leaf from the vault client PKI: falconone-tls\agents-ca.crt is
+# the pool of ClientCAs falconone-api trusts for inbound agent mTLS, and
+# falconone-tls\server.crt is the leaf falconone-api presents on :8443 to its
+# own Windows agents. Bug #170: server.crt's SAN only ever had
+# [localhost, falconone-api] — remote agents connecting via
+# https://<public-hostname>:8443/agent/v1 failed hostname verification.
+# Self-healing: the CA is preserved if it already exists (regenerating it
+# would break trust for any agent already enrolled); only the leaf is
+# regenerated, and only when it's missing the "coderaft.local" SAN.
+#
+# Defined here (and called both inside the one-time migration block below
+# AND unconditionally after it) because the migration block only ever runs
+# ONCE per install — already-migrated installs would otherwise never get
+# this SAN fix or a falconone-tls dir that didn't exist on an older version.
+function Invoke-FalconOneTlsBootstrap {
+    param([Parameter(Mandatory = $true)][string]$InstallDir)
+
+    $foTlsDir = Join-Path $InstallDir "falconone-tls"
+    New-Item -ItemType Directory -Force -Path $foTlsDir | Out-Null
+
+    $foSanList = [System.Collections.Generic.List[string]]::new()
+    foreach ($s in @("DNS:localhost", "DNS:falconone-api", "DNS:coderaft.local")) { $foSanList.Add($s) }
+    if ($env:COMPUTERNAME) { $foSanList.Add("DNS:$($env:COMPUTERNAME)") }
+    if ($env:CODERAFT_EXTRA_HOSTS) {
+        foreach ($h in ($env:CODERAFT_EXTRA_HOSTS -split ",")) {
+            $trimmed = $h.Trim()
+            if ($trimmed) { $foSanList.Add("DNS:$trimmed") }
+        }
+    }
+    $foSanList.Add("IP:127.0.0.1")
+    $foSanString = (($foSanList | Select-Object -Unique) -join ",")
+
+    $foScript = @'
+set -e
+apk add --no-cache openssl >/dev/null
+cd /work
+if [ ! -f agents-ca.crt ]; then
+    openssl req -x509 -newkey rsa:4096 -days 3650 -nodes -sha256 \
+        -keyout agents-ca.key -out agents-ca.crt \
+        -subj "/CN=falconone-agents-ca" \
+        -addext "basicConstraints=critical,CA:TRUE" 2>/dev/null
+fi
+NEED_REGEN=1
+if [ -f server.crt ] && openssl x509 -in server.crt -noout -text 2>/dev/null | grep -q "coderaft.local"; then
+    NEED_REGEN=0
+fi
+if [ "$NEED_REGEN" = "1" ]; then
+    openssl req -newkey rsa:2048 -nodes -sha256 \
+        -keyout server.key -out server.csr \
+        -subj "/CN=falconone-agents" 2>/dev/null
+    cat > /tmp/server.ext <<EOF
+subjectAltName=__FO_SAN_LIST__
+basicConstraints=CA:FALSE
+EOF
+    openssl x509 -req -days 3650 -sha256 \
+        -in server.csr -CA agents-ca.crt -CAkey agents-ca.key -CAcreateserial \
+        -out server.crt -extfile /tmp/server.ext 2>/dev/null
+    rm -f server.csr
+fi
+chmod 644 *.crt *.key 2>/dev/null || true
+'@
+    $foScript = $foScript.Replace("__FO_SAN_LIST__", $foSanString)
+    $foScriptFile = Join-Path $env:TEMP "coderaft-fo-tls-$(Get-Random).sh"
+    $foScriptLF = $foScript -replace "`r`n", "`n"
+    [System.IO.File]::WriteAllText($foScriptFile, $foScriptLF, [System.Text.UTF8Encoding]::new($false))
+    $absFoTlsDir = (Resolve-Path -LiteralPath $foTlsDir).Path
+
+    Start-Process -FilePath "docker" -ArgumentList @(
+        "run", "--rm",
+        "-v", "${foScriptFile}:/script.sh:ro",
+        "-v", "${absFoTlsDir}:/work",
+        "alpine:3.20", "sh", "/script.sh"
+    ) -NoNewWindow -Wait -ErrorAction SilentlyContinue | Out-Null
+    Remove-Item -Path $foScriptFile -ErrorAction SilentlyContinue
+    Write-Host "  ✓ FalconOne agents PKI written (SAN: $foSanString)"
+}
+
+# ── ACL self-heal: falconone entry/permissions (#172) ────────────────────────
+# The acl.yaml rewrite below only runs once, inside the migration block (its
+# caller is gated by $vaultNeedsMigration). That means any install that
+# already migrated to vault before this fix shipped would never get the
+# falconone entry/permissions rewritten. This self-heal is additive-only,
+# idempotent, and safe to call on every install/update run: if the
+# "falconone" client entry is missing, it appends the full canonical block;
+# if present, it appends only whichever required permissions are missing,
+# leaving everything else in the file untouched. Backs up acl.yaml before
+# any modification.
+function Invoke-FalconOneAclSelfHeal {
+    param([Parameter(Mandatory = $true)][string]$AclPath)
+
+    if (-not (Test-Path $AclPath)) {
+        Write-Host "  [install] ACL self-heal: $AclPath not found — skipping (vault not provisioned yet)"
+        return
+    }
+
+    $requiredPerms = @(
+        "read:license_key",
+        "read:falconone_*",
+        "read:platform/identity/oidc",
+        "sign:falconone_agent_cert",
+        "read:falconone/nvd_api_key",
+        "read:falconone/audit_hmac_key",
+        "write:falconone/audit_hmac_key",
+        "read:falconone/pki/agents-ca/cert"
+    )
+
+    $lines = @(Get-Content -LiteralPath $AclPath)
+    $blockStart = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match '^\s*-\s*name:\s*falconone\s*$') { $blockStart = $i; break }
+    }
+
+    $ts = Get-Date -Format "yyyyMMddTHHmmssZ"
+
+    if ($blockStart -eq -1) {
+        Copy-Item -LiteralPath $AclPath -Destination "${AclPath}.bak-${ts}"
+        $newBlock = @'
+
+  - name: falconone
+    cert_san: "falconone.coderaft.local"
+    permissions:
+      - "read:license_key"
+      - "read:falconone_*"
+      - "read:platform/identity/oidc"
+      - "sign:falconone_agent_cert"
+      - "read:falconone/nvd_api_key"
+      - "read:falconone/audit_hmac_key"
+      - "write:falconone/audit_hmac_key"
+      - "read:falconone/pki/agents-ca/cert"
+'@
+        Add-Content -LiteralPath $AclPath -Value $newBlock
+        Write-Host "  [install] Self-heal ACL: falconone permissions updated (+$($requiredPerms.Count) added, entry created)"
+        return
+    }
+
+    $blockEnd = $lines.Count
+    for ($j = $blockStart + 1; $j -lt $lines.Count; $j++) {
+        if ($lines[$j] -match '^\s*-\s*name:\s*\S') { $blockEnd = $j; break }
+    }
+    $blockText = ($lines[$blockStart..($blockEnd - 1)]) -join "`n"
+
+    $missing = @($requiredPerms | Where-Object { $blockText -notmatch [regex]::Escape("`"$_`"") })
+
+    if ($missing.Count -eq 0) {
+        Write-Host "  [install] ACL falconone already up-to-date"
+        return
+    }
+
+    Copy-Item -LiteralPath $AclPath -Destination "${AclPath}.bak-${ts}"
+
+    $permsLineIdx = -1
+    for ($k = $blockStart; $k -lt $blockEnd; $k++) {
+        if ($lines[$k] -match '^\s*permissions:\s*\[.*\]\s*$') { $permsLineIdx = $k; break }
+    }
+
+    if ($permsLineIdx -ge 0) {
+        $additions = ($missing | ForEach-Object { "`"$_`"" }) -join ","
+        $lines[$permsLineIdx] = $lines[$permsLineIdx] -replace '\]\s*$', ",$additions]"
+        $lines | Set-Content -LiteralPath $AclPath -Encoding UTF8
+    } else {
+        $insertLines = @($missing | ForEach-Object { "      - `"$_`"" })
+        $before = if ($blockEnd -gt 0) { $lines[0..($blockEnd - 1)] } else { @() }
+        $after  = if ($blockEnd -le $lines.Count - 1) { $lines[$blockEnd..($lines.Count - 1)] } else { @() }
+        $merged = @($before + $insertLines + $after)
+        $merged | Set-Content -LiteralPath $AclPath -Encoding UTF8
+    }
+
+    Write-Host "  [install] Self-heal ACL: falconone permissions updated (+$($missing.Count) added)"
 }
 
 # ── Vault migration (D4) ─────────────────────────────────────────────────
@@ -799,7 +1014,8 @@ rm -f vault.csr
 for pair in "dashboard-api:dashboard-api.coderaft.local" \
             "entraguard:entraguard.coderaft.local" \
             "ravenscan:ravenscan.coderaft.local" \
-            "redfox:redfox.coderaft.local"; do
+            "redfox:redfox.coderaft.local" \
+            "falconone:falconone.coderaft.local"; do
     name="${pair%%:*}"
     san="${pair##*:}"
     openssl req -newkey rsa:2048 -nodes -sha256 \
@@ -815,6 +1031,12 @@ EOF
     rm -f "${name}-client.csr"
 done
 chmod 600 *.key 2>/dev/null || true
+# falconone-api runs distroless nonroot (uid 65532) — it CAN'T read files
+# owned by root with mode 600. Loosen to 644 so the bind-mounted certs are
+# world-readable inside the container. The private key lives on a chmod 700
+# vault-tls dir anyway, and Docker Desktop's Windows/Mac bind-mount already
+# strips POSIX perms, so this only affects Linux hosts.
+chmod 644 falconone-client.key falconone-client.crt 2>/dev/null || true
 '@
     # Bind-mount tlsDir into the alpine container at /work and run the script.
     # Use --user to keep file ownership readable on Linux hosts; on Windows/Mac
@@ -880,16 +1102,47 @@ clients:
     permissions: ["*"]
   - name: entraguard
     cert_san: "entraguard.coderaft.local"
-    permissions: ["read:azure_*","read:license_key","read:entraguard_*"]
+    permissions: ["read:azure_*","read:license_key","read:entraguard_*","read:platform/identity/oidc"]
   - name: ravenscan
     cert_san: "ravenscan.coderaft.local"
-    permissions: ["read:ravenscan_*","read:neo4j_*","read:license_key"]
+    permissions: ["read:ravenscan_*","read:neo4j_*","read:license_key","read:platform/identity/oidc"]
   - name: redfox
     cert_san: "redfox.coderaft.local"
-    permissions: ["read:redfox_*","read:license_key"]
+    permissions: ["read:redfox_*","read:license_key","read:platform/identity/oidc"]
+  - name: falconone
+    cert_san: "falconone.coderaft.local"
+    permissions: ["read:license_key","read:falconone_*","read:platform/identity/oidc","sign:falconone_agent_cert","read:falconone/nvd_api_key","read:falconone/audit_hmac_key","write:falconone/audit_hmac_key","read:falconone/pki/agents-ca/cert"]
 '@
     [System.IO.File]::WriteAllText((Join-Path $cfgDir "acl.yaml"), $aclYaml, [System.Text.UTF8Encoding]::new($false))
     Write-Host "  ✓ Vault TLS PKI + config written"
+
+    # ── FalconOne relay signal-server key (mint-on-boot pattern) ──────────
+    # falconone-relay expects /keys/signal-server.key mounted from
+    # certs/falconone-signal-server.key on the host. If the host path is
+    # absent, Docker creates a DIRECTORY at the mount source → the relay
+    # reads it as a directory → fatal "signal server key: is a directory".
+    # Pre-create an empty file so Docker mounts it as a regular file and
+    # the relay can mint the Ed25519 key inline on first boot (per its
+    # own commentary in server.js line 1515).
+    $foCertsDir = Join-Path $INSTALL_DIR "certs"
+    New-Item -ItemType Directory -Force -Path $foCertsDir | Out-Null
+    $foSignalKey = Join-Path $foCertsDir "falconone-signal-server.key"
+    if (Test-Path $foSignalKey -PathType Container) {
+        Remove-Item -LiteralPath $foSignalKey -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if (-not (Test-Path $foSignalKey -PathType Leaf)) {
+        New-Item -ItemType File -Force -Path $foSignalKey | Out-Null
+    }
+
+    # ── FalconOne agents mTLS PKI (falconone-tls/) — bug #170 ──────────────
+    # Distinct CA from the vault client PKI: the "agents-ca" here signs the
+    # cert presented by falconone-api on :8443 to its own Windows agents,
+    # NOT vault clients. See Invoke-FalconOneTlsBootstrap definition above
+    # for the extended-SAN + self-heal logic (this call covers first-time
+    # provisioning; the unconditional call after this migration block covers
+    # already-migrated installs).
+    Write-Host "  Bootstrapping FalconOne agents PKI (via alpine container)..."
+    Invoke-FalconOneTlsBootstrap -InstallDir $INSTALL_DIR
 
     # ── 4d Pull and start vault ────────────────────────────────────────────
     if ($env:CODERAFT_TEST_FAIL -eq "4d") { Invoke-VaultMigrationRollback "injected test failure at 4d" }
@@ -1259,6 +1512,14 @@ services:
     Write-Host "  ✓ Vault migration not needed (already done or vault running)"
 }
 
+# ── FalconOne mTLS PKI + ACL self-heal (#170 / #172) ─────────────────────────
+# Runs unconditionally on EVERY update, independent of the one-time vault
+# migration gate above, so already-migrated installs (vaultNeedsMigration =
+# $false) still get the extended-SAN falconone-tls cert and any missing ACL
+# permissions healed.
+Invoke-FalconOneTlsBootstrap -InstallDir $INSTALL_DIR
+Invoke-FalconOneAclSelfHeal -AclPath (Join-Path $INSTALL_DIR "vault-config\acl.yaml")
+
 # ── Banking-grade plaintext purge (auto) ──────────────────────────────────
 # When .env.enc exists, the plaintext .env MUST be purged. The oneliner
 # does the finalize itself: verifies decryption matches plaintext, keeps a
@@ -1278,8 +1539,11 @@ if ((Test-Path $envEnc) -and (Test-Path $envPlain)) {
         Write-Host "  [!] .env + .env.enc coexist but age key not found at $ageKey" -ForegroundColor Yellow
         Write-Host "      Plaintext .env left in place; investigate before next run." -ForegroundColor Yellow
     } elseif (-not $sops) {
-        Write-Host "  [!] sops binary missing on host — cannot finalize purge automatically" -ForegroundColor Yellow
-        Write-Host "      Run: iex (irm https://install.coderaft.io/migrate.ps1) -Finalize" -ForegroundColor Yellow
+        Write-Host "  [i] sops missing on host — update.ps1 skips the automatic finalize." -ForegroundColor Yellow
+        Write-Host "      Choose one method to purge the plaintext .env:" -ForegroundColor Yellow
+        Write-Host "        A) Dashboard  →  Settings → Migrate secrets  (runs inside dashboard-api)" -ForegroundColor Yellow
+        Write-Host "        B) CLI        →  iex (irm https://install.coderaft.io/migrate.ps1) -Finalize" -ForegroundColor Yellow
+        Write-Host "                          (auto-downloads sops.exe + age-keygen.exe)" -ForegroundColor Yellow
     } else {
         $env:SOPS_AGE_KEY_FILE = $ageKey
         $decrypted = & $sops --decrypt --input-type dotenv --output-type dotenv $envEnc 2>$null
@@ -1297,7 +1561,9 @@ if ((Test-Path $envEnc) -and (Test-Path $envPlain)) {
                 Write-Host "  ✓ plaintext .env purged (backup: $bakFile, kept 24h)"
             } else {
                 Write-Host "  [!] .env and .env.enc differ — refusing to purge plaintext." -ForegroundColor Yellow
-                Write-Host "      Re-run: iex (irm https://install.coderaft.io/migrate.ps1) -Finalize" -ForegroundColor Yellow
+                Write-Host "      Choose one method to reconcile + purge:" -ForegroundColor Yellow
+                Write-Host "        A) Dashboard  →  Settings → Migrate secrets" -ForegroundColor Yellow
+                Write-Host "        B) CLI        →  iex (irm https://install.coderaft.io/migrate.ps1)" -ForegroundColor Yellow
                 Write-Host "      Backup written to $bakFile" -ForegroundColor Yellow
             }
         }

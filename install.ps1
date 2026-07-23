@@ -635,21 +635,199 @@ clients:
 
   - name: entraguard
     cert_san: "entraguard.coderaft.local"
-    permissions: ["read:azure_*","read:license_key","read:entraguard_*"]
+    permissions: ["read:azure_*","read:license_key","read:entraguard_*","read:platform/identity/oidc"]
 
   - name: ravenscan
     cert_san: "ravenscan.coderaft.local"
-    permissions: ["read:ravenscan_*","read:neo4j_*","read:license_key"]
+    permissions: ["read:ravenscan_*","read:neo4j_*","read:license_key","read:platform/identity/oidc"]
 
   - name: redfox
     cert_san: "redfox.coderaft.local"
-    permissions: ["read:redfox_*","read:license_key"]
+    permissions: ["read:redfox_*","read:license_key","read:platform/identity/oidc"]
+
+  - name: falconone
+    cert_san: "falconone.coderaft.local"
+    permissions: ["read:license_key","read:falconone_*","read:platform/identity/oidc","sign:falconone_agent_cert","read:falconone/nvd_api_key","read:falconone/audit_hmac_key","write:falconone/audit_hmac_key","read:falconone/pki/agents-ca/cert"]
 '@
     [System.IO.File]::WriteAllText((Join-Path $cfgDir "acl.yaml"), $aclYaml, [System.Text.UTF8Encoding]::new($false))
     Write-Host "  ✓ Vault mTLS PKI generated (CA + server cert + 4 client certs)" -ForegroundColor Green
 }
 
+# ── FalconOne agents mTLS PKI (#170) ─────────────────────────────────────────
+# Distinct CA/leaf from the vault client PKI above: falconone-tls\agents-ca.crt
+# is the pool of ClientCAs falconone-api trusts for inbound agent mTLS, and
+# falconone-tls\server.crt is the leaf falconone-api presents on :8443 to its
+# own Windows agents. Bug #170: server.crt's SAN only ever had
+# [localhost, falconone-api] — remote agents connecting via
+# https://<public-hostname>:8443/agent/v1 failed hostname verification.
+# Self-healing: the CA is preserved if it already exists (regenerating it
+# would break trust for any agent already enrolled); only the leaf is
+# regenerated, and only when it's missing the "coderaft.local" SAN.
+function Invoke-FalconOneTlsBootstrap {
+    param([Parameter(Mandatory = $true)][string]$InstallDir)
+
+    $foTlsDir = Join-Path $InstallDir "falconone-tls"
+    New-Item -ItemType Directory -Force -Path $foTlsDir | Out-Null
+
+    $foSanList = [System.Collections.Generic.List[string]]::new()
+    foreach ($s in @("DNS:localhost", "DNS:falconone-api", "DNS:coderaft.local")) { $foSanList.Add($s) }
+    if ($env:COMPUTERNAME) { $foSanList.Add("DNS:$($env:COMPUTERNAME)") }
+    if ($env:CODERAFT_EXTRA_HOSTS) {
+        foreach ($h in ($env:CODERAFT_EXTRA_HOSTS -split ",")) {
+            $trimmed = $h.Trim()
+            if ($trimmed) { $foSanList.Add("DNS:$trimmed") }
+        }
+    }
+    $foSanList.Add("IP:127.0.0.1")
+    $foSanString = (($foSanList | Select-Object -Unique) -join ",")
+
+    $foScript = @'
+set -e
+apk add --no-cache openssl >/dev/null
+cd /work
+if [ ! -f agents-ca.crt ]; then
+    openssl req -x509 -newkey rsa:4096 -days 3650 -nodes -sha256 \
+        -keyout agents-ca.key -out agents-ca.crt \
+        -subj "/CN=falconone-agents-ca" \
+        -addext "basicConstraints=critical,CA:TRUE" 2>/dev/null
+fi
+NEED_REGEN=1
+if [ -f server.crt ] && openssl x509 -in server.crt -noout -text 2>/dev/null | grep -q "coderaft.local"; then
+    NEED_REGEN=0
+fi
+if [ "$NEED_REGEN" = "1" ]; then
+    openssl req -newkey rsa:2048 -nodes -sha256 \
+        -keyout server.key -out server.csr \
+        -subj "/CN=falconone-agents" 2>/dev/null
+    cat > /tmp/server.ext <<EOF
+subjectAltName=__FO_SAN_LIST__
+basicConstraints=CA:FALSE
+EOF
+    openssl x509 -req -days 3650 -sha256 \
+        -in server.csr -CA agents-ca.crt -CAkey agents-ca.key -CAcreateserial \
+        -out server.crt -extfile /tmp/server.ext 2>/dev/null
+    rm -f server.csr
+fi
+chmod 644 *.crt *.key 2>/dev/null || true
+'@
+    $foScript = $foScript.Replace("__FO_SAN_LIST__", $foSanString)
+    $foScriptFile = Join-Path $env:TEMP "coderaft-fo-tls-$(Get-Random).sh"
+    $foScriptLF = $foScript -replace "`r`n", "`n"
+    [System.IO.File]::WriteAllText($foScriptFile, $foScriptLF, [System.Text.UTF8Encoding]::new($false))
+    $absFoTlsDir = (Resolve-Path -LiteralPath $foTlsDir).Path
+
+    Start-Process -FilePath "docker" -ArgumentList @(
+        "run", "--rm",
+        "-v", "${foScriptFile}:/script.sh:ro",
+        "-v", "${absFoTlsDir}:/work",
+        "alpine:3.20", "sh", "/script.sh"
+    ) -NoNewWindow -Wait -ErrorAction SilentlyContinue | Out-Null
+    Remove-Item -Path $foScriptFile -ErrorAction SilentlyContinue
+    Write-Host "  ✓ FalconOne agents PKI written (SAN: $foSanString)"
+}
+
+# ── ACL self-heal: falconone entry/permissions (#172) ────────────────────────
+# The static acl.yaml above only runs once (Invoke-VaultBootstrapTLS returns
+# early when vault-tls already exists — see the "already exists — skipping"
+# guard at its top). That means any install that provisioned vault before
+# this fix shipped will never get the falconone entry/permissions rewritten.
+# This self-heal is additive-only, idempotent, and safe to call on every
+# install/update run: if the "falconone" client entry is missing, it appends
+# the full canonical block; if present, it appends only whichever required
+# permissions are missing, leaving everything else in the file untouched.
+# Backs up acl.yaml before any modification.
+function Invoke-FalconOneAclSelfHeal {
+    param([Parameter(Mandatory = $true)][string]$AclPath)
+
+    if (-not (Test-Path $AclPath)) {
+        Write-Host "  [install] ACL self-heal: $AclPath not found — skipping (vault not provisioned yet)"
+        return
+    }
+
+    $requiredPerms = @(
+        "read:license_key",
+        "read:falconone_*",
+        "read:platform/identity/oidc",
+        "sign:falconone_agent_cert",
+        "read:falconone/nvd_api_key",
+        "read:falconone/audit_hmac_key",
+        "write:falconone/audit_hmac_key",
+        "read:falconone/pki/agents-ca/cert"
+    )
+
+    $lines = @(Get-Content -LiteralPath $AclPath)
+    $blockStart = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match '^\s*-\s*name:\s*falconone\s*$') { $blockStart = $i; break }
+    }
+
+    $ts = Get-Date -Format "yyyyMMddTHHmmssZ"
+
+    if ($blockStart -eq -1) {
+        Copy-Item -LiteralPath $AclPath -Destination "${AclPath}.bak-${ts}"
+        $newBlock = @'
+
+  - name: falconone
+    cert_san: "falconone.coderaft.local"
+    permissions:
+      - "read:license_key"
+      - "read:falconone_*"
+      - "read:platform/identity/oidc"
+      - "sign:falconone_agent_cert"
+      - "read:falconone/nvd_api_key"
+      - "read:falconone/audit_hmac_key"
+      - "write:falconone/audit_hmac_key"
+      - "read:falconone/pki/agents-ca/cert"
+'@
+        Add-Content -LiteralPath $AclPath -Value $newBlock
+        Write-Host "  [install] Self-heal ACL: falconone permissions updated (+$($requiredPerms.Count) added, entry created)"
+        return
+    }
+
+    $blockEnd = $lines.Count
+    for ($j = $blockStart + 1; $j -lt $lines.Count; $j++) {
+        if ($lines[$j] -match '^\s*-\s*name:\s*\S') { $blockEnd = $j; break }
+    }
+    $blockText = ($lines[$blockStart..($blockEnd - 1)]) -join "`n"
+
+    $missing = @($requiredPerms | Where-Object { $blockText -notmatch [regex]::Escape("`"$_`"") })
+
+    if ($missing.Count -eq 0) {
+        Write-Host "  [install] ACL falconone already up-to-date"
+        return
+    }
+
+    Copy-Item -LiteralPath $AclPath -Destination "${AclPath}.bak-${ts}"
+
+    $permsLineIdx = -1
+    for ($k = $blockStart; $k -lt $blockEnd; $k++) {
+        if ($lines[$k] -match '^\s*permissions:\s*\[.*\]\s*$') { $permsLineIdx = $k; break }
+    }
+
+    if ($permsLineIdx -ge 0) {
+        $additions = ($missing | ForEach-Object { "`"$_`"" }) -join ","
+        $lines[$permsLineIdx] = $lines[$permsLineIdx] -replace '\]\s*$', ",$additions]"
+        $lines | Set-Content -LiteralPath $AclPath -Encoding UTF8
+    } else {
+        $insertLines = @($missing | ForEach-Object { "      - `"$_`"" })
+        $before = if ($blockEnd -gt 0) { $lines[0..($blockEnd - 1)] } else { @() }
+        $after  = if ($blockEnd -le $lines.Count - 1) { $lines[$blockEnd..($lines.Count - 1)] } else { @() }
+        $merged = @($before + $insertLines + $after)
+        $merged | Set-Content -LiteralPath $AclPath -Encoding UTF8
+    }
+
+    Write-Host "  [install] Self-heal ACL: falconone permissions updated (+$($missing.Count) added)"
+}
+
 Invoke-VaultBootstrap
+
+# ── FalconOne mTLS PKI + ACL self-heal (#170 / #172) ─────────────────────────
+# Always run, independent of Invoke-VaultBootstrap's internal "already
+# exists — skipping" guards, so a re-run of this installer on an existing
+# install still gets the extended-SAN falconone-tls cert and any missing
+# ACL permissions healed.
+Invoke-FalconOneTlsBootstrap -InstallDir (Get-Location).Path
+Invoke-FalconOneAclSelfHeal -AclPath (Join-Path (Get-Location).Path "vault-config\acl.yaml")
 
 # Append CODERAFT_VAULT_* env vars if not already present
 $envText = [System.IO.File]::ReadAllText("$(Get-Location)\.env", [System.Text.UTF8Encoding]::new($false))
@@ -785,6 +963,17 @@ services:
       # OIDC config, etc.) returns 500. Observed live 2026-07-16 during
       # setup wizard.
       - coderaft-backend
+    # B-IPV6-KILL (2026-07-22): Docker Desktop on Windows/macOS gives the
+    # container an IPv6 stack that has no upstream route. Node's default
+    # resolver in Node 22+ (`verbatim`) can still return AAAA first, and
+    # some libraries do their own `dns.lookup({family:6})`. NODE_OPTIONS
+    # and the in-code setDefaultResultOrder() cover *most* callers, but
+    # Entra callback (openid-client / passport) still surfaced ENETUNREACH
+    # on 2603:1027:*. Killing IPv6 at the sysctl level removes the failure
+    # surface entirely — no interface, no lookup, no crash.
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+      - net.ipv6.conf.default.disable_ipv6=1
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
@@ -1431,6 +1620,13 @@ $null = Install-CaddyRootCA
 Write-Host ""
 Write-Host "  Waiting for dashboard to be ready..."
 Start-Sleep -Seconds 10
+
+# BANKING-GRADE PURGE — DEFERRED (task #149).
+# An earlier revision purged .env here, but Docker Compose re-interpolates
+# ${VAR} refs on every subsequent `docker compose up` (updates, product
+# deploys, scheduled restarts). No .env on disk = empty vars in containers
+# = crash-loop. Reintroduce the purge only once dashboard-api regenerates
+# .env from .env.enc before every compose action.
 
 
 # ── Native capture daemon — REMOVED FROM ONELINER (B-CAPTURE-DEFER) ─────────

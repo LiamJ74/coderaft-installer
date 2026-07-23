@@ -552,15 +552,19 @@ clients:
 
   - name: entraguard
     cert_san: "entraguard.coderaft.local"
-    permissions: ["read:azure_*","read:license_key","read:entraguard_*"]
+    permissions: ["read:azure_*","read:license_key","read:entraguard_*","read:platform/identity/oidc"]
 
   - name: ravenscan
     cert_san: "ravenscan.coderaft.local"
-    permissions: ["read:ravenscan_*","read:neo4j_*","read:license_key"]
+    permissions: ["read:ravenscan_*","read:neo4j_*","read:license_key","read:platform/identity/oidc"]
 
   - name: redfox
     cert_san: "redfox.coderaft.local"
-    permissions: ["read:redfox_*","read:license_key"]
+    permissions: ["read:redfox_*","read:license_key","read:platform/identity/oidc"]
+
+  - name: falconone
+    cert_san: "falconone.coderaft.local"
+    permissions: ["read:license_key","read:falconone_*","read:platform/identity/oidc","sign:falconone_agent_cert","read:falconone/nvd_api_key","read:falconone/audit_hmac_key","write:falconone/audit_hmac_key","read:falconone/pki/agents-ca/cert"]
 ACLEOF
     chmod 600 vault-config/acl.yaml
 
@@ -587,7 +591,205 @@ _vault_client_cert() {
     chmod 600 "vault-tls/${name}-client.crt" "vault-tls/${name}-client.key"
 }
 
+# ── FalconOne agents mTLS PKI (#170) ─────────────────────────────────────────
+# Distinct CA/leaf from the vault client PKI above: falconone-tls/agents-ca.crt
+# is the pool of ClientCAs falconone-api trusts for inbound agent mTLS, and
+# falconone-tls/server.crt is the leaf falconone-api presents on :8443 to its
+# own Windows agents. Bug #170: server.crt's SAN only ever had
+# [localhost, falconone-api] — remote agents connecting via
+# https://<public-hostname>:8443/agent/v1 failed hostname verification.
+# Self-healing: the CA is preserved if it already exists (regenerating it
+# would break trust for any agent already enrolled); only the leaf is
+# regenerated, and only when it's missing the "coderaft.local" SAN.
+_falconone_tls_bootstrap() {
+    local install_dir="${1:?install_dir required}"
+    local fo_tls_dir="${install_dir}/falconone-tls"
+    mkdir -p "$fo_tls_dir"
+    chmod 755 "$fo_tls_dir"
+
+    local fo_sans="DNS:localhost,DNS:falconone-api,DNS:coderaft.local"
+    local fo_hostname
+    fo_hostname="$(hostname 2>/dev/null || true)"
+    [ -n "$fo_hostname" ] && fo_sans="${fo_sans},DNS:${fo_hostname}"
+    if [ -n "${CODERAFT_EXTRA_HOSTS:-}" ]; then
+        local _h _extra_hosts
+        IFS=',' read -ra _extra_hosts <<< "$CODERAFT_EXTRA_HOSTS"
+        for _h in "${_extra_hosts[@]}"; do
+            _h="$(echo "$_h" | xargs)"
+            [ -n "$_h" ] && fo_sans="${fo_sans},DNS:${_h}"
+        done
+    fi
+    fo_sans="${fo_sans},IP:127.0.0.1"
+
+    if command -v openssl &>/dev/null; then
+        if [ ! -f "${fo_tls_dir}/agents-ca.crt" ]; then
+            openssl req -x509 -newkey rsa:4096 -days 3650 -nodes -sha256 \
+                -keyout "${fo_tls_dir}/agents-ca.key" -out "${fo_tls_dir}/agents-ca.crt" \
+                -subj "/CN=falconone-agents-ca" \
+                -addext "basicConstraints=critical,CA:TRUE" 2>/dev/null
+        fi
+        local need_regen=1
+        if [ -f "${fo_tls_dir}/server.crt" ] && openssl x509 -in "${fo_tls_dir}/server.crt" -noout -text 2>/dev/null | grep -q "coderaft.local"; then
+            need_regen=0
+        fi
+        if [ "$need_regen" = "1" ]; then
+            openssl req -newkey rsa:2048 -nodes -sha256 \
+                -keyout "${fo_tls_dir}/server.key" -out "${fo_tls_dir}/server.csr" \
+                -subj "/CN=falconone-agents" 2>/dev/null
+            openssl x509 -req -days 3650 -sha256 \
+                -in "${fo_tls_dir}/server.csr" \
+                -CA "${fo_tls_dir}/agents-ca.crt" -CAkey "${fo_tls_dir}/agents-ca.key" -CAcreateserial \
+                -out "${fo_tls_dir}/server.crt" \
+                -extfile <(printf "subjectAltName=%s\nbasicConstraints=CA:FALSE" "$fo_sans") 2>/dev/null
+            rm -f "${fo_tls_dir}/server.csr"
+        fi
+        chmod 644 "${fo_tls_dir}"/*.crt "${fo_tls_dir}"/*.key 2>/dev/null || true
+    else
+        local abs_fo_tls_dir fo_script_file
+        abs_fo_tls_dir="$(cd "$fo_tls_dir" && pwd)"
+        fo_script_file="$(mktemp)"
+        cat > "$fo_script_file" <<'FOSCRIPT'
+set -e
+apk add --no-cache openssl >/dev/null
+cd /work
+if [ ! -f agents-ca.crt ]; then
+    openssl req -x509 -newkey rsa:4096 -days 3650 -nodes -sha256 \
+        -keyout agents-ca.key -out agents-ca.crt \
+        -subj "/CN=falconone-agents-ca" \
+        -addext "basicConstraints=critical,CA:TRUE" 2>/dev/null
+fi
+NEED_REGEN=1
+if [ -f server.crt ] && openssl x509 -in server.crt -noout -text 2>/dev/null | grep -q "coderaft.local"; then
+    NEED_REGEN=0
+fi
+if [ "$NEED_REGEN" = "1" ]; then
+    openssl req -newkey rsa:2048 -nodes -sha256 \
+        -keyout server.key -out server.csr \
+        -subj "/CN=falconone-agents" 2>/dev/null
+    printf "subjectAltName=__FO_SAN_LIST__\nbasicConstraints=CA:FALSE" > /tmp/server.ext
+    openssl x509 -req -days 3650 -sha256 \
+        -in server.csr -CA agents-ca.crt -CAkey agents-ca.key -CAcreateserial \
+        -out server.crt -extfile /tmp/server.ext 2>/dev/null
+    rm -f server.csr
+fi
+chmod 644 *.crt *.key 2>/dev/null || true
+FOSCRIPT
+        sed -i.tmp "s/__FO_SAN_LIST__/${fo_sans}/" "$fo_script_file" && rm -f "${fo_script_file}.tmp"
+        docker run --rm -v "${fo_script_file}:/script.sh:ro" -v "${abs_fo_tls_dir}:/work" alpine:3.20 sh /script.sh 2>&1
+        rm -f "$fo_script_file"
+    fi
+    echo "  ✓ FalconOne agents PKI written (SAN: ${fo_sans})"
+}
+
+# ── ACL self-heal: falconone entry/permissions (#172) ────────────────────────
+# The static acl.yaml written by _vault_write_config only runs once (its
+# caller, vault_bootstrap_tls, returns early when vault-tls already exists —
+# see the "already exists — skipping" guards above). That means any install
+# that provisioned vault before this fix shipped will never get the
+# falconone entry/permissions rewritten. This self-heal is additive-only,
+# idempotent, and safe to call on every install/update run: if the
+# "falconone" client entry is missing, it appends the full canonical block;
+# if present, it appends only whichever required permissions are missing,
+# leaving everything else in the file untouched. Backs up acl.yaml before
+# any modification.
+_falconone_acl_selfheal() {
+    local acl_path="$1"
+
+    if [ ! -f "$acl_path" ]; then
+        echo "  [install] ACL self-heal: $acl_path not found — skipping (vault not provisioned yet)"
+        return 0
+    fi
+
+    local required_perms=(
+        "read:license_key"
+        "read:falconone_*"
+        "read:platform/identity/oidc"
+        "sign:falconone_agent_cert"
+        "read:falconone/nvd_api_key"
+        "read:falconone/audit_hmac_key"
+        "write:falconone/audit_hmac_key"
+        "read:falconone/pki/agents-ca/cert"
+    )
+
+    local ts
+    ts="$(date -u +"%Y%m%dT%H%M%SZ")"
+
+    if ! grep -qE '^[[:space:]]*-[[:space:]]*name:[[:space:]]*falconone[[:space:]]*$' "$acl_path"; then
+        cp "$acl_path" "${acl_path}.bak-${ts}"
+        cat >> "$acl_path" <<'FALCONONEACL'
+
+  - name: falconone
+    cert_san: "falconone.coderaft.local"
+    permissions:
+      - "read:license_key"
+      - "read:falconone_*"
+      - "read:platform/identity/oidc"
+      - "sign:falconone_agent_cert"
+      - "read:falconone/nvd_api_key"
+      - "read:falconone/audit_hmac_key"
+      - "write:falconone/audit_hmac_key"
+      - "read:falconone/pki/agents-ca/cert"
+FALCONONEACL
+        echo "  [install] Self-heal ACL: falconone permissions updated (+${#required_perms[@]} added, entry created)"
+        return 0
+    fi
+
+    local start_line end_line
+    start_line=$(grep -nE '^[[:space:]]*-[[:space:]]*name:[[:space:]]*falconone[[:space:]]*$' "$acl_path" | head -1 | cut -d: -f1)
+    end_line=$(awk -v s="$start_line" 'NR>s && /^[[:space:]]*-[[:space:]]*name:/{print NR; exit}' "$acl_path")
+    if [ -z "$end_line" ]; then
+        end_line=$(( $(wc -l < "$acl_path") + 1 ))
+    fi
+
+    local block
+    block=$(sed -n "${start_line},$((end_line - 1))p" "$acl_path")
+
+    local missing=()
+    local p
+    for p in "${required_perms[@]}"; do
+        if ! grep -qF "\"${p}\"" <<< "$block"; then
+            missing+=("$p")
+        fi
+    done
+
+    if [ "${#missing[@]}" -eq 0 ]; then
+        echo "  [install] ACL falconone already up-to-date"
+        return 0
+    fi
+
+    cp "$acl_path" "${acl_path}.bak-${ts}"
+
+    if grep -qE '^[[:space:]]*permissions:[[:space:]]*\[.*\][[:space:]]*$' <<< "$block"; then
+        local additions=""
+        for p in "${missing[@]}"; do additions="${additions},\"${p}\""; done
+        awk -v s="$start_line" -v e="$end_line" -v add="$additions" '
+            NR>=s && NR<e && /^[[:space:]]*permissions:[[:space:]]*\[.*\][[:space:]]*$/ {
+                sub(/\][[:space:]]*$/, add "]")
+            }
+            { print }
+        ' "$acl_path" > "${acl_path}.tmp" && mv "${acl_path}.tmp" "$acl_path"
+    else
+        local addition_block=""
+        for p in "${missing[@]}"; do addition_block="${addition_block}      - \"${p}\""$'\n'; done
+        local insert_line=$(( end_line - 1 ))
+        awk -v ins="$insert_line" -v add="$addition_block" '
+            { print }
+            NR==ins { printf "%s", add }
+        ' "$acl_path" > "${acl_path}.tmp" && mv "${acl_path}.tmp" "$acl_path"
+    fi
+
+    echo "  [install] Self-heal ACL: falconone permissions updated (+${#missing[@]} added)"
+}
+
 vault_bootstrap
+
+# ── FalconOne mTLS PKI + ACL self-heal (#170 / #172) ─────────────────────────
+# Always run, independent of vault_bootstrap's internal "already exists —
+# skipping" guards, so a re-run of this installer on an existing install
+# still gets the extended-SAN falconone-tls cert and any missing ACL
+# permissions healed.
+_falconone_tls_bootstrap "$PWD"
+_falconone_acl_selfheal "vault-config/acl.yaml"
 
 # Append CODERAFT_VAULT_* env vars if not already present
 _add_env_if_missing() {
@@ -733,6 +935,14 @@ services:
       # dashboard-api resolves `postgres` to nothing and every DB call
       # throws `getaddrinfo EAI_AGAIN postgres`.
       - coderaft-backend
+    # B-IPV6-KILL (2026-07-22): Docker Desktop on Windows/macOS gives the
+    # container an IPv6 stack with no upstream route; some libraries still
+    # `dns.lookup({family:6})` despite NODE_OPTIONS. Kill IPv6 at the sysctl
+    # level so no lookup can even resolve to an AAAA — root-caused after
+    # Entra callback surfaced ENETUNREACH on 2603:1027:*.
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+      - net.ipv6.conf.default.disable_ipv6=1
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
@@ -1247,6 +1457,16 @@ else
     echo ""
     echo "  Waiting for dashboard to be ready..."
     sleep 10
+
+    # BANKING-GRADE PURGE — DEFERRED (task #149).
+    # An earlier revision purged .env here (banking-grade at-rest goal), but
+    # Docker Compose re-interpolates ${VAR} refs on every `docker compose up`
+    # (including scheduled restarts, updates, product deploys) — no .env on
+    # disk means empty env vars in the containers → whole stack crash-loops.
+    # Reintroduce the purge ONLY once dashboard-api regenerates .env from
+    # .env.enc before each compose action (or a --env-file explicit pipe is
+    # wired everywhere). Until then keep .env at rest with mode 0600 as
+    # documented in the same section of update.sh.
 fi
 
 
