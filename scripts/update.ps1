@@ -2113,35 +2113,90 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-# ── #137 fix: refresh certs/server-ca.pem from Caddy internal CA ─────────
+# ── #137 fix: refresh certs/server-ca.pem — Caddy TLS mode-aware (#187) ──
 # entraguard-api mounts certs/server-ca.pem into the container and hands
 # it to endpoint agents at /register (as `ca_cert`) so agents can verify
-# the Caddy front cert on their report loop. Any operator that ran an
-# install BEFORE this fix landed has no server-ca.pem — refresh it every
-# update so the file exists (idempotent, non-fatal on failure).
-Write-Host "  Refreshing certs\server-ca.pem from Caddy internal CA…"
+# the front cert on their report loop. Caddy can be configured in 3 modes
+# (task #133 Setup Wizard TLS): (1) `tls internal` → PKI root at
+# /data/caddy/pki/authorities/local/root.crt ; (2) `tls /certs/...`
+# (mkcert / self-signed / setup-wizard-generated) → leaf cert already on
+# host under ./certs/, serves as its own trust anchor ; (3) `tls email`
+# (Let's Encrypt) → globally trusted, no export needed. Detect the mode
+# from the running Caddyfile and adapt.
+Write-Host "  Refreshing certs\server-ca.pem (mode-aware)..."
 try {
     New-Item -ItemType Directory -Force -Path (Join-Path (Get-Location) "certs") | Out-Null
-    $caContainerPath = "/data/caddy/pki/authorities/local/root.crt"
-    $ok = $false
-    for ($i = 0; $i -lt 20; $i++) {
-        & docker @ComposeArgs exec -T caddy test -f $caContainerPath 2>$null
-        if ($LASTEXITCODE -eq 0) { $ok = $true; break }
-        Start-Sleep -Seconds 2
-    }
-    if ($ok) {
-        $caLocal = Join-Path (Get-Location) "certs\server-ca.pem"
-        & docker @ComposeArgs cp "caddy:$caContainerPath" $caLocal 2>$null
-        if ($LASTEXITCODE -eq 0 -and (Test-Path $caLocal)) {
-            Write-Host "  ✓ certs\server-ca.pem refreshed (entraguard-api will pick it up on next call)"
-            # Restart entraguard-api so the (bind-mounted) new CA is
-            # visible without waiting for the next container recreate.
-            & docker @ComposeArgs restart entraguard-api 2>$null | Out-Null
-        } else {
-            Write-Host "  ⚠ docker cp for Caddy CA failed (exit $LASTEXITCODE)" -ForegroundColor Yellow
+    $caLocal = Join-Path (Get-Location) "certs\server-ca.pem"
+
+    # Read the actual Caddyfile inside the running caddy container.
+    $caddyfileOut = Join-Path $env:TEMP "coderaft-caddyfile-$(Get-Random).log"
+    $caddyfileErr = Join-Path $env:TEMP "coderaft-caddyfile-err-$(Get-Random).log"
+    $cfProc = Start-Process -FilePath "docker" -ArgumentList (@() + $ComposeArgs + @("exec","-T","caddy","cat","/etc/caddy/Caddyfile")) `
+        -NoNewWindow -PassThru `
+        -RedirectStandardOutput $caddyfileOut `
+        -RedirectStandardError  $caddyfileErr
+    if (-not $cfProc.WaitForExit(15000)) { try { $cfProc.Kill() } catch {} }
+    $caddyfile = ""
+    if (Test-Path $caddyfileOut) { $caddyfile = (Get-Content $caddyfileOut -Raw -ErrorAction SilentlyContinue) }
+    Remove-Item -Path $caddyfileOut, $caddyfileErr -ErrorAction SilentlyContinue
+
+    $tlsMode = "unknown"
+    if ($caddyfile -match '(?m)^\s*tls\s+internal\s*$')                 { $tlsMode = "internal" }
+    elseif ($caddyfile -match '(?m)^\s*tls\s+/certs/\S+\.pem\s+\S+')    { $tlsMode = "file" }
+    elseif ($caddyfile -match '(?m)^\s*tls\s+[a-zA-Z0-9._+-]+@\S+')     { $tlsMode = "letsencrypt" }
+
+    switch ($tlsMode) {
+        "internal" {
+            $caContainerPath = "/data/caddy/pki/authorities/local/root.crt"
+            $ok = $false
+            for ($i = 0; $i -lt 20; $i++) {
+                & docker @ComposeArgs exec -T caddy test -f $caContainerPath 2>$null
+                if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+                Start-Sleep -Seconds 2
+            }
+            if ($ok) {
+                & docker @ComposeArgs cp "caddy:$caContainerPath" $caLocal 2>$null
+                if ($LASTEXITCODE -eq 0 -and (Test-Path $caLocal) -and (Get-Item $caLocal).Length -gt 0) {
+                    Write-Host "  ✓ certs\server-ca.pem refreshed from Caddy internal PKI"
+                    & docker @ComposeArgs restart entraguard-api 2>$null | Out-Null
+                } else {
+                    Write-Host "  ⚠ docker cp for Caddy internal CA failed (exit $LASTEXITCODE)" -ForegroundColor Yellow
+                }
+            } else {
+                Write-Host "  ⚠ Caddy internal CA not initialized after 40s — endpoint agents may see x509 errors." -ForegroundColor Yellow
+            }
         }
-    } else {
-        Write-Host "  ⚠ Caddy CA not found after 40s — endpoint agents may see x509 errors until it's exported." -ForegroundColor Yellow
+        "file" {
+            # Caddy serves file-based certs (mkcert / setup-wizard signed).
+            # The leaf cert IS the trust anchor for agents (self-contained
+            # chain). Copy the active leaf as server-ca.pem — agents pin
+            # the leaf via /register response `ca_cert` field.
+            $leafCandidates = @("certs\coderaft.local.pem", "certs\coderaft.pem", "certs\server.pem")
+            $leafSrc = $null
+            foreach ($cand in $leafCandidates) {
+                $candPath = Join-Path (Get-Location) $cand
+                if (Test-Path $candPath -PathType Leaf) { $leafSrc = $candPath; break }
+            }
+            if ($leafSrc) {
+                Copy-Item -LiteralPath $leafSrc -Destination $caLocal -Force
+                Write-Host "  ✓ certs\server-ca.pem refreshed (from active TLS file cert: $(Split-Path $leafSrc -Leaf))"
+                & docker @ComposeArgs restart entraguard-api 2>$null | Out-Null
+            } else {
+                Write-Host "  ⚠ TLS mode 'file' detected but no active leaf cert found under .\certs\ — agents may fail x509 verify." -ForegroundColor Yellow
+            }
+        }
+        "letsencrypt" {
+            # LE certs are chained to publicly-trusted roots — nothing to
+            # export. Ensure server-ca.pem is either absent or empty so
+            # agents fall back to system trust store.
+            if (Test-Path $caLocal) { Remove-Item -Path $caLocal -Force -ErrorAction SilentlyContinue }
+            New-Item -ItemType File -Path $caLocal -Force | Out-Null
+            Write-Host "  ✓ TLS mode 'letsencrypt' — server-ca.pem cleared (agents use system trust)"
+        }
+        default {
+            Write-Host "  ⚠ Could not detect Caddy TLS mode from Caddyfile — skipping CA refresh." -ForegroundColor Yellow
+            Write-Host "     (task #187: help improve detection by opening a support ticket with your Caddyfile)"
+        }
     }
 } catch {
     Write-Host "  ⚠ CA refresh skipped: $($_.Exception.Message)" -ForegroundColor Yellow

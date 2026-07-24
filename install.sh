@@ -1148,38 +1148,77 @@ CADDY
     echo "  ✓ Caddyfile generated (TLS: Caddy internal CA)"
 fi
 
-# ── Trust the Caddy internal CA (replaces mkcert, 2026-07) ──────────────────
-# Caddy (`tls internal`) generates a root CA on first start, stored in the
-# caddy_data volume — NEVER delete that volume between installs, or every
-# endpoint/agent that trusted the old CA breaks. We export root.crt and add
-# it to the OS trust store. Failure is non-fatal (dashboard also serves the
-# CA + a GPO push package: Setup → TLS).
+# ── Trust the active Caddy CA (mode-aware, #187) ────────────────────────────
+# Caddy runs in one of 3 TLS modes (Setup Wizard TLS 3-modes, task #133):
+#   (1) `tls internal`             → PKI root at /data/caddy/pki/authorities/local/root.crt
+#   (2) `tls /certs/...pem <key>`  → mkcert / self-signed / setup-wizard leaf; the leaf
+#                                    is the trust anchor for endpoint agents
+#   (3) `tls email@example.com`    → Let's Encrypt; globally trusted, no export needed
+# Detect the mode from the running Caddyfile and adapt. Failure is non-fatal
+# (dashboard also serves the active CA + GPO push package: Setup → TLS).
 trust_caddy_ca() {
     if [ "${CODERAFT_SKIP_HTTPS:-0}" = "1" ]; then
         echo "  CODERAFT_SKIP_HTTPS=1 — skipping CA trust setup"
         return 0
     fi
 
-    local ca_container_path="/data/caddy/pki/authorities/local/root.crt"
-    echo "  Waiting for Caddy to generate its internal CA (max 30s)…"
-    local i ca_ready=0
-    for i in $(seq 1 15); do
-        if docker compose exec -T caddy test -f "$ca_container_path" >/dev/null 2>&1; then
-            ca_ready=1
-            break
-        fi
-        sleep 2
-    done
-    if [ "$ca_ready" = "0" ]; then
-        echo "  ⚠ Caddy CA not found after 30s — browsers will warn on https://coderaft.local."
-        echo "    Download it later from the dashboard: Setup → TLS → Download CA."
-        return 1
+    # Detect the active TLS mode from the running Caddyfile
+    local caddyfile
+    caddyfile="$(docker compose exec -T caddy cat /etc/caddy/Caddyfile 2>/dev/null || true)"
+    local tls_mode="unknown"
+    if echo "$caddyfile" | grep -qE '^\s*tls\s+internal\s*$'; then
+        tls_mode="internal"
+    elif echo "$caddyfile" | grep -qE '^\s*tls\s+/certs/\S+\.pem\s+\S+'; then
+        tls_mode="file"
+    elif echo "$caddyfile" | grep -qE '^\s*tls\s+[a-zA-Z0-9._+-]+@\S+'; then
+        tls_mode="letsencrypt"
     fi
 
-    if ! docker compose cp "caddy:${ca_container_path}" caddy-root.crt >/dev/null 2>&1; then
-        echo "  ⚠ Could not export the Caddy root CA — skipping trust install."
-        return 1
-    fi
+    case "$tls_mode" in
+        letsencrypt)
+            echo "  Caddy TLS mode: Let's Encrypt (public trust — nothing to install)"
+            return 0
+            ;;
+        file)
+            # File-based cert: use the leaf on the host as the trust anchor.
+            local leaf=""
+            for c in certs/coderaft.local.pem certs/coderaft.pem certs/server.pem; do
+                if [ -f "$c" ]; then leaf="$c"; break; fi
+            done
+            if [ -z "$leaf" ]; then
+                echo "  ⚠ Caddy TLS mode 'file' detected but no active leaf cert found under ./certs/ — cannot install trust."
+                return 1
+            fi
+            cp -f "$leaf" caddy-root.crt
+            echo "  Caddy TLS mode: file ($(basename "$leaf") acts as trust anchor)"
+            ;;
+        internal)
+            local ca_container_path="/data/caddy/pki/authorities/local/root.crt"
+            echo "  Waiting for Caddy to generate its internal CA (max 30s)…"
+            local i ca_ready=0
+            for i in $(seq 1 15); do
+                if docker compose exec -T caddy test -f "$ca_container_path" >/dev/null 2>&1; then
+                    ca_ready=1
+                    break
+                fi
+                sleep 2
+            done
+            if [ "$ca_ready" = "0" ]; then
+                echo "  ⚠ Caddy internal CA not found after 30s — browsers will warn on https://coderaft.local."
+                echo "    Download it later from the dashboard: Setup → TLS → Download CA."
+                return 1
+            fi
+            if ! docker compose cp "caddy:${ca_container_path}" caddy-root.crt >/dev/null 2>&1; then
+                echo "  ⚠ Could not export the Caddy root CA — skipping trust install."
+                return 1
+            fi
+            ;;
+        *)
+            echo "  ⚠ Could not detect Caddy TLS mode from Caddyfile — skipping CA trust install."
+            echo "    (task #187: report your Caddyfile so we can improve detection)"
+            return 1
+            ;;
+    esac
 
     echo "  Installing the Coderaft root CA into the system trust store (may prompt for sudo)…"
     case "${CODERAFT_OS}" in
