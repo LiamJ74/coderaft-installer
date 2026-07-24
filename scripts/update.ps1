@@ -368,17 +368,25 @@ if (Test-Path $composePathB15) {
     # PowerShell 5.1 for large compose files with catastrophic backtracking
     # (confirmed live at Liam's node, task #183). Switched to a cheap
     # substring probe: scan line-by-line for "dashboard-api:" then look for
-    # "sysctls:" in the next 40 lines before the next top-level service.
+    # BOTH "sysctls:" AND "disable_ipv6=1" in the next 40 lines. Checking
+    # for the actual disable_ipv6 value (not just the sysctls: key) means
+    # a compose with sysctls declared for another reason won't silently
+    # skip the IPv6 kill — the IPv6 issue was the whole point of this
+    # self-heal, so we verify the value, not the container's presence.
     $needsSysctls = $true
     $probeLines = $composeTextB15 -split "`r?`n"
     for ($p = 0; $p -lt $probeLines.Count; $p++) {
         if ($probeLines[$p] -match '^\s+dashboard-api:\s*$') {
             $probeIndent = ($probeLines[$p] -replace '\S.*$','').Length
+            $seenSysctls = $false
+            $seenDisableIpv6 = $false
             for ($q = $p + 1; $q -lt [Math]::Min($p + 40, $probeLines.Count); $q++) {
                 # Left a sibling service block (same indent, starts with letter)
                 if ($probeLines[$q] -match "^\s{$probeIndent}[a-zA-Z]") { break }
-                if ($probeLines[$q] -match '^\s+sysctls:\s*$') { $needsSysctls = $false; break }
+                if ($probeLines[$q] -match '^\s+sysctls:\s*$')                { $seenSysctls = $true }
+                if ($probeLines[$q] -match 'net\.ipv6\.conf\.all\.disable_ipv6\s*=\s*1') { $seenDisableIpv6 = $true }
             }
+            if ($seenSysctls -and $seenDisableIpv6) { $needsSysctls = $false }
             break
         }
     }
