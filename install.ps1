@@ -343,10 +343,14 @@ function Invoke-VaultBootstrap {
     $volInspectErr = Join-Path $env:TEMP "coderaft-volinspect-stderr-$(Get-Random).txt"
     $volInspectProc = Start-Process -FilePath "docker" `
         -ArgumentList "volume","inspect","coderaft_vault_data" `
-        -NoNewWindow -Wait -PassThru `
+        -NoNewWindow -PassThru `
         -RedirectStandardOutput $volInspectOut `
         -RedirectStandardError  $volInspectErr `
         -ErrorAction SilentlyContinue
+    if ($volInspectProc -and -not $volInspectProc.WaitForExit(60000)) {   # 60s
+        Write-Host "  ⚠  Docker command timed out after 60s: docker volume inspect coderaft_vault_data" -ForegroundColor Yellow
+        try { $volInspectProc.Kill() } catch {}
+    }
     Remove-Item -Path $volInspectOut,$volInspectErr -ErrorAction SilentlyContinue
     if ($volInspectProc.ExitCode -eq 0) {
         Write-Host "  Removing stale coderaft_vault_data volume from a previous install attempt..."
@@ -1188,10 +1192,14 @@ function Install-CaddyRootCA {
         $out = Join-Path $env:TEMP "coderaft-ca-out-$(Get-Random).log"
         $err = Join-Path $env:TEMP "coderaft-ca-err-$(Get-Random).log"
         $proc = Start-Process -FilePath "docker" -ArgumentList $Arguments `
-            -NoNewWindow -Wait -PassThru `
+            -NoNewWindow -PassThru `
             -RedirectStandardOutput $out `
             -RedirectStandardError $err `
             -ErrorAction SilentlyContinue
+        if ($proc -and -not $proc.WaitForExit(60000)) {   # 60s
+            Write-Host "  ⚠  Docker command timed out after 60s: docker $($Arguments -join ' ')" -ForegroundColor Yellow
+            try { $proc.Kill() } catch {}
+        }
         Remove-Item -Path $out,$err -ErrorAction SilentlyContinue
         if ($proc) { return $proc.ExitCode } else { return 1 }
     }
@@ -1386,12 +1394,16 @@ function Invoke-VaultUnsealFresh {
     $inspectFormat = '{{ index .Config.Labels "com.docker.compose.project" }}'
     $inspectStdout = Join-Path $env:TEMP "coderaft-inspect-out-$(Get-Random).log"
     $inspectStderr = Join-Path $env:TEMP "coderaft-inspect-err-$(Get-Random).log"
-    Start-Process -FilePath "docker" -ArgumentList @(
+    $inspectProc = Start-Process -FilePath "docker" -ArgumentList @(
         "inspect", "coderaft-coderaft-vault-1", "--format", $inspectFormat
-    ) -NoNewWindow -Wait `
+    ) -NoNewWindow -PassThru `
         -RedirectStandardOutput $inspectStdout `
         -RedirectStandardError $inspectStderr `
-        -ErrorAction SilentlyContinue | Out-Null
+        -ErrorAction SilentlyContinue
+    if ($inspectProc -and -not $inspectProc.WaitForExit(60000)) {   # 60s
+        Write-Host "  ⚠  Docker command timed out after 60s: docker inspect coderaft-coderaft-vault-1" -ForegroundColor Yellow
+        try { $inspectProc.Kill() } catch {}
+    }
     $vaultProject = ((Get-Content $inspectStdout -ErrorAction SilentlyContinue) -join "").Trim()
     Remove-Item -Path $inspectStdout,$inspectStderr -ErrorAction SilentlyContinue
     if (-not $vaultProject) { $vaultProject = "coderaft" }

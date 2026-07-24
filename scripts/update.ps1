@@ -12,6 +12,15 @@
 # newly declared services, auto-rollback on failure). Without -Product,
 # the legacy full-platform update runs unchanged. Equivalent of clicking
 # "Mettre à jour ce produit" in the dashboard, and of `update.sh --product`.
+#
+# HTTP calls (#183): every Invoke-RestMethod / Invoke-WebRequest below has
+# an explicit -TimeoutSec — PS 5.1 defaults to infinite, which used to hang
+# this script silently on a slow backend/DNS/TLS stack. New HTTP calls
+# should use the Invoke-CoderaftHTTP helper (defined below, right before
+# "Updating CodeRaft...") to keep the timeout+logging behavior consistent.
+# Start-Process docker calls for quick health probes (compose ps, exec
+# cat/test-f, inspect) also carry a WaitForExit(60000) safety net to guard
+# against Docker Desktop hangs; long-running docker pull/run are untouched.
 
 param(
     [string]$Product = ""
@@ -99,21 +108,29 @@ function Find-AdminToken {
         # as NativeCommandError in PS 5.1. Use Start-Process + temp files.
         $svcStdout = Join-Path $env:TEMP "coderaft-svc-out-$(Get-Random).log"
         $svcStderr = Join-Path $env:TEMP "coderaft-svc-err-$(Get-Random).log"
-        Start-Process -FilePath "docker" -ArgumentList @("compose","ps","--services") `
-            -NoNewWindow -Wait `
+        $svcProc = Start-Process -FilePath "docker" -ArgumentList @("compose","ps","--services") `
+            -NoNewWindow -PassThru `
             -RedirectStandardOutput $svcStdout `
             -RedirectStandardError  $svcStderr `
-            -ErrorAction SilentlyContinue | Out-Null
+            -ErrorAction SilentlyContinue
+        if ($svcProc -and -not $svcProc.WaitForExit(60000)) {   # 60s — Docker Desktop can hang on `compose ps`
+            Write-Host "  ⚠  Docker command timed out after 60s: docker compose ps --services" -ForegroundColor Yellow
+            try { $svcProc.Kill() } catch {}
+        }
         $services = (Get-Content $svcStdout -ErrorAction SilentlyContinue) -join "`n"
         Remove-Item -Path $svcStdout,$svcStderr -ErrorAction SilentlyContinue
         if ($services -match '(?m)^dashboard-api$') {
             $catStdout = Join-Path $env:TEMP "coderaft-cat-out-$(Get-Random).log"
             $catStderr = Join-Path $env:TEMP "coderaft-cat-err-$(Get-Random).log"
-            Start-Process -FilePath "docker" -ArgumentList @("compose","exec","-T","dashboard-api","cat","/data/admin_token") `
-                -NoNewWindow -Wait `
+            $catProc = Start-Process -FilePath "docker" -ArgumentList @("compose","exec","-T","dashboard-api","cat","/data/admin_token") `
+                -NoNewWindow -PassThru `
                 -RedirectStandardOutput $catStdout `
                 -RedirectStandardError  $catStderr `
-                -ErrorAction SilentlyContinue | Out-Null
+                -ErrorAction SilentlyContinue
+            if ($catProc -and -not $catProc.WaitForExit(60000)) {   # 60s
+                Write-Host "  ⚠  Docker command timed out after 60s: docker compose exec dashboard-api cat /data/admin_token" -ForegroundColor Yellow
+                try { $catProc.Kill() } catch {}
+            }
             $val = ((Get-Content $catStdout -ErrorAction SilentlyContinue) -join "`n").Trim()
             Remove-Item -Path $catStdout,$catStderr -ErrorAction SilentlyContinue
             if ($val) { return $val }
@@ -220,6 +237,43 @@ if (-not $env:DOCKER_DEFAULT_PLATFORM) {
     $hostArch = $env:PROCESSOR_ARCHITECTURE
     if ($hostArch -eq "ARM64")        { $env:DOCKER_DEFAULT_PLATFORM = "linux/arm64" }
     elseif ($hostArch -eq "AMD64")    { $env:DOCKER_DEFAULT_PLATFORM = "linux/amd64" }
+}
+
+# ── Invoke-CoderaftHTTP — timeout enforcé + logging cohérent (#183) ──────
+# Windows PowerShell 5.1's Invoke-RestMethod/Invoke-WebRequest default to an
+# INFINITE timeout. A slow backend, a stalled DNS resolver, or a hung TLS
+# handshake can therefore block this script forever with no log line to
+# explain why (confirmed live 2026-07-24). Every Invoke-RestMethod /
+# Invoke-WebRequest call in this script now passes an explicit -TimeoutSec.
+# This wrapper is not yet used by the existing calls (too much churn for
+# this change) but is available for any NEW call added going forward —
+# prefer it over a bare Invoke-RestMethod so the timeout can never be
+# forgotten again.
+function Invoke-CoderaftHTTP {
+    param(
+        [Parameter(Mandatory)] [string]$Method,
+        [Parameter(Mandatory)] [string]$Uri,
+        [hashtable]$Headers,
+        [string]$Body,
+        [int]$TimeoutSec = 15,
+        [switch]$UseBasicParsing,
+        [switch]$SuppressErrors
+    )
+    Write-Verbose "HTTP $Method $Uri (timeout ${TimeoutSec}s)"
+    $params = @{
+        Method = $Method
+        Uri = $Uri
+        TimeoutSec = $TimeoutSec
+    }
+    if ($Headers) { $params['Headers'] = $Headers }
+    if ($Body) { $params['Body'] = $Body }
+    if ($UseBasicParsing) { $params['UseBasicParsing'] = $true }
+    try {
+        return Invoke-RestMethod @params -ErrorAction Stop
+    } catch {
+        if ($SuppressErrors) { return $null }
+        throw
+    }
 }
 
 Write-Host "  Updating CodeRaft..."
@@ -485,10 +539,14 @@ try {
     $psCheckOut = Join-Path $env:TEMP "coderaft-pscheck-out-$(Get-Random).log"
     $psCheckErr = Join-Path $env:TEMP "coderaft-pscheck-err-$(Get-Random).log"
     $psCheckProc = Start-Process -FilePath "docker" -ArgumentList @("compose","ps") `
-        -NoNewWindow -Wait -PassThru `
+        -NoNewWindow -PassThru `
         -RedirectStandardOutput $psCheckOut `
         -RedirectStandardError  $psCheckErr `
         -ErrorAction SilentlyContinue
+    if ($psCheckProc -and -not $psCheckProc.WaitForExit(60000)) {   # 60s
+        Write-Host "  ⚠  Docker command timed out after 60s: docker compose ps" -ForegroundColor Yellow
+        try { $psCheckProc.Kill() } catch {}
+    }
     Remove-Item -Path $psCheckOut,$psCheckErr -ErrorAction SilentlyContinue
     if ($psCheckProc.ExitCode -eq 0) { $composeOK = $true }
 } catch { }
@@ -526,10 +584,14 @@ if (-not $composeOK) {
         $psHealOut = Join-Path $env:TEMP "coderaft-psheal-out-$(Get-Random).log"
         $psHealErr = Join-Path $env:TEMP "coderaft-psheal-err-$(Get-Random).log"
         $psHealProc = Start-Process -FilePath "docker" -ArgumentList @("compose","ps") `
-            -NoNewWindow -Wait -PassThru `
+            -NoNewWindow -PassThru `
             -RedirectStandardOutput $psHealOut `
             -RedirectStandardError  $psHealErr `
             -ErrorAction SilentlyContinue
+        if ($psHealProc -and -not $psHealProc.WaitForExit(60000)) {   # 60s
+            Write-Host "  ⚠  Docker command timed out after 60s: docker compose ps" -ForegroundColor Yellow
+            try { $psHealProc.Kill() } catch {}
+        }
         Remove-Item -Path $psHealOut,$psHealErr -ErrorAction SilentlyContinue
         if ($psHealProc.ExitCode -eq 0) {
             Write-Host "    ✓ compose repaired"
@@ -729,11 +791,15 @@ try {
     # B20 (2026-06-08): `& docker compose ps ... 2>$null` → NativeCommandError PS 5.1
     $vaultPsOut = Join-Path $env:TEMP "coderaft-vaultps-out-$(Get-Random).log"
     $vaultPsErr = Join-Path $env:TEMP "coderaft-vaultps-err-$(Get-Random).log"
-    Start-Process -FilePath "docker" -ArgumentList @("compose","ps","coderaft-vault") `
-        -NoNewWindow -Wait `
+    $vaultPsProc = Start-Process -FilePath "docker" -ArgumentList @("compose","ps","coderaft-vault") `
+        -NoNewWindow -PassThru `
         -RedirectStandardOutput $vaultPsOut `
         -RedirectStandardError  $vaultPsErr `
-        -ErrorAction SilentlyContinue | Out-Null
+        -ErrorAction SilentlyContinue
+    if ($vaultPsProc -and -not $vaultPsProc.WaitForExit(60000)) {   # 60s
+        Write-Host "  ⚠  Docker command timed out after 60s: docker compose ps coderaft-vault" -ForegroundColor Yellow
+        try { $vaultPsProc.Kill() } catch {}
+    }
     $ps = (Get-Content $vaultPsOut -ErrorAction SilentlyContinue) -join " "
     Remove-Item -Path $vaultPsOut,$vaultPsErr -ErrorAction SilentlyContinue
     if ($ps -match "running") { $vaultRunning = $true }
@@ -770,11 +836,15 @@ if ($vaultNeedsMigration) {
         # B20 (2026-06-08): `& docker compose ps ... 2>$null` → NativeCommandError PS 5.1
         $pgPsOut = Join-Path $env:TEMP "coderaft-pgps-out-$(Get-Random).log"
         $pgPsErr = Join-Path $env:TEMP "coderaft-pgps-err-$(Get-Random).log"
-        Start-Process -FilePath "docker" -ArgumentList @("compose","ps","postgres") `
-            -NoNewWindow -Wait `
+        $pgPsProc = Start-Process -FilePath "docker" -ArgumentList @("compose","ps","postgres") `
+            -NoNewWindow -PassThru `
             -RedirectStandardOutput $pgPsOut `
             -RedirectStandardError  $pgPsErr `
-            -ErrorAction SilentlyContinue | Out-Null
+            -ErrorAction SilentlyContinue
+        if ($pgPsProc -and -not $pgPsProc.WaitForExit(60000)) {   # 60s
+            Write-Host "  ⚠  Docker command timed out after 60s: docker compose ps postgres" -ForegroundColor Yellow
+            try { $pgPsProc.Kill() } catch {}
+        }
         $pgPsText = (Get-Content $pgPsOut -ErrorAction SilentlyContinue) -join " "
         Remove-Item -Path $pgPsOut,$pgPsErr -ErrorAction SilentlyContinue
         $pgRunning = $pgPsText -match "running"
@@ -791,11 +861,15 @@ if ($vaultNeedsMigration) {
     try {
         $rvPsOut = Join-Path $env:TEMP "coderaft-rvps-out-$(Get-Random).log"
         $rvPsErr = Join-Path $env:TEMP "coderaft-rvps-err-$(Get-Random).log"
-        Start-Process -FilePath "docker" -ArgumentList @("compose","ps","ravenscan") `
-            -NoNewWindow -Wait `
+        $rvPsProc = Start-Process -FilePath "docker" -ArgumentList @("compose","ps","ravenscan") `
+            -NoNewWindow -PassThru `
             -RedirectStandardOutput $rvPsOut `
             -RedirectStandardError  $rvPsErr `
-            -ErrorAction SilentlyContinue | Out-Null
+            -ErrorAction SilentlyContinue
+        if ($rvPsProc -and -not $rvPsProc.WaitForExit(60000)) {   # 60s
+            Write-Host "  ⚠  Docker command timed out after 60s: docker compose ps ravenscan" -ForegroundColor Yellow
+            try { $rvPsProc.Kill() } catch {}
+        }
         $rvRunning = ((Get-Content $rvPsOut -ErrorAction SilentlyContinue) -join " ") -match "running"
         Remove-Item -Path $rvPsOut,$rvPsErr -ErrorAction SilentlyContinue
         if ($rvRunning) {
@@ -812,11 +886,15 @@ if ($vaultNeedsMigration) {
     try {
         $apiPsOut = Join-Path $env:TEMP "coderaft-apips-out-$(Get-Random).log"
         $apiPsErr = Join-Path $env:TEMP "coderaft-apips-err-$(Get-Random).log"
-        Start-Process -FilePath "docker" -ArgumentList @("compose","ps","dashboard-api") `
-            -NoNewWindow -Wait `
+        $apiPsProc = Start-Process -FilePath "docker" -ArgumentList @("compose","ps","dashboard-api") `
+            -NoNewWindow -PassThru `
             -RedirectStandardOutput $apiPsOut `
             -RedirectStandardError  $apiPsErr `
-            -ErrorAction SilentlyContinue | Out-Null
+            -ErrorAction SilentlyContinue
+        if ($apiPsProc -and -not $apiPsProc.WaitForExit(60000)) {   # 60s
+            Write-Host "  ⚠  Docker command timed out after 60s: docker compose ps dashboard-api" -ForegroundColor Yellow
+            try { $apiPsProc.Kill() } catch {}
+        }
         $apiRunning = ((Get-Content $apiPsOut -ErrorAction SilentlyContinue) -join " ") -match "running"
         Remove-Item -Path $apiPsOut,$apiPsErr -ErrorAction SilentlyContinue
         if ($apiRunning) {
@@ -1337,11 +1415,15 @@ services:
     $inspFmt2   = '{{ index .Config.Labels "com.docker.compose.project" }}'
     $inspOut2   = Join-Path $env:TEMP "coderaft-insp2-out-$(Get-Random).log"
     $inspErr2   = Join-Path $env:TEMP "coderaft-insp2-err-$(Get-Random).log"
-    Start-Process -FilePath "docker" -ArgumentList @("inspect","coderaft-coderaft-vault-1","--format",$inspFmt2) `
-        -NoNewWindow -Wait `
+    $inspProc2 = Start-Process -FilePath "docker" -ArgumentList @("inspect","coderaft-coderaft-vault-1","--format",$inspFmt2) `
+        -NoNewWindow -PassThru `
         -RedirectStandardOutput $inspOut2 `
         -RedirectStandardError  $inspErr2 `
-        -ErrorAction SilentlyContinue | Out-Null
+        -ErrorAction SilentlyContinue
+    if ($inspProc2 -and -not $inspProc2.WaitForExit(60000)) {   # 60s
+        Write-Host "  ⚠  Docker command timed out after 60s: docker inspect coderaft-coderaft-vault-1" -ForegroundColor Yellow
+        try { $inspProc2.Kill() } catch {}
+    }
     $vaultProject = ((Get-Content $inspOut2 -ErrorAction SilentlyContinue) -join "").Trim()
     Remove-Item -Path $inspOut2,$inspErr2 -ErrorAction SilentlyContinue
     if (-not $vaultProject) { $vaultProject = "coderaft" }
@@ -1661,11 +1743,15 @@ try {
     # B20 (2026-06-08): `& docker compose ps ... 2>$null` → NativeCommandError PS 5.1
     $pgQOut = Join-Path $env:TEMP "coderaft-pgq-out-$(Get-Random).log"
     $pgQErr = Join-Path $env:TEMP "coderaft-pgq-err-$(Get-Random).log"
-    Start-Process -FilePath "docker" -ArgumentList @("compose","ps","postgres","--quiet") `
-        -NoNewWindow -Wait `
+    $pgQProc = Start-Process -FilePath "docker" -ArgumentList @("compose","ps","postgres","--quiet") `
+        -NoNewWindow -PassThru `
         -RedirectStandardOutput $pgQOut `
         -RedirectStandardError  $pgQErr `
-        -ErrorAction SilentlyContinue | Out-Null
+        -ErrorAction SilentlyContinue
+    if ($pgQProc -and -not $pgQProc.WaitForExit(60000)) {   # 60s
+        Write-Host "  ⚠  Docker command timed out after 60s: docker compose ps postgres --quiet" -ForegroundColor Yellow
+        try { $pgQProc.Kill() } catch {}
+    }
     $psOutput = (Get-Content $pgQOut -ErrorAction SilentlyContinue) -join ""
     Remove-Item -Path $pgQOut,$pgQErr -ErrorAction SilentlyContinue
     if ($psOutput) { $postgresRunning = $true }
@@ -1958,10 +2044,14 @@ foreach ($img in $ComposeImages) {
             $inspCiOut = Join-Path $env:TEMP "coderaft-inspci-out-$(Get-Random).log"
             $inspCiErr = Join-Path $env:TEMP "coderaft-inspci-err-$(Get-Random).log"
             $inspCiProc = Start-Process -FilePath "docker" -ArgumentList @("image","inspect",$img) `
-                -NoNewWindow -Wait -PassThru `
+                -NoNewWindow -PassThru `
                 -RedirectStandardOutput $inspCiOut `
                 -RedirectStandardError  $inspCiErr `
                 -ErrorAction SilentlyContinue
+            if ($inspCiProc -and -not $inspCiProc.WaitForExit(60000)) {   # 60s
+                Write-Host "  ⚠  Docker command timed out after 60s: docker image inspect $img" -ForegroundColor Yellow
+                try { $inspCiProc.Kill() } catch {}
+            }
             Remove-Item -Path $inspCiOut,$inspCiErr -ErrorAction SilentlyContinue
             if ($inspCiProc.ExitCode -eq 0) {
                 $rmiOut = Join-Path $env:TEMP "coderaft-rmi-out-$(Get-Random).log"
@@ -2168,13 +2258,17 @@ if (-not $healthOk) {
 Write-Host "  Verifying IPv6 disabled in dashboard-api container..."
 $v6Out = Join-Path $env:TEMP "coderaft-ipv6-verify-$(Get-Random).log"
 $v6Err = Join-Path $env:TEMP "coderaft-ipv6-verify-err-$(Get-Random).log"
-Start-Process -FilePath "docker" -ArgumentList @(
+$v6Proc = Start-Process -FilePath "docker" -ArgumentList @(
         "exec", "coderaft-dashboard-api-1",
         "cat", "/proc/sys/net/ipv6/conf/all/disable_ipv6"
-    ) -NoNewWindow -Wait `
+    ) -NoNewWindow -PassThru `
       -RedirectStandardOutput $v6Out `
       -RedirectStandardError  $v6Err `
-      -ErrorAction SilentlyContinue | Out-Null
+      -ErrorAction SilentlyContinue
+if ($v6Proc -and -not $v6Proc.WaitForExit(60000)) {   # 60s
+    Write-Host "  ⚠  Docker command timed out after 60s: docker exec coderaft-dashboard-api-1 cat .../disable_ipv6" -ForegroundColor Yellow
+    try { $v6Proc.Kill() } catch {}
+}
 $v6Value = ((Get-Content $v6Out -ErrorAction SilentlyContinue) -join "").Trim()
 Remove-Item -Path $v6Out, $v6Err -ErrorAction SilentlyContinue
 if ($v6Value -eq "1") {
