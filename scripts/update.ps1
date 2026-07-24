@@ -2158,6 +2158,35 @@ if (-not $healthOk) {
     exit 1
 }
 
+# ── B-IPV6-KILL-VERIFY (2026-07-24) ───────────────────────────────────────
+# Confirm at RUNTIME that dashboard-api actually has IPv6 disabled in its
+# network namespace. The self-heal above writes sysctls into compose, but
+# Docker only applies them on container (re)creation — a partial update
+# path could leave a running container without the kill. If /proc says v6
+# is still up, warn loudly so Liam catches it before OIDC login re-fails
+# with ENETUNREACH.
+Write-Host "  Verifying IPv6 disabled in dashboard-api container..."
+$v6Out = Join-Path $env:TEMP "coderaft-ipv6-verify-$(Get-Random).log"
+$v6Err = Join-Path $env:TEMP "coderaft-ipv6-verify-err-$(Get-Random).log"
+Start-Process -FilePath "docker" -ArgumentList @(
+        "exec", "coderaft-dashboard-api-1",
+        "cat", "/proc/sys/net/ipv6/conf/all/disable_ipv6"
+    ) -NoNewWindow -Wait `
+      -RedirectStandardOutput $v6Out `
+      -RedirectStandardError  $v6Err `
+      -ErrorAction SilentlyContinue | Out-Null
+$v6Value = ((Get-Content $v6Out -ErrorAction SilentlyContinue) -join "").Trim()
+Remove-Item -Path $v6Out, $v6Err -ErrorAction SilentlyContinue
+if ($v6Value -eq "1") {
+    Write-Host "  ✓ IPv6 disabled in dashboard-api (/proc value = 1)" -ForegroundColor Green
+} elseif ($v6Value -eq "0") {
+    Write-Host "  ⚠  IPv6 still ENABLED in dashboard-api — Entra login will ENETUNREACH." -ForegroundColor Yellow
+    Write-Host "     The sysctls block was likely NOT applied on container recreation." -ForegroundColor Yellow
+    Write-Host "     Fix: docker compose stop dashboard-api ; docker compose up -d --force-recreate dashboard-api"
+} else {
+    Write-Host "  ⚠  Could not read /proc/sys/net/ipv6/conf/all/disable_ipv6 (empty or non-Linux). Skipping IPv6 verify." -ForegroundColor Yellow
+}
+
 # ── Post-update notification ──────────────────────────────────────────────
 if ($ADMIN_TOKEN) {
     try {
