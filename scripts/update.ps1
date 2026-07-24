@@ -362,7 +362,27 @@ if (Test-Path $composePathB15) {
     # the dashboard-api block. Line-based state machine so any indent style
     # (2-space, 4-space, tab) is handled the same way — regex flavour of
     # PowerShell is finicky with multi-line lookaheads.
-    if ($composeTextB15 -notmatch '(?ms)dashboard-api:[^\S\n]*\r?\n(?:[^\S\n]+\S.*\r?\n)*?[^\S\n]+sysctls:') {
+    #
+    # B-REGEX-CATASTROPHIC-BACKTRACK (2026-07-24): the original multiline
+    # regex above (?ms)dashboard-api:...sysctls: hangs indefinitely on
+    # PowerShell 5.1 for large compose files with catastrophic backtracking
+    # (confirmed live at Liam's node, task #183). Switched to a cheap
+    # substring probe: scan line-by-line for "dashboard-api:" then look for
+    # "sysctls:" in the next 40 lines before the next top-level service.
+    $needsSysctls = $true
+    $probeLines = $composeTextB15 -split "`r?`n"
+    for ($p = 0; $p -lt $probeLines.Count; $p++) {
+        if ($probeLines[$p] -match '^\s+dashboard-api:\s*$') {
+            $probeIndent = ($probeLines[$p] -replace '\S.*$','').Length
+            for ($q = $p + 1; $q -lt [Math]::Min($p + 40, $probeLines.Count); $q++) {
+                # Left a sibling service block (same indent, starts with letter)
+                if ($probeLines[$q] -match "^\s{$probeIndent}[a-zA-Z]") { break }
+                if ($probeLines[$q] -match '^\s+sysctls:\s*$') { $needsSysctls = $false; break }
+            }
+            break
+        }
+    }
+    if ($needsSysctls) {
         $lines = $composeTextB15 -split "`r?`n"
         $out = New-Object System.Collections.ArrayList
         $inDashApi = $false
