@@ -4,6 +4,12 @@
 # Usage: iex (irm https://install.coderaft.io/migrate.ps1)
 #    or: .\migrate-to-sops.ps1   (from the install directory)
 #
+# With parameters (e.g. -Finalize): `iex (irm url) -Finalize` does NOT work —
+# Invoke-Expression has no -Finalize parameter of its own, so PowerShell
+# rejects it before the downloaded script ever runs. Use a scriptblock so the
+# parameter is bound to the actual script instead:
+#   & ([scriptblock]::Create((irm https://install.coderaft.io/migrate.ps1))) -Finalize
+#
 # Idempotent: can be safely re-run if the first execution fails.
 # =============================================================================
 

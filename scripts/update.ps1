@@ -1652,7 +1652,7 @@ if ((Test-Path $envEnc) -and (Test-Path $envPlain)) {
         Write-Host "  [i] sops missing on host — update.ps1 skips the automatic finalize." -ForegroundColor Yellow
         Write-Host "      Choose one method to purge the plaintext .env:" -ForegroundColor Yellow
         Write-Host "        A) Dashboard  →  Settings → Migrate secrets  (runs inside dashboard-api)" -ForegroundColor Yellow
-        Write-Host "        B) CLI        →  iex (irm https://install.coderaft.io/migrate.ps1) -Finalize" -ForegroundColor Yellow
+        Write-Host "        B) CLI        →  & ([scriptblock]::Create((irm https://install.coderaft.io/migrate.ps1))) -Finalize" -ForegroundColor Yellow
         Write-Host "                          (auto-downloads sops.exe + age-keygen.exe)" -ForegroundColor Yellow
     } else {
         $env:SOPS_AGE_KEY_FILE = $ageKey
