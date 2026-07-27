@@ -645,30 +645,42 @@ function Invoke-FalconOneTlsBootstrap {
 set -e
 apk add --no-cache openssl >/dev/null
 cd /work
-if [ ! -f agents-ca.crt ]; then
+# Bug fix (2026-07-27, live outage): regeneration used to gate ONLY on
+# agents-ca.crt missing. If agents-ca.crt existed but agents-ca.key had been
+# lost/never written (any partial failure of a prior run), this block was
+# skipped, agents-ca.key stayed absent, and the server.crt (re)signing step
+# below silently failed (its stderr was redirected to /dev/null) — leaving
+# server.crt EMPTY while the script still exited 0 and the caller printed a
+# fake "PKI written" success. falconone-api then fatal-crashed at boot with
+# "load server keypair: ... failed to find any PEM data" (full 502 outage).
+# Now regenerates the CA pair whenever EITHER half is missing.
+if [ ! -f agents-ca.crt ] || [ ! -f agents-ca.key ]; then
     openssl req -x509 -newkey rsa:4096 -days 3650 -nodes -sha256 \
         -keyout agents-ca.key -out agents-ca.crt \
         -subj "/CN=falconone-agents-ca" \
-        -addext "basicConstraints=critical,CA:TRUE" 2>/dev/null
+        -addext "basicConstraints=critical,CA:TRUE"
 fi
 NEED_REGEN=1
-if [ -f server.crt ] && openssl x509 -in server.crt -noout -text 2>/dev/null | grep -q "coderaft.local"; then
+if [ -f server.crt ] && [ -s server.crt ] && openssl x509 -in server.crt -noout -text 2>/dev/null | grep -q "coderaft.local"; then
     NEED_REGEN=0
 fi
 if [ "$NEED_REGEN" = "1" ]; then
     openssl req -newkey rsa:2048 -nodes -sha256 \
         -keyout server.key -out server.csr \
-        -subj "/CN=falconone-agents" 2>/dev/null
+        -subj "/CN=falconone-agents"
     cat > /tmp/server.ext <<EOF
 subjectAltName=__FO_SAN_LIST__
 basicConstraints=CA:FALSE
 EOF
     openssl x509 -req -days 3650 -sha256 \
         -in server.csr -CA agents-ca.crt -CAkey agents-ca.key -CAcreateserial \
-        -out server.crt -extfile /tmp/server.ext 2>/dev/null
+        -out server.crt -extfile /tmp/server.ext
     rm -f server.csr
 fi
 chmod 644 *.crt *.key 2>/dev/null || true
+# Final sanity check: fail loudly (non-zero exit) rather than let an empty
+# file pass silently as "success" to the PowerShell caller.
+[ -s server.crt ] && [ -s server.key ] && [ -s agents-ca.crt ]
 '@
     $foScript = $foScript.Replace("__FO_SAN_LIST__", $foSanString)
     $foScriptFile = Join-Path $env:TEMP "coderaft-fo-tls-$(Get-Random).sh"
@@ -676,14 +688,20 @@ chmod 644 *.crt *.key 2>/dev/null || true
     [System.IO.File]::WriteAllText($foScriptFile, $foScriptLF, [System.Text.UTF8Encoding]::new($false))
     $absFoTlsDir = (Resolve-Path -LiteralPath $foTlsDir).Path
 
-    Start-Process -FilePath "docker" -ArgumentList @(
+    $foProc = Start-Process -FilePath "docker" -ArgumentList @(
         "run", "--rm",
         "-v", "${foScriptFile}:/script.sh:ro",
         "-v", "${absFoTlsDir}:/work",
         "alpine:3.20", "sh", "/script.sh"
-    ) -NoNewWindow -Wait -ErrorAction SilentlyContinue | Out-Null
+    ) -NoNewWindow -Wait -PassThru -ErrorAction SilentlyContinue
     Remove-Item -Path $foScriptFile -ErrorAction SilentlyContinue
-    Write-Host "  ✓ FalconOne agents PKI written (SAN: $foSanString)"
+    # Bug fix (2026-07-27): this used to print success unconditionally,
+    # regardless of whether the container/script actually succeeded.
+    if ($foProc -and $foProc.ExitCode -eq 0) {
+        Write-Host "  ✓ FalconOne agents PKI written (SAN: $foSanString)"
+    } else {
+        Write-Host "  ✗ FalconOne agents PKI bootstrap FAILED (exit code $($foProc.ExitCode)) — falconone-api will fatal-crash at boot (empty/missing cert in $foTlsDir). Re-run the update, or manually delete $foTlsDir and re-run to force a clean regeneration." -ForegroundColor Red
+    }
 }
 
 # ── ACL self-heal: falconone entry/permissions (#172) ────────────────────────
