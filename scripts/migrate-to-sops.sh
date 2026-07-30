@@ -8,7 +8,21 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.1.1"
+
+# ── srun helper — sudo when available, else direct call ──────────────────────
+# The dashboard-api image (Alpine + rootless) has no `sudo` binary but already
+# runs as root, so `sudo X` fails with "sudo: command not found" (exit 127)
+# even though X would have worked directly. Wrap every privileged call in
+# `srun` and let the shell decide. Confirmed live 2026-07-24 chez Liam
+# (crash at line 245: srun grep — no fallback).
+if command -v sudo >/dev/null 2>&1; then
+    srun() { sudo -E "$@"; }
+    srun_pipe() { sudo -E "$@"; }
+else
+    srun() { "$@"; }
+    srun_pipe() { "$@"; }
+fi
 GITHUB_RAW="https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/migrate-to-sops.sh"
 
 # ── Argument parsing ─────────────────────────────────────────────────────────
@@ -71,7 +85,7 @@ mirror_age_key_to_local() {
     return 0
   fi
   if [ -f "${AGE_KEY_PATH}" ]; then
-    if sudo cat "${AGE_KEY_PATH}" 2>/dev/null > "${AGE_KEY_LOCAL}" \
+    if srun cat "${AGE_KEY_PATH}" 2>/dev/null > "${AGE_KEY_LOCAL}" \
        || cat "${AGE_KEY_PATH}" 2>/dev/null > "${AGE_KEY_LOCAL}"; then
       chmod 400 "${AGE_KEY_LOCAL}"
       info "Mirrored age key to ${AGE_KEY_LOCAL} (bind-mount source for dashboard-api)"
@@ -103,8 +117,24 @@ if [ "${FINALIZE_ONLY}" = "1" ]; then
 
   _VERIFY_TMP="$(mktemp)"
   trap 'rm -f "${_VERIFY_TMP}"' EXIT
-  if ! SOPS_AGE_KEY_FILE="${AGE_KEY_FOR_DECRYPT}" sudo -E sops --decrypt .env.enc > "${_VERIFY_TMP}" 2>/dev/null \
-       && ! SOPS_AGE_KEY_FILE="${AGE_KEY_FOR_DECRYPT}" sops --decrypt .env.enc > "${_VERIFY_TMP}" 2>/dev/null; then
+  # F-DOTENV-DECRYPT (2026-07-23): sops infers the input format from the file
+  # extension. `.env.enc` doesn't match any built-in mapping — without
+  # `--input-type dotenv` sops falls back to JSON parsing and dies with a
+  # cryptic "not a valid input" error, surfacing as "cannot be decrypted".
+  # Also drop the sudo prefix — the dashboard-api container is Alpine +
+  # rootless, `sudo` isn't installed and the fallback silently swallows all
+  # errors via `2>/dev/null`, so the operator ends up chasing an unrelated
+  # age-key mismatch. Try sops-with-sudo only when the binary exists.
+  DECRYPT_OK=0
+  if command -v sudo >/dev/null 2>&1; then
+    SOPS_AGE_KEY_FILE="${AGE_KEY_FOR_DECRYPT}" srun sops --decrypt \
+      --input-type dotenv --output-type dotenv .env.enc > "${_VERIFY_TMP}" 2>/dev/null && DECRYPT_OK=1
+  fi
+  if [ "${DECRYPT_OK}" = "0" ]; then
+    SOPS_AGE_KEY_FILE="${AGE_KEY_FOR_DECRYPT}" sops --decrypt \
+      --input-type dotenv --output-type dotenv .env.enc > "${_VERIFY_TMP}" 2>/dev/null && DECRYPT_OK=1
+  fi
+  if [ "${DECRYPT_OK}" = "0" ]; then
     fatal ".env.enc cannot be decrypted with the available age key — refusing to purge .env."
   fi
   if ! diff -q "${_VERIFY_TMP}" .env > /dev/null 2>&1; then
@@ -173,7 +203,7 @@ install_age() {
   curl -fsSL "https://github.com/FiloSottile/age/releases/download/${AGE_VERSION}/age-${AGE_VERSION}-${_AGE_OS}-${_AGE_ARCH}.tar.gz" \
       -o "${_TMP}/age.tar.gz" || fatal "Could not download age"
   tar -xzf "${_TMP}/age.tar.gz" -C "${_TMP}"
-  sudo install -m 755 "${_TMP}/age/age-keygen" /usr/local/bin/age-keygen \
+  srun install -m 755 "${_TMP}/age/age-keygen" /usr/local/bin/age-keygen \
     || fatal "Could not install age-keygen (sudo required)"
   info "age-keygen installed"
 }
@@ -193,7 +223,7 @@ install_sops() {
   _SOPS_BIN="sops-${SOPS_VERSION}.${_SOPS_OS}.${_SOPS_ARCH}"
   curl -fsSL "https://github.com/getsops/sops/releases/download/${SOPS_VERSION}/${_SOPS_BIN}" \
       -o "/tmp/sops" || fatal "Could not download sops"
-  sudo install -m 755 /tmp/sops /usr/local/bin/sops \
+  srun install -m 755 /tmp/sops /usr/local/bin/sops \
     || fatal "Could not install sops (sudo required)"
   rm -f /tmp/sops
   info "sops installed"
@@ -216,22 +246,22 @@ headline "age key"
 if [ -f "${AGE_KEY_PATH}" ]; then
   info "Existing age key found: ${AGE_KEY_PATH}"
 else
-  echo "  Generating age key (sudo required)..."
-  sudo mkdir -p "${AGE_KEY_DIR}"
-  sudo age-keygen -o "${AGE_KEY_PATH}" 2>/dev/null \
+  echo "  Generating age key (elevation required if sudo installed)..."
+  srun mkdir -p "${AGE_KEY_DIR}"
+  srun age-keygen -o "${AGE_KEY_PATH}" 2>/dev/null \
     || fatal "Could not generate the age key"
-  sudo chmod 400 "${AGE_KEY_PATH}"
-  sudo chown root:root "${AGE_KEY_PATH}" 2>/dev/null || true
+  srun chmod 400 "${AGE_KEY_PATH}"
+  srun chown root:root "${AGE_KEY_PATH}" 2>/dev/null || true
   info "age key generated: ${AGE_KEY_PATH}"
 fi
 
 # Extract the public key
-AGE_PUB=$(sudo grep "# public key:" "${AGE_KEY_PATH}" | awk '{print $NF}')
+AGE_PUB=$(srun grep "# public key:" "${AGE_KEY_PATH}" | awk '{print $NF}')
 if [ -z "$AGE_PUB" ]; then
   fatal "Could not extract age public key from ${AGE_KEY_PATH}"
 fi
-echo "$AGE_PUB" | sudo tee "${AGE_PUB_PATH}" > /dev/null
-sudo chmod 444 "${AGE_PUB_PATH}"
+echo "$AGE_PUB" | srun tee "${AGE_PUB_PATH}" > /dev/null
+srun chmod 444 "${AGE_PUB_PATH}"
 info "Public key: ${AGE_PUB}"
 
 # ── 4. GPG backup of the original .env ───────────────────────────────────────
@@ -297,7 +327,7 @@ headline "Integrity check"
 _VERIFY_TMP="$(mktemp)"
 trap 'rm -f "${_VERIFY_TMP}"' EXIT
 SOPS_AGE_KEY_FILE="${AGE_KEY_PATH}" \
-  sudo -E sops --decrypt .env.enc > "${_VERIFY_TMP}" \
+  srun sops --decrypt .env.enc > "${_VERIFY_TMP}" \
   || fatal "Could not decrypt .env.enc — aborting (.env is preserved)"
 
 if ! diff -q "${_VERIFY_TMP}" .env > /dev/null 2>&1; then

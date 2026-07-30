@@ -288,6 +288,56 @@ if [ -f "$COMPOSE_PATH" ] && ! grep -qF 'NODE_OPTIONS=--dns-result-order=ipv4fir
     fi
 fi
 
+# ── Self-heal: docker-compose.yml missing coderaft-cve-proxy service ──────
+# coderaft-cve-proxy (sidecar in front of the shared coderaft-cve-engine,
+# cve.coderaft.io) is a platform-level service like coderaft-vault — added
+# here, not via the per-product PRODUCT_SERVICES update mechanism, so it
+# reaches every existing install regardless of which products are licensed.
+if [ -f "$COMPOSE_PATH" ] && ! grep -qE '^[[:space:]]*coderaft-cve-proxy:[[:space:]]*$' "$COMPOSE_PATH" \
+   && grep -qE '^[[:space:]]*postgres:[[:space:]]*$' "$COMPOSE_PATH"; then
+    cp "$COMPOSE_PATH" "$COMPOSE_PATH.bak-cveproxy-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    _cveproxy_block=$(cat <<'CVEPROXYBLOCK'
+  # ── coderaft-cve-proxy ───────────────────────────────────────────────────
+  # Internal sidecar in front of the shared coderaft-cve-engine
+  # (cve.coderaft.io): holds the ONE bearer key for this deployment (read
+  # from vault at boot) and forwards CVE/KEV/EPSS/MSRC lookups from any
+  # product on coderaft-backend. No host port published.
+  coderaft-cve-proxy:
+    image: ghcr.io/liamj74/coderaft-cve-proxy:latest
+    networks:
+      - coderaft-vault-net
+      - coderaft-backend
+      - coderaft-frontend
+    depends_on:
+      coderaft-vault: { condition: service_started }
+    environment:
+      - CODERAFT_VAULT_URL=https://coderaft-vault:8200
+      - CODERAFT_VAULT_CA=/vault-tls/client-ca.crt
+      - CODERAFT_VAULT_CLIENT_CERT=/vault-tls/cve-proxy-client.crt
+      - CODERAFT_VAULT_CLIENT_KEY=/vault-tls/cve-proxy-client.key
+      - XPRODUCT_INTERNAL_TOKEN=${XPRODUCT_INTERNAL_TOKEN}
+    volumes:
+      - ./vault-tls/client-ca.crt:/vault-tls/client-ca.crt:ro
+      - ./vault-tls/cve-proxy-client.crt:/vault-tls/cve-proxy-client.crt:ro
+      - ./vault-tls/cve-proxy-client.key:/vault-tls/cve-proxy-client.key:ro
+    healthcheck:
+      test: ["CMD", "/coderaft-cve-proxy", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    restart: unless-stopped
+
+CVEPROXYBLOCK
+)
+    awk -v block="$_cveproxy_block" '
+        /^[[:space:]]*postgres:[[:space:]]*$/ && !done { printf "%s", block; done=1 }
+        { print }
+    ' "$COMPOSE_PATH" > "$COMPOSE_PATH.tmp" && mv "$COMPOSE_PATH.tmp" "$COMPOSE_PATH"
+    echo "  ✓ Self-heal docker-compose.yml — coderaft-cve-proxy service added"
+fi
+
 # ── Self-heal: docker-compose.override.yml neo4j port (B26) ───────────────
 # Bind 127.0.0.1 + port paramétrable. Banking-grade.
 OVERRIDE_PATH="${INSTALL_DIR}/docker-compose.override.yml"
@@ -550,6 +600,85 @@ FALCONONEACL
     fi
 
     echo "  [install] Self-heal ACL: falconone permissions updated (+${#missing[@]} added)"
+}
+
+# ── ACL self-heal: cve-proxy entry (coderaft-cve-engine sidecar) ────────────
+# Same additive-only, idempotent pattern as _falconone_acl_selfheal above.
+_cveproxy_acl_selfheal() {
+    local acl_path="$1"
+
+    if [ ! -f "$acl_path" ]; then
+        echo "  [install] ACL self-heal: $acl_path not found — skipping (vault not provisioned yet)"
+        return 0
+    fi
+
+    if grep -qE '^[[:space:]]*-[[:space:]]*name:[[:space:]]*cve-proxy[[:space:]]*$' "$acl_path"; then
+        echo "  [install] ACL cve-proxy already present"
+        return 0
+    fi
+
+    local ts
+    ts="$(date -u +"%Y%m%dT%H%M%SZ")"
+    cp "$acl_path" "${acl_path}.bak-${ts}"
+    cat >> "$acl_path" <<'CVEPROXYACL'
+
+  - name: cve-proxy
+    cert_san: "cve-proxy.coderaft.local"
+    permissions:
+      - "read:cve-proxy/*"
+      - "write:cve-proxy/*"
+CVEPROXYACL
+    echo "  [install] Self-heal ACL: cve-proxy entry created"
+}
+
+# ── Vault client cert self-heal (any product whose cert was never
+# generated, e.g. falconone/cve-proxy on installs provisioned before they
+# shipped) — additive-only, requires client-ca.key to still be present.
+_vault_client_cert_selfheal() {
+    local name="$1" san="$2"
+    local tls_dir="${INSTALL_DIR}/vault-tls"
+
+    if [ -f "${tls_dir}/${name}-client.crt" ]; then
+        return 0
+    fi
+    if [ ! -f "${tls_dir}/client-ca.key" ] || [ ! -f "${tls_dir}/client-ca.crt" ]; then
+        echo "  [update] Cert self-heal: ${tls_dir}/client-ca.key missing — cannot mint ${name}-client cert (needs a full CA rotation, not a self-heal)"
+        return 0
+    fi
+
+    echo "  [update] Cert self-heal: generating vault-tls/${name}-client (was missing)"
+    if command -v openssl &>/dev/null; then
+        ( cd "$tls_dir" && \
+          openssl req -newkey rsa:2048 -nodes -sha256 \
+              -keyout "${name}-client.key" -out "${name}-client.csr" \
+              -subj "/CN=${san}" 2>/dev/null && \
+          openssl x509 -req -days 3650 -sha256 \
+              -in "${name}-client.csr" -CA client-ca.crt -CAkey client-ca.key -CAcreateserial \
+              -out "${name}-client.crt" \
+              -extfile <(printf "subjectAltName=DNS:%s\nbasicConstraints=CA:FALSE" "$san") \
+              2>/dev/null && \
+          rm -f "${name}-client.csr" && \
+          chmod 600 "${name}-client.key" "${name}-client.crt" )
+    else
+        local abs_tls_dir
+        abs_tls_dir="$(cd "$tls_dir" && pwd)"
+        docker run --rm -i \
+            -v "${abs_tls_dir}:/work" \
+            alpine:3.20 sh -c "
+                set -e
+                apk add --no-cache openssl >/dev/null
+                cd /work
+                openssl req -newkey rsa:2048 -nodes -sha256 \
+                    -keyout '${name}-client.key' -out '${name}-client.csr' \
+                    -subj '/CN=${san}' 2>/dev/null
+                printf 'subjectAltName=DNS:%s\nbasicConstraints=CA:FALSE' '${san}' > /tmp/client.ext
+                openssl x509 -req -days 3650 -sha256 \
+                    -in '${name}-client.csr' -CA client-ca.crt -CAkey client-ca.key -CAcreateserial \
+                    -out '${name}-client.crt' -extfile /tmp/client.ext 2>/dev/null
+                rm -f '${name}-client.csr'
+                chmod 600 '${name}-client.key' '${name}-client.crt'
+            " 2>&1
+    fi
 }
 
 # ── Vault migration (D4) ─────────────────────────────────────────────────
@@ -1010,7 +1139,8 @@ _vault_gen_tls_update() {
                      "entraguard:entraguard.coderaft.local" \
                      "ravenscan:ravenscan.coderaft.local" \
                      "redfox:redfox.coderaft.local" \
-                     "falconone:falconone.coderaft.local"; do
+                     "falconone:falconone.coderaft.local" \
+                     "cve-proxy:cve-proxy.coderaft.local"; do
             _n="${_pair%%:*}"; _s="${_pair##*:}"
             openssl req -newkey rsa:2048 -nodes -sha256 \
                 -keyout "vault-tls/${_n}-client.key" \
@@ -1022,9 +1152,10 @@ _vault_gen_tls_update() {
                 -out "vault-tls/${_n}-client.crt" \
                 -extfile <(printf "subjectAltName=DNS:%s\nbasicConstraints=CA:FALSE" "$_s") 2>/dev/null
             rm -f "vault-tls/${_n}-client.csr"
-            if [ "$_n" = "falconone" ]; then
-                # falconone-api runs distroless nonroot (uid 65532) — 600
-                # would be unreadable. See update.ps1 for the same fix.
+            if [ "$_n" = "falconone" ] || [ "$_n" = "cve-proxy" ]; then
+                # falconone-api / coderaft-cve-proxy run distroless nonroot
+                # (uid 65532) — 600 would be unreadable. See update.ps1 for
+                # the same fix.
                 chmod 644 "vault-tls/${_n}-client.crt" "vault-tls/${_n}-client.key"
             else
                 chmod 600 "vault-tls/${_n}-client.crt" "vault-tls/${_n}-client.key"
@@ -1050,7 +1181,7 @@ openssl x509 -req -days 3650 -sha256 \
     -in vault.csr -CA client-ca.crt -CAkey client-ca.key -CAcreateserial \
     -out vault.crt -extfile /tmp/server.ext 2>/dev/null
 rm -f vault.csr
-for pair in "dashboard-api:dashboard-api.coderaft.local" "entraguard:entraguard.coderaft.local" "ravenscan:ravenscan.coderaft.local" "redfox:redfox.coderaft.local" "falconone:falconone.coderaft.local"; do
+for pair in "dashboard-api:dashboard-api.coderaft.local" "entraguard:entraguard.coderaft.local" "ravenscan:ravenscan.coderaft.local" "redfox:redfox.coderaft.local" "falconone:falconone.coderaft.local" "cve-proxy:cve-proxy.coderaft.local"; do
     n="${pair%%:*}"; s="${pair##*:}"
     openssl req -newkey rsa:2048 -nodes -sha256 -keyout "${n}-client.key" -out "${n}-client.csr" -subj "/CN=${s}" 2>/dev/null
     printf "subjectAltName=DNS:%s\nbasicConstraints=CA:FALSE" "$s" > /tmp/client.ext
@@ -1058,8 +1189,9 @@ for pair in "dashboard-api:dashboard-api.coderaft.local" "entraguard:entraguard.
     rm -f "${n}-client.csr"
 done
 chmod 600 *.key 2>/dev/null || true
-# falconone-api nonroot fix — see rationale above.
+# falconone-api / coderaft-cve-proxy nonroot fix — see rationale above.
 chmod 644 falconone-client.key falconone-client.crt 2>/dev/null || true
+chmod 644 cve-proxy-client.key cve-proxy-client.crt 2>/dev/null || true
 SCRIPT
     fi
 
@@ -1117,6 +1249,9 @@ clients:
   - name: falconone
     cert_san: "falconone.coderaft.local"
     permissions: ["read:license_key","read:falconone_*","read:platform/identity/oidc","sign:falconone_agent_cert","read:falconone/nvd_api_key","read:falconone/audit_hmac_key","write:falconone/audit_hmac_key","read:falconone/pki/agents-ca/cert"]
+  - name: cve-proxy
+    cert_san: "cve-proxy.coderaft.local"
+    permissions: ["read:cve-proxy/*", "write:cve-proxy/*"]
 ACLEOF
     chmod 600 vault-config/acl.yaml
 }

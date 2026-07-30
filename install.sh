@@ -452,6 +452,8 @@ _vault_bootstrap_tls_host() {
     _vault_client_cert "entraguard"     "entraguard.coderaft.local"
     _vault_client_cert "ravenscan"      "ravenscan.coderaft.local"
     _vault_client_cert "redfox"         "redfox.coderaft.local"
+    _vault_client_cert "falconone"      "falconone.coderaft.local"
+    _vault_client_cert "cve-proxy"      "cve-proxy.coderaft.local"
 
     _vault_write_config
 }
@@ -490,7 +492,9 @@ rm -f vault.csr
 for pair in "dashboard-api:dashboard-api.coderaft.local" \
             "entraguard:entraguard.coderaft.local" \
             "ravenscan:ravenscan.coderaft.local" \
-            "redfox:redfox.coderaft.local"; do
+            "redfox:redfox.coderaft.local" \
+            "falconone:falconone.coderaft.local" \
+            "cve-proxy:cve-proxy.coderaft.local"; do
     name="${pair%%:*}"
     san="${pair##*:}"
     openssl req -newkey rsa:2048 -nodes -sha256 \
@@ -506,6 +510,9 @@ EOF
     rm -f "${name}-client.csr"
 done
 chmod 600 *.key 2>/dev/null || true
+# falconone-api / coderaft-cve-proxy nonroot fix (distroless uid 65532).
+chmod 644 falconone-client.key falconone-client.crt 2>/dev/null || true
+chmod 644 cve-proxy-client.key cve-proxy-client.crt 2>/dev/null || true
 SCRIPT
 )
 
@@ -565,13 +572,17 @@ clients:
   - name: falconone
     cert_san: "falconone.coderaft.local"
     permissions: ["read:license_key","read:falconone_*","read:platform/identity/oidc","sign:falconone_agent_cert","read:falconone/nvd_api_key","read:falconone/audit_hmac_key","write:falconone/audit_hmac_key","read:falconone/pki/agents-ca/cert"]
+
+  - name: cve-proxy
+    cert_san: "cve-proxy.coderaft.local"
+    permissions: ["read:cve-proxy/*", "write:cve-proxy/*"]
 ACLEOF
     chmod 600 vault-config/acl.yaml
 
     echo "  ✓ Vault mTLS PKI generated"
     echo "    CA:      vault-tls/client-ca.crt"
     echo "    Server:  vault-tls/vault.{crt,key}"
-    echo "    Clients: vault-tls/{dashboard-api,entraguard,ravenscan,redfox}-client.{crt,key}"
+    echo "    Clients: vault-tls/{dashboard-api,entraguard,ravenscan,redfox,falconone,cve-proxy}-client.{crt,key}"
 }
 
 _vault_client_cert() {
@@ -588,7 +599,13 @@ _vault_client_cert() {
         -extfile <(printf "subjectAltName=DNS:%s\nbasicConstraints=CA:FALSE" "$san") \
         2>/dev/null
     rm -f "vault-tls/${name}-client.csr"
-    chmod 600 "vault-tls/${name}-client.crt" "vault-tls/${name}-client.key"
+    if [ "$name" = "falconone" ] || [ "$name" = "cve-proxy" ]; then
+        # falconone-api / coderaft-cve-proxy run distroless nonroot
+        # (uid 65532) — 600 would be unreadable. See update.sh for the same fix.
+        chmod 644 "vault-tls/${name}-client.crt" "vault-tls/${name}-client.key"
+    else
+        chmod 600 "vault-tls/${name}-client.crt" "vault-tls/${name}-client.key"
+    fi
 }
 
 # ── FalconOne agents mTLS PKI (#170) ─────────────────────────────────────────
@@ -781,6 +798,84 @@ FALCONONEACL
     echo "  [install] Self-heal ACL: falconone permissions updated (+${#missing[@]} added)"
 }
 
+# ── ACL self-heal: cve-proxy entry (coderaft-cve-engine sidecar) ────────────
+# Same additive-only, idempotent pattern as _falconone_acl_selfheal above —
+# any install provisioned before this ships never gets the cve-proxy entry
+# otherwise, since vault_bootstrap_tls's static acl.yaml write only runs once.
+_cveproxy_acl_selfheal() {
+    local acl_path="$1"
+
+    if [ ! -f "$acl_path" ]; then
+        echo "  [install] ACL self-heal: $acl_path not found — skipping (vault not provisioned yet)"
+        return 0
+    fi
+
+    if grep -qE '^[[:space:]]*-[[:space:]]*name:[[:space:]]*cve-proxy[[:space:]]*$' "$acl_path"; then
+        echo "  [install] ACL cve-proxy already present"
+        return 0
+    fi
+
+    local ts
+    ts="$(date -u +"%Y%m%dT%H%M%SZ")"
+    cp "$acl_path" "${acl_path}.bak-${ts}"
+    cat >> "$acl_path" <<'CVEPROXYACL'
+
+  - name: cve-proxy
+    cert_san: "cve-proxy.coderaft.local"
+    permissions:
+      - "read:cve-proxy/*"
+      - "write:cve-proxy/*"
+CVEPROXYACL
+    echo "  [install] Self-heal ACL: cve-proxy entry created"
+}
+
+# ── Vault client cert self-heal (any product whose cert was never generated,
+# e.g. falconone/cve-proxy on installs provisioned before they shipped) ─────
+# Additive-only: does nothing to certs that already exist. Requires the CA
+# private key (vault-tls/client-ca.key) to still be present — deliberately
+# does NOT attempt a full CA rotation (that's a separate, disruptive
+# operation, not a self-heal). Silently no-ops with a clear message if the
+# CA key is gone, rather than failing the whole install/update.
+_vault_client_cert_selfheal() {
+    local name="$1" san="$2"
+
+    if [ -f "vault-tls/${name}-client.crt" ]; then
+        return 0
+    fi
+    if [ ! -f vault-tls/client-ca.key ] || [ ! -f vault-tls/client-ca.crt ]; then
+        echo "  [install] Cert self-heal: vault-tls/client-ca.key missing — cannot mint ${name}-client cert (needs a full CA rotation, not a self-heal)"
+        return 0
+    fi
+
+    echo "  [install] Cert self-heal: generating vault-tls/${name}-client (was missing)"
+    if command -v openssl &>/dev/null; then
+        _vault_client_cert "$name" "$san"
+    else
+        local abs_tls_dir
+        abs_tls_dir="$(cd vault-tls && pwd)"
+        docker run --rm -i \
+            -v "${abs_tls_dir}:/work" \
+            alpine:3.20 sh -c "
+                set -e
+                apk add --no-cache openssl >/dev/null
+                cd /work
+                openssl req -newkey rsa:2048 -nodes -sha256 \
+                    -keyout '${name}-client.key' -out '${name}-client.csr' \
+                    -subj '/CN=${san}' 2>/dev/null
+                printf 'subjectAltName=DNS:%s\nbasicConstraints=CA:FALSE' '${san}' > /tmp/client.ext
+                openssl x509 -req -days 3650 -sha256 \
+                    -in '${name}-client.csr' -CA client-ca.crt -CAkey client-ca.key -CAcreateserial \
+                    -out '${name}-client.crt' -extfile /tmp/client.ext 2>/dev/null
+                rm -f '${name}-client.csr'
+                if [ '${name}' = 'falconone' ] || [ '${name}' = 'cve-proxy' ]; then
+                    chmod 644 '${name}-client.key' '${name}-client.crt'
+                else
+                    chmod 600 '${name}-client.key' '${name}-client.crt'
+                fi
+            " 2>&1
+    fi
+}
+
 vault_bootstrap
 
 # ── FalconOne mTLS PKI + ACL self-heal (#170 / #172) ─────────────────────────
@@ -790,6 +885,14 @@ vault_bootstrap
 # permissions healed.
 _falconone_tls_bootstrap "$PWD"
 _falconone_acl_selfheal "vault-config/acl.yaml"
+
+# ── cve-proxy vault client cert + ACL self-heal ──────────────────────────────
+# coderaft-cve-proxy is a shared platform sidecar (in front of the central
+# coderaft-cve-engine), not tied to any single product license — self-healed
+# unconditionally, same as falconone above.
+_vault_client_cert_selfheal "falconone" "falconone.coderaft.local"
+_vault_client_cert_selfheal "cve-proxy" "cve-proxy.coderaft.local"
+_cveproxy_acl_selfheal "vault-config/acl.yaml"
 
 # Append CODERAFT_VAULT_* env vars if not already present
 _add_env_if_missing() {
@@ -1021,6 +1124,40 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    restart: unless-stopped
+
+  # ── coderaft-cve-proxy ───────────────────────────────────────────────────
+  # Internal sidecar in front of the shared coderaft-cve-engine
+  # (cve.coderaft.io): holds the ONE bearer key for this deployment (read
+  # from vault at boot) and forwards CVE/KEV/EPSS/MSRC lookups from any
+  # product on coderaft-backend. No host port published — reachable only as
+  # coderaft-cve-proxy:8092 inside the docker network. Not tied to any
+  # product license (shared platform service, like coderaft-vault).
+  coderaft-cve-proxy:
+    image: ghcr.io/liamj74/coderaft-cve-proxy:latest
+    networks:
+      - coderaft-vault-net
+      - coderaft-backend
+      - coderaft-frontend
+    depends_on:
+      coderaft-vault: { condition: service_started }
+    environment:
+      - CODERAFT_VAULT_URL=https://coderaft-vault:8200
+      - CODERAFT_VAULT_CA=/vault-tls/client-ca.crt
+      - CODERAFT_VAULT_CLIENT_CERT=/vault-tls/cve-proxy-client.crt
+      - CODERAFT_VAULT_CLIENT_KEY=/vault-tls/cve-proxy-client.key
+      - XPRODUCT_INTERNAL_TOKEN=${XPRODUCT_INTERNAL_TOKEN}
+    volumes:
+      - ./vault-tls/client-ca.crt:/vault-tls/client-ca.crt:ro
+      - ./vault-tls/cve-proxy-client.crt:/vault-tls/cve-proxy-client.crt:ro
+      - ./vault-tls/cve-proxy-client.key:/vault-tls/cve-proxy-client.key:ro
+    healthcheck:
+      test: ["CMD", "/coderaft-cve-proxy", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
     restart: unless-stopped

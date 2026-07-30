@@ -542,7 +542,9 @@ rm -f vault.csr
 for pair in "dashboard-api:dashboard-api.coderaft.local" \
             "entraguard:entraguard.coderaft.local" \
             "ravenscan:ravenscan.coderaft.local" \
-            "redfox:redfox.coderaft.local"; do
+            "redfox:redfox.coderaft.local" \
+            "falconone:falconone.coderaft.local" \
+            "cve-proxy:cve-proxy.coderaft.local"; do
     name="${pair%%:*}"
     san="${pair##*:}"
     openssl req -newkey rsa:2048 -nodes -sha256 \
@@ -558,6 +560,10 @@ EOF
     rm -f "${name}-client.csr"
 done
 chmod 600 *.key 2>/dev/null || true
+# falconone-api / coderaft-cve-proxy run distroless nonroot (uid 65532) —
+# 600 would be unreadable.
+chmod 644 falconone-client.key falconone-client.crt 2>/dev/null || true
+chmod 644 cve-proxy-client.key cve-proxy-client.crt 2>/dev/null || true
 '@
     $absTlsDir = (Resolve-Path -LiteralPath $tlsDir -ErrorAction SilentlyContinue)
     if (-not $absTlsDir) {
@@ -652,9 +658,13 @@ clients:
   - name: falconone
     cert_san: "falconone.coderaft.local"
     permissions: ["read:license_key","read:falconone_*","read:platform/identity/oidc","sign:falconone_agent_cert","read:falconone/nvd_api_key","read:falconone/audit_hmac_key","write:falconone/audit_hmac_key","read:falconone/pki/agents-ca/cert"]
+
+  - name: cve-proxy
+    cert_san: "cve-proxy.coderaft.local"
+    permissions: ["read:cve-proxy/*", "write:cve-proxy/*"]
 '@
     [System.IO.File]::WriteAllText((Join-Path $cfgDir "acl.yaml"), $aclYaml, [System.Text.UTF8Encoding]::new($false))
-    Write-Host "  ✓ Vault mTLS PKI generated (CA + server cert + 4 client certs)" -ForegroundColor Green
+    Write-Host "  ✓ Vault mTLS PKI generated (CA + server cert + 6 client certs)" -ForegroundColor Green
 }
 
 # ── FalconOne agents mTLS PKI (#170) ─────────────────────────────────────────
@@ -823,6 +833,102 @@ function Invoke-FalconOneAclSelfHeal {
     Write-Host "  [install] Self-heal ACL: falconone permissions updated (+$($missing.Count) added)"
 }
 
+# ── ACL self-heal: cve-proxy entry (coderaft-cve-engine sidecar) ────────────
+# Same additive-only, idempotent pattern as Invoke-FalconOneAclSelfHeal above.
+function Invoke-CveProxyAclSelfHeal {
+    param([Parameter(Mandatory = $true)][string]$AclPath)
+
+    if (-not (Test-Path $AclPath)) {
+        Write-Host "  [install] ACL self-heal: $AclPath not found — skipping (vault not provisioned yet)"
+        return
+    }
+
+    $lines = @(Get-Content -LiteralPath $AclPath)
+    $already = $lines | Where-Object { $_ -match '^\s*-\s*name:\s*cve-proxy\s*$' }
+    if ($already) {
+        Write-Host "  [install] ACL cve-proxy already present"
+        return
+    }
+
+    $ts = Get-Date -Format "yyyyMMddTHHmmssZ"
+    Copy-Item -LiteralPath $AclPath -Destination "${AclPath}.bak-${ts}"
+    $newBlock = @'
+
+  - name: cve-proxy
+    cert_san: "cve-proxy.coderaft.local"
+    permissions:
+      - "read:cve-proxy/*"
+      - "write:cve-proxy/*"
+'@
+    Add-Content -LiteralPath $AclPath -Value $newBlock
+    Write-Host "  [install] Self-heal ACL: cve-proxy entry created"
+}
+
+# ── Vault client cert self-heal (any product whose cert was never
+# generated, e.g. falconone/cve-proxy on installs provisioned before they
+# shipped) — additive-only, requires client-ca.key to still be present.
+function Invoke-VaultClientCertSelfHeal {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$San
+    )
+
+    $tlsDir = Join-Path (Get-Location).Path "vault-tls"
+    $certPath = Join-Path $tlsDir "$Name-client.crt"
+    if (Test-Path $certPath) { return }
+
+    $caKey = Join-Path $tlsDir "client-ca.key"
+    $caCrt = Join-Path $tlsDir "client-ca.crt"
+    if (-not (Test-Path $caKey) -or -not (Test-Path $caCrt)) {
+        Write-Host "  [install] Cert self-heal: vault-tls\client-ca.key missing — cannot mint $Name-client cert (needs a full CA rotation, not a self-heal)"
+        return
+    }
+
+    Write-Host "  [install] Cert self-heal: generating vault-tls\$Name-client (was missing)"
+    $chmodExtra = if ($Name -eq "falconone" -or $Name -eq "cve-proxy") {
+        "chmod 644 '$Name-client.key' '$Name-client.crt'"
+    } else {
+        "chmod 600 '$Name-client.key' '$Name-client.crt'"
+    }
+    # Same proven pattern as Invoke-VaultBootstrapTLS (B20-docker): script
+    # file + Start-Process with explicit redirection, never a bare pipeline
+    # to `docker run`, or PowerShell 5.1 surfaces stderr as a scary red
+    # NativeCommandError even on success.
+    $script = @"
+set -e
+apk add --no-cache openssl >/dev/null
+cd /work
+openssl req -newkey rsa:2048 -nodes -sha256 \
+    -keyout '$Name-client.key' -out '$Name-client.csr' \
+    -subj '/CN=$San' 2>/dev/null
+printf 'subjectAltName=DNS:%s\nbasicConstraints=CA:FALSE' '$San' > /tmp/client.ext
+openssl x509 -req -days 3650 -sha256 \
+    -in '$Name-client.csr' -CA client-ca.crt -CAkey client-ca.key -CAcreateserial \
+    -out '$Name-client.crt' -extfile /tmp/client.ext 2>/dev/null
+rm -f '$Name-client.csr'
+$chmodExtra
+"@
+    $scriptFile = Join-Path $env:TEMP "coderaft-cert-selfheal-$(Get-Random).sh"
+    $scriptLF = $script -replace "`r`n", "`n"
+    [System.IO.File]::WriteAllText($scriptFile, $scriptLF, [System.Text.UTF8Encoding]::new($false))
+
+    $runStdout = Join-Path $env:TEMP "coderaft-cert-selfheal-out-$(Get-Random).log"
+    $runStderr = Join-Path $env:TEMP "coderaft-cert-selfheal-err-$(Get-Random).log"
+    $proc = Start-Process -FilePath "docker" -ArgumentList @(
+        "run","--rm",
+        "-v","${scriptFile}:/script.sh:ro",
+        "-v","${tlsDir}:/work",
+        "alpine:3.20","sh","/script.sh"
+    ) -NoNewWindow -Wait -PassThru `
+        -RedirectStandardOutput $runStdout `
+        -RedirectStandardError $runStderr `
+        -ErrorAction SilentlyContinue
+    Remove-Item -Path $runStdout, $runStderr, $scriptFile -ErrorAction SilentlyContinue
+    if (-not $proc -or $proc.ExitCode -ne 0 -or -not (Test-Path $certPath)) {
+        Write-Host "  [install] Cert self-heal: $Name-client generation failed (non-fatal, retried next run)"
+    }
+}
+
 Invoke-VaultBootstrap
 
 # ── FalconOne mTLS PKI + ACL self-heal (#170 / #172) ─────────────────────────
@@ -832,6 +938,13 @@ Invoke-VaultBootstrap
 # ACL permissions healed.
 Invoke-FalconOneTlsBootstrap -InstallDir (Get-Location).Path
 Invoke-FalconOneAclSelfHeal -AclPath (Join-Path (Get-Location).Path "vault-config\acl.yaml")
+
+# ── cve-proxy vault client cert + ACL self-heal ──────────────────────────────
+# coderaft-cve-proxy is a shared platform sidecar (in front of the central
+# coderaft-cve-engine), not tied to any single product license.
+Invoke-VaultClientCertSelfHeal -Name "falconone" -San "falconone.coderaft.local"
+Invoke-VaultClientCertSelfHeal -Name "cve-proxy" -San "cve-proxy.coderaft.local"
+Invoke-CveProxyAclSelfHeal -AclPath (Join-Path (Get-Location).Path "vault-config\acl.yaml")
 
 # Append CODERAFT_VAULT_* env vars if not already present
 $envText = [System.IO.File]::ReadAllText("$(Get-Location)\.env", [System.Text.UTF8Encoding]::new($false))
@@ -1047,6 +1160,38 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    restart: unless-stopped
+
+  # ── coderaft-cve-proxy ───────────────────────────────────────────────────
+  # Internal sidecar in front of the shared coderaft-cve-engine
+  # (cve.coderaft.io): holds the ONE bearer key for this deployment (read
+  # from vault at boot) and forwards CVE/KEV/EPSS/MSRC lookups from any
+  # product on coderaft-backend. No host port published.
+  coderaft-cve-proxy:
+    image: ghcr.io/liamj74/coderaft-cve-proxy:latest
+    networks:
+      - coderaft-vault-net
+      - coderaft-backend
+      - coderaft-frontend
+    depends_on:
+      coderaft-vault: { condition: service_started }
+    environment:
+      - CODERAFT_VAULT_URL=https://coderaft-vault:8200
+      - CODERAFT_VAULT_CA=/vault-tls/client-ca.crt
+      - CODERAFT_VAULT_CLIENT_CERT=/vault-tls/cve-proxy-client.crt
+      - CODERAFT_VAULT_CLIENT_KEY=/vault-tls/cve-proxy-client.key
+      - XPRODUCT_INTERNAL_TOKEN=${XPRODUCT_INTERNAL_TOKEN}
+    volumes:
+      - ./vault-tls/client-ca.crt:/vault-tls/client-ca.crt:ro
+      - ./vault-tls/cve-proxy-client.crt:/vault-tls/cve-proxy-client.crt:ro
+      - ./vault-tls/cve-proxy-client.key:/vault-tls/cve-proxy-client.key:ro
+    healthcheck:
+      test: ["CMD", "/coderaft-cve-proxy", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
     restart: unless-stopped

@@ -1,0 +1,106 @@
+# docker-compose.airgap.yml — Coderaft Platform Air-gap overlay
+#
+# STARTING POINT — review and adapt before production use.
+# See docs/deployment-topologies.md for full context.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.airgap.yml up -d
+#
+# Prerequisites:
+#   1. Mirror all Coderaft images to your local OCI registry:
+#        crane copy ghcr.io/liamj74/coderaft-X:TAG <LOCAL_REGISTRY>/coderaft-X:TAG
+#      Or use the provided mirror script: scripts/mirror-images.sh
+#   2. Obtain an offline license bundle from sales@coderaft.io and place it at
+#      the path specified in AIRGAP_LICENSE_PATH.
+#   3. Set LOCAL_REGISTRY in .env (e.g. harbor.internal/coderaft or 192.168.1.10:5000).
+#
+# Variables (set in .env or environment):
+#   LOCAL_REGISTRY        — your local OCI registry prefix (no trailing slash)
+#   TAG                   — image tag (default: latest)
+#   AIRGAP_LICENSE_PATH   — path to offline license .tar.gz on the host
+#
+# ------------------------------------------------------------------
+
+version: '3.9'
+
+# All images re-pointed to the local registry. Telemetry disabled. License Server offline.
+
+services:
+  dashboard-api:
+    image: ${LOCAL_REGISTRY}/coderaft-dashboard-api:${TAG:-latest}
+    environment:
+      LICENSE_SERVER_URL: ""
+      LICENSE_OFFLINE_PATH: ${AIRGAP_LICENSE_PATH}
+      TELEMETRY_ENABLED: "false"
+      UPDATE_CHECK_ENABLED: "false"
+
+  entraguard-api:
+    image: ${LOCAL_REGISTRY}/coderaft-entraguard:${TAG:-latest}
+    environment:
+      TELEMETRY_ENABLED: "false"
+      UPDATE_CHECK_ENABLED: "false"
+      # Disable Azure Graph change notification webhooks (require outbound internet)
+      DISABLE_REALTIME_MONITORING: "true"
+
+  entraguard-worker:
+    image: ${LOCAL_REGISTRY}/coderaft-entraguard:${TAG:-latest}
+    environment:
+      TELEMETRY_ENABLED: "false"
+
+  entraguard-beat:
+    image: ${LOCAL_REGISTRY}/coderaft-entraguard:${TAG:-latest}
+    environment:
+      TELEMETRY_ENABLED: "false"
+
+  ravenscan:
+    image: ${LOCAL_REGISTRY}/coderaft-ravenscan:${TAG:-latest}
+    environment:
+      TELEMETRY_ENABLED: "false"
+      UPDATE_CHECK_ENABLED: "false"
+      # NVD CVE feed must be pre-loaded; see scripts/load-nvd-offline.sh
+      NVD_OFFLINE_MODE: "true"
+
+  redfox-api:
+    image: ${LOCAL_REGISTRY}/coderaft-redfox-api:${TAG:-latest}
+    environment:
+      TELEMETRY_ENABLED: "false"
+
+  redfox-proxy:
+    image: ${LOCAL_REGISTRY}/coderaft-redfox-proxy:${TAG:-latest}
+
+  redfox-gateway:
+    image: ${LOCAL_REGISTRY}/coderaft-redfox-gateway:${TAG:-latest}
+
+  postgres:
+    image: ${LOCAL_REGISTRY}/coderaft-postgres:${TAG:-latest}
+
+  redis:
+    image: ${LOCAL_REGISTRY}/coderaft-redis:${TAG:-latest}
+
+  neo4j:
+    image: ${LOCAL_REGISTRY}/coderaft-neo4j:${TAG:-latest}
+    environment:
+      NEO4J_dbms_connector_https_enabled: "false"
+
+  nginx:
+    image: ${LOCAL_REGISTRY}/coderaft-nginx:${TAG:-latest}
+
+  # Loki and Grafana (optional in air-gap — remove if not mirrored)
+  loki:
+    image: ${LOCAL_REGISTRY}/grafana-loki:${TAG:-latest}
+
+  grafana:
+    image: ${LOCAL_REGISTRY}/grafana-grafana:${TAG:-latest}
+
+# ------------------------------------------------------------------
+# NOTE: Air-gap operation requires additional steps:
+#   1. Mirror NVD CVE database for Ravenscan offline scanning.
+#      Use: scripts/load-nvd-offline.sh to pre-seed the DB.
+#   2. Mirror the EntraGuard feature-catalog.json locally and set
+#      FEATURE_CATALOG_URL to point to your internal web server.
+#   3. Microsoft Graph authentication still works (Entra ID STS is
+#      internet-facing). For full air-gap, use ADFS or an on-prem IDP.
+#   4. Updates: download new image bundles via secure transfer,
+#      load with docker load -i coderaft-<version>.tar.gz, then
+#      push to your local registry and re-run docker compose up -d.
+# ------------------------------------------------------------------

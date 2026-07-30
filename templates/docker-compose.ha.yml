@@ -1,0 +1,144 @@
+# docker-compose.ha.yml — Coderaft Platform HA Cluster overlay
+#
+# STARTING POINT — review and adapt before production use.
+# See docs/deployment-topologies.md and docs/ha-architecture.md for full context.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.ha.yml up -d
+#
+# Assumptions:
+#   - You have 2 or 3 Linux hosts with Docker Engine 24+ and Compose v2.
+#   - Shared /data volume is NOT needed: each node has its own volumes.
+#     PostgreSQL replication keeps data in sync at the DB level.
+#   - Keepalived VIP (VRRP) is configured directly on the host — not in this file.
+#   - All nodes run this same override file (with node-specific .env adjustments).
+#
+# Variables (set in .env or environment):
+#   NODE_ROLE         — "primary" on the first node, "standby" on others
+#   PG_PRIMARY_HOST   — hostname/IP of the primary PostgreSQL node
+#   TAG               — image tag (default: latest)
+#   REGISTRY          — image registry (default: ghcr.io/liamj74)
+#
+# ------------------------------------------------------------------
+
+version: '3.9'
+
+# -----------------------------------------------------------
+# PostgreSQL — streaming replication, auto-failover via Patroni
+# -----------------------------------------------------------
+services:
+  postgres:
+    image: ${REGISTRY:-ghcr.io/liamj74}/coderaft-postgres:${TAG:-latest}
+    environment:
+      NODE_ROLE: ${NODE_ROLE:-primary}
+      POSTGRES_REPLICATION_USER: replicator
+      POSTGRES_REPLICATION_PASSWORD: ${PG_REPLICATION_PASSWORD}
+      POSTGRES_SYNCHRONOUS_COMMIT: "on"
+      POSTGRES_SYNCHRONOUS_STANDBY_NAMES: "*"
+      PG_PRIMARY_HOST: ${PG_PRIMARY_HOST:-pg-primary}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "coderaft"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # -----------------------------------------------------------
+  # Redis — master on primary node only; replicas on standby nodes
+  # -----------------------------------------------------------
+  redis:
+    image: ${REGISTRY:-ghcr.io/liamj74}/coderaft-redis:${TAG:-latest}
+    command: >
+      sh -c "
+        if [ \"$$NODE_ROLE\" = 'primary' ]; then
+          redis-server /etc/redis/redis.conf;
+        else
+          redis-server /etc/redis/redis.conf --replicaof $$REDIS_MASTER_HOST 6379;
+        fi
+      "
+    environment:
+      NODE_ROLE: ${NODE_ROLE:-primary}
+      REDIS_MASTER_HOST: ${REDIS_MASTER_HOST:-redis-primary}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  # Redis Sentinel — run on ALL nodes (3 sentinels = quorum 2)
+  redis-sentinel:
+    image: ${REGISTRY:-ghcr.io/liamj74}/coderaft-redis-sentinel:${TAG:-latest}
+    environment:
+      SENTINEL_MASTER_HOST: ${REDIS_MASTER_HOST:-redis-primary}
+      SENTINEL_QUORUM: "2"
+      SENTINEL_DOWN_AFTER_MS: "5000"
+      SENTINEL_FAILOVER_TIMEOUT: "15000"
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    restart: unless-stopped
+    depends_on:
+      - redis
+
+  # -----------------------------------------------------------
+  # dashboard-api — stateless, run on all nodes
+  # -----------------------------------------------------------
+  dashboard-api:
+    image: ${REGISTRY:-ghcr.io/liamj74}/coderaft-dashboard-api:${TAG:-latest}
+    environment:
+      DATABASE_URL: postgresql://coderaft:${POSTGRES_PASSWORD}@${PG_PRIMARY_HOST:-pg-primary}:5432/coderaft
+      REDIS_URL: redis://:${REDIS_PASSWORD}@${REDIS_MASTER_HOST:-redis-primary}:6379/0
+      DASHBOARD_SECRET: ${DASHBOARD_SECRET}
+      VAULT_DIR: /data
+      CONTAINER_COMPOSE_DIR: /host-compose
+      HOST_PROJECT_DIR: ${HOST_PROJECT_DIR:-/opt/coderaft}
+    volumes:
+      - dashboard_data:/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ${HOST_PROJECT_DIR:-/opt/coderaft}:/host-compose
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # -----------------------------------------------------------
+  # EntraGuard — stateless, run on all nodes (shared PG+Redis)
+  # -----------------------------------------------------------
+  entraguard-api:
+    image: ${REGISTRY:-ghcr.io/liamj74}/coderaft-entraguard:${TAG:-latest}
+    environment:
+      DATABASE_URL: postgresql://coderaft:${POSTGRES_PASSWORD}@${PG_PRIMARY_HOST:-pg-primary}:5432/entraguard
+      REDIS_URL: redis://:${REDIS_PASSWORD}@${REDIS_MASTER_HOST:-redis-primary}:6379/1
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@${REDIS_MASTER_HOST:-redis-primary}:6379/2
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # -----------------------------------------------------------
+  # Nginx — load balance on each node; pair with Keepalived VIP
+  # -----------------------------------------------------------
+  nginx:
+    image: ${REGISTRY:-ghcr.io/liamj74}/coderaft-nginx:${TAG:-latest}
+    environment:
+      NGINX_UPSTREAM_DASHBOARD_API: "dashboard-api:3001"
+    ports:
+      - "80:80"
+      - "443:443"
+    restart: unless-stopped
+    depends_on:
+      - dashboard-api
+
+volumes:
+  pg_data:
+  redis_data:
+  dashboard_data:
+
+# ------------------------------------------------------------------
+# NOTE: This template is a STARTING POINT, not production-ready YAML.
+# Missing pieces for a hardened HA deployment:
+#   - Patroni (or pg_auto_failover) for automatic PG promotion
+#   - Keepalived VIP config on the hosts (not in Docker Compose)
+#   - Shared storage for reports (NFS/S3 mount for entraguard reports_data)
+#   - Proper firewall rules between nodes (ports: 5432, 6379, 3001)
+#   - mTLS between dashboard-api instances if cross-node calls are added
+# ------------------------------------------------------------------
