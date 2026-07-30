@@ -530,6 +530,8 @@ _falconone_acl_selfheal() {
         "read:falconone/audit_hmac_key"
         "write:falconone/audit_hmac_key"
         "read:falconone/pki/agents-ca/cert"
+        "read:pki/falconone-agents-ca*"
+        "write:pki/falconone-agents-ca*"
     )
 
     local ts
@@ -550,6 +552,8 @@ _falconone_acl_selfheal() {
       - "read:falconone/audit_hmac_key"
       - "write:falconone/audit_hmac_key"
       - "read:falconone/pki/agents-ca/cert"
+      - "read:pki/falconone-agents-ca*"
+      - "write:pki/falconone-agents-ca*"
 FALCONONEACL
         echo "  [install] Self-heal ACL: falconone permissions updated (+${#required_perms[@]} added, entry created)"
         return 0
@@ -1248,7 +1252,7 @@ clients:
     permissions: ["read:redfox_*","read:license_key","read:platform/identity/oidc"]
   - name: falconone
     cert_san: "falconone.coderaft.local"
-    permissions: ["read:license_key","read:falconone_*","read:platform/identity/oidc","sign:falconone_agent_cert","read:falconone/nvd_api_key","read:falconone/audit_hmac_key","write:falconone/audit_hmac_key","read:falconone/pki/agents-ca/cert"]
+    permissions: ["read:license_key","read:falconone_*","read:platform/identity/oidc","sign:falconone_agent_cert","read:falconone/nvd_api_key","read:falconone/audit_hmac_key","write:falconone/audit_hmac_key","read:falconone/pki/agents-ca/cert","read:pki/falconone-agents-ca*","write:pki/falconone-agents-ca*"]
   - name: cve-proxy
     cert_san: "cve-proxy.coderaft.local"
     permissions: ["read:cve-proxy/*", "write:cve-proxy/*"]
@@ -1263,6 +1267,15 @@ ACLEOF
 # permissions healed.
 _falconone_tls_bootstrap "${INSTALL_DIR}"
 _falconone_acl_selfheal "${INSTALL_DIR}/vault-config/acl.yaml"
+
+# ── cve-proxy vault client cert + ACL self-heal ──────────────────────────────
+# coderaft-cve-proxy is a shared platform sidecar, not tied to any single
+# product license — self-healed unconditionally, same as falconone above.
+# (Mirrors install.sh; was previously missing here, so updates never grew
+# the cve-proxy client cert/ACL entry on already-bootstrapped installs.)
+_vault_client_cert_selfheal "falconone" "falconone.coderaft.local"
+_vault_client_cert_selfheal "cve-proxy" "cve-proxy.coderaft.local"
+_cveproxy_acl_selfheal "${INSTALL_DIR}/vault-config/acl.yaml"
 
 # ── Banking-grade plaintext .env handling ──────────────────────────────────
 # B-PLAINTEXT-PURGE (2026-06-14): The previous block deleted .env when an

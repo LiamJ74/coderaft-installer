@@ -571,7 +571,7 @@ clients:
 
   - name: falconone
     cert_san: "falconone.coderaft.local"
-    permissions: ["read:license_key","read:falconone_*","read:platform/identity/oidc","sign:falconone_agent_cert","read:falconone/nvd_api_key","read:falconone/audit_hmac_key","write:falconone/audit_hmac_key","read:falconone/pki/agents-ca/cert"]
+    permissions: ["read:license_key","read:falconone_*","read:platform/identity/oidc","sign:falconone_agent_cert","read:falconone/nvd_api_key","read:falconone/audit_hmac_key","write:falconone/audit_hmac_key","read:falconone/pki/agents-ca/cert","read:pki/falconone-agents-ca*","write:pki/falconone-agents-ca*"]
 
   - name: cve-proxy
     cert_san: "cve-proxy.coderaft.local"
@@ -726,6 +726,8 @@ _falconone_acl_selfheal() {
         "read:falconone/audit_hmac_key"
         "write:falconone/audit_hmac_key"
         "read:falconone/pki/agents-ca/cert"
+        "read:pki/falconone-agents-ca*"
+        "write:pki/falconone-agents-ca*"
     )
 
     local ts
@@ -746,6 +748,8 @@ _falconone_acl_selfheal() {
       - "read:falconone/audit_hmac_key"
       - "write:falconone/audit_hmac_key"
       - "read:falconone/pki/agents-ca/cert"
+      - "read:pki/falconone-agents-ca*"
+      - "write:pki/falconone-agents-ca*"
 FALCONONEACL
         echo "  [install] Self-heal ACL: falconone permissions updated (+${#required_perms[@]} added, entry created)"
         return 0

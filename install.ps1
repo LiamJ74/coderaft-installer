@@ -657,7 +657,7 @@ clients:
 
   - name: falconone
     cert_san: "falconone.coderaft.local"
-    permissions: ["read:license_key","read:falconone_*","read:platform/identity/oidc","sign:falconone_agent_cert","read:falconone/nvd_api_key","read:falconone/audit_hmac_key","write:falconone/audit_hmac_key","read:falconone/pki/agents-ca/cert"]
+    permissions: ["read:license_key","read:falconone_*","read:platform/identity/oidc","sign:falconone_agent_cert","read:falconone/nvd_api_key","read:falconone/audit_hmac_key","write:falconone/audit_hmac_key","read:falconone/pki/agents-ca/cert","read:pki/falconone-agents-ca*","write:pki/falconone-agents-ca*"]
 
   - name: cve-proxy
     cert_san: "cve-proxy.coderaft.local"
@@ -766,7 +766,9 @@ function Invoke-FalconOneAclSelfHeal {
         "read:falconone/nvd_api_key",
         "read:falconone/audit_hmac_key",
         "write:falconone/audit_hmac_key",
-        "read:falconone/pki/agents-ca/cert"
+        "read:falconone/pki/agents-ca/cert",
+        "read:pki/falconone-agents-ca*",
+        "write:pki/falconone-agents-ca*"
     )
 
     $lines = @(Get-Content -LiteralPath $AclPath)
@@ -792,6 +794,8 @@ function Invoke-FalconOneAclSelfHeal {
       - "read:falconone/audit_hmac_key"
       - "write:falconone/audit_hmac_key"
       - "read:falconone/pki/agents-ca/cert"
+      - "read:pki/falconone-agents-ca*"
+      - "write:pki/falconone-agents-ca*"
 '@
         Add-Content -LiteralPath $AclPath -Value $newBlock
         Write-Host "  [install] Self-heal ACL: falconone permissions updated (+$($requiredPerms.Count) added, entry created)"
