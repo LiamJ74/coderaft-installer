@@ -2182,142 +2182,28 @@ if (-not $vaultInMainTop -and (Test-Path ".\docker-compose.vault.yml")) {
 # Task #150: both env files, always explicit (see $ComposeEnvArgs above).
 $ComposeArgs += $ComposeEnvArgs
 
-# ── Refresh license keys (drift "superseded") ─────────────────────────────
-# When the License Server resigns a license (e.g. feature added, key
-# rotation), it returns 403 "License has been superseded by a newer version"
-# for any request using the old key. So we refresh the key in
-# docker-compose.override.yml BEFORE `docker compose up`. Backup is .bak.
-# If the License Server is unreachable, we continue silently.
-function Update-License {
-    param(
-        [Parameter(Mandatory=$true)] [string] $EnvVar,
-        [Parameter(Mandatory=$true)] [string] $OverrideFile
-    )
-
-    $content = if (Test-Path $OverrideFile -PathType Leaf) {
-        Get-Content -LiteralPath $OverrideFile -ErrorAction SilentlyContinue
-    } else { @() }
-
-    # Read current key from .env first (source of truth read by
-    # dashboard-api), fall back to override.yml. Ensures we always validate
-    # the OLDEST stale key still on disk and propagate the refreshed value
-    # to all stores — even when override.yml was rotated by a previous run
-    # but .env wasn't.
-    $currentKey = $null
-    $envFile = Join-Path $INSTALL_DIR ".env"
-    if (Test-Path $envFile -PathType Leaf) {
-        $envLines = Get-Content -LiteralPath $envFile
-        foreach ($line in $envLines) {
-            if ($line -match "^\s*$([Regex]::Escape($EnvVar))=(.+)$") {
-                $currentKey = $Matches[1].Trim().Trim('"').Trim("'")
-                break
-            }
-        }
-    }
-    if (-not $currentKey) {
-        $regex = "^\s*-?\s*$([Regex]::Escape($EnvVar))=(.+)$"
-        foreach ($line in $content) {
-            if ($line -match $regex) {
-                $currentKey = $Matches[1].Trim().Trim('"').Trim("'")
-                break
-            }
-        }
-    }
-    $regex = "^\s*-?\s*$([Regex]::Escape($EnvVar))=(.+)$"
-    if (-not $currentKey -or $currentKey -eq "UNCONFIGURED") { return $false }
-
-    $server = if ($env:LICENSE_SERVER_URL) { $env:LICENSE_SERVER_URL } else { "https://license.coderaft.io" }
-    $latest = $null
-    try {
-        $body = @{ license_key = $currentKey } | ConvertTo-Json -Compress
-        $resp = Invoke-RestMethod -Method Post -Uri "$server/api/licenses/validate" `
-            -ContentType "application/json" -Body $body -TimeoutSec 10 -ErrorAction Stop
-        if ($resp.latest_license_key) { $latest = [string]$resp.latest_license_key }
-    } catch {
-        # License Server unreachable or network error → silent
-        return $false
-    }
-
-    if ($latest -and $latest -ne $currentKey) {
-        # 1. override.yml — replace ALL occurrences (worker + api may share)
-        Copy-Item -LiteralPath $OverrideFile -Destination "$OverrideFile.bak" -Force
-        $newContent = foreach ($line in $content) {
-            if ($line -match $regex) {
-                $padMatch = [Regex]::Match($line, "^(\s*-?\s*)")
-                $pad = $padMatch.Groups[1].Value
-                "$pad$EnvVar=$latest"
-            } else { $line }
-        }
-        [System.IO.File]::WriteAllLines($OverrideFile, $newContent, (New-Object System.Text.UTF8Encoding($false)))
-
-        # 2. .env (host) — dashboard-api reads this directly. Without this
-        #    sync, override.yml has the new key but dashboard-api keeps
-        #    seeing the old one and license.json never refreshes.
-        $envFile = Join-Path $INSTALL_DIR ".env"
-        if (Test-Path $envFile) {
-            $envLines = Get-Content -LiteralPath $envFile
-            $envRegex = "^\s*${EnvVar}="
-            if ($envLines -match $envRegex) {
-                Copy-Item -LiteralPath $envFile -Destination "$envFile.bak.$(Get-Date -UFormat %s)" -Force -ErrorAction SilentlyContinue
-                $newEnv = foreach ($l in $envLines) {
-                    if ($l -match $envRegex) { "$EnvVar=$latest" } else { $l }
-                }
-                [System.IO.File]::WriteAllLines($envFile, $newEnv, (New-Object System.Text.UTF8Encoding($false)))
-            }
-        }
-
-        # 3. .env.enc — re-encrypt so next dashboard-api boot reads fresh
-        $envEnc = Join-Path $INSTALL_DIR ".env.enc"
-        $sopsCmd = Get-Command sops -ErrorAction SilentlyContinue
-        if ((Test-Path $envEnc) -and $sopsCmd -and (Test-Path $envFile)) {
-            $ageKey = if ($env:SOPS_AGE_KEY_FILE) { $env:SOPS_AGE_KEY_FILE } else { Join-Path $INSTALL_DIR ".coderaft-age.key" }
-            if (-not (Test-Path $ageKey) -and (Test-Path "C:\ProgramData\coderaft\age.key")) {
-                $ageKey = "C:\ProgramData\coderaft\age.key"
-            }
-            if (Test-Path $ageKey) {
-                $env:SOPS_AGE_KEY_FILE = $ageKey
-                try {
-                    # B20 (2026-06-08): `& $sopsCmd.Path ... > file 2>$null` → NativeCommandError PS 5.1
-                    $sopsEncTmp = "$envEnc.tmp"
-                    $sopsEncErr = Join-Path $env:TEMP "coderaft-sopsenc-err-$(Get-Random).log"
-                    $sopsProc = Start-Process -FilePath $sopsCmd.Path `
-                        -ArgumentList @("--encrypt","--input-type","dotenv","--output-type","dotenv",$envFile) `
-                        -NoNewWindow -Wait -PassThru `
-                        -RedirectStandardOutput $sopsEncTmp `
-                        -RedirectStandardError  $sopsEncErr `
-                        -ErrorAction SilentlyContinue
-                    Remove-Item -Path $sopsEncErr -ErrorAction SilentlyContinue
-                    if ($sopsProc.ExitCode -eq 0) { Move-Item -Force $sopsEncTmp $envEnc } else { Remove-Item -Force $sopsEncTmp -ErrorAction SilentlyContinue }
-                } catch { }
-            }
-        }
-
-        Write-Host "  🔄 License refreshed for $EnvVar"
-        return $true
-    }
-    return $false
-}
-
-function Update-AllLicenses {
-    $overrideFile = Join-Path $INSTALL_DIR "docker-compose.override.yml"
-    Write-Host ""
-    Write-Host "  ▶ Checking for license drift..."
-    $any = $false
-    foreach ($var in @("LICENSE_KEY", "RAVENSCAN_LICENSE_KEY", "REDFOX_LICENSE_KEY")) {
-        try {
-            if (Update-License -EnvVar $var -OverrideFile $overrideFile) { $any = $true }
-        } catch {
-            # Never fail the update because of a refresh
-        }
-    }
-    if ($any) {
-        Write-Host "  ⚠️  At least one license was refreshed; services will be restarted"
-    } else {
-        Write-Host "  ✅ All licenses are up to date"
-    }
-}
-
-try { Update-AllLicenses } catch { }
+# ── License key drift refresh: REMOVED (2026-07-31) ───────────────────────
+# Update-License/Update-AllLicenses used to POST the local
+# LICENSE_KEY/RAVENSCAN_LICENSE_KEY/REDFOX_LICENSE_KEY (baked into
+# docker-compose.override.yml + .env) to the License Server's public
+# /api/licenses/validate before `docker compose up`, so a resigned/rotated
+# key baked into a product container's env didn't 403 with "superseded by a
+# newer version". That whole problem class is gone since #166
+# (2026-07-28): products no longer take their license via a boot-time env
+# var at all — they fetch the resolved license live from dashboard-api's
+# GET /api/dashboard/internal/license (which itself reads Coderaft Vault,
+# not .env). dashboard-api's removeLicenseKeyFromHostEnv() also actively
+# strips any stray LICENSE_KEY= line from .env/.env.enc on every boot, so
+# this function's writes were already being erased by the very next
+# dashboard-api start — and install.ps1/templates no longer write these
+# vars into docker-compose.override.yml in the first place, so
+# $currentKey resolved empty (silent no-op) on every install that had
+# booted a post-#166 dashboard-api even once. Confirmed dead via
+# exhaustive grep for live env reads (not just comments) in all four
+# product repos: Audit_Entra (WolfGuard), secaudit (Ravenscan), Redfox,
+# falconone — zero hits. See scripts/update.sh/update.ps1's vault-migration
+# D4 comment (task #150) for the matching removal on the secrets-migration
+# side, and scripts/update.sh for the bash equivalent of this comment.
 
 # ── Renew local HTTPS certs if older than 80 days ─────────────────────────
 # Preserve user-provided certs untouched. Only auto-renew the ones we

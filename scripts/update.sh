@@ -1594,131 +1594,27 @@ fi
 echo ""
 echo "  ${#IMAGES_TO_UPDATE[@]} image(s) to update."
 
-# ── Refresh license keys (drift "superseded") ─────────────────────────────
-# When the License Server resigns a license (e.g. feature added, extension,
-# key rotation), the server returns 403 "License has been superseded by a
-# newer version" for any request using the old key. The product-side fix
-# prioritizes DB > env, but on a fresh deploy or after a volume reset, only
-# the env key exists. So we refresh it here, in-place in
-# docker-compose.override.yml, BEFORE `docker compose up`.
-#
-# Strategy: POST /api/licenses/validate with the local key; if the response
-# contains a different `latest_license_key`, write it into the override
-# (with a .bak backup). We never fail the update because of this (License
-# Server down → continue with the local key; the runtime will handle 403).
-refresh_license() {
-    local env_var="$1"   # LICENSE_KEY / RAVENSCAN_LICENSE_KEY / REDFOX_LICENSE_KEY
-    local override_file="$INSTALL_DIR/docker-compose.override.yml"
-    local env_file="$INSTALL_DIR/.env"
-
-    # Read current key from .env first (source of truth read by
-    # dashboard-api), fall back to override.yml. This ensures we always
-    # validate the OLDEST stale key that's still on disk and propagate the
-    # refreshed value to all stores — even when override.yml was already
-    # rotated by a previous run but .env wasn't.
-    local current_key=""
-    if [ -f "$env_file" ] && grep -qE "^[[:space:]]*${env_var}=" "$env_file"; then
-        current_key=$(grep -E "^[[:space:]]*${env_var}=" "$env_file" \
-            | head -1 \
-            | sed -E "s/^[[:space:]]*${env_var}=//" \
-            | tr -d '"' | tr -d "'" | xargs)
-    fi
-    if [ -z "$current_key" ] && [ -f "$override_file" ] && grep -qE "^[[:space:]]*-?[[:space:]]*${env_var}=" "$override_file"; then
-        current_key=$(grep -E "^[[:space:]]*-?[[:space:]]*${env_var}=" "$override_file" \
-            | head -1 \
-            | sed -E "s/^[[:space:]]*-?[[:space:]]*${env_var}=//" \
-            | tr -d '"' | tr -d "'" | xargs)
-    fi
-    [[ -z "$current_key" || "$current_key" == "UNCONFIGURED" ]] && return 0
-
-    local server="${LICENSE_SERVER_URL:-https://license.coderaft.io}"
-    local response
-    response=$(curl -s --max-time 10 -X POST "${server}/api/licenses/validate" \
-        -H "Content-Type: application/json" \
-        -d "{\"license_key\":\"$current_key\"}" 2>/dev/null) || return 0
-    [[ -z "$response" ]] && return 0
-
-    local latest=""
-    if command -v jq &>/dev/null; then
-        latest=$(echo "$response" | jq -r '.latest_license_key // empty' 2>/dev/null)
-    else
-        latest=$(echo "$response" \
-            | grep -oE '"latest_license_key"[[:space:]]*:[[:space:]]*"[^"]+"' \
-            | head -1 \
-            | sed -E 's/.*"latest_license_key"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
-    fi
-
-    if [[ -n "$latest" && "$latest" != "$current_key" ]]; then
-        # 1. override.yml — replace ALL occurrences (entraguard-api +
-        #    entraguard-worker may share the same key across services).
-        cp "$override_file" "${override_file}.bak"
-        awk -v var="$env_var" -v key="$latest" '
-            {
-                pat = "^[[:space:]]*-?[[:space:]]*" var "="
-                if ($0 ~ pat) {
-                    match($0, /^[[:space:]]*-?[[:space:]]*/)
-                    pad = substr($0, 1, RLENGTH)
-                    print pad var "=" key
-                    next
-                }
-                print
-            }
-        ' "${override_file}.bak" > "$override_file"
-
-        # 2. .env (host) — dashboard-api reads this directly, and compose
-        #    interpolation pulls ${LICENSE_KEY} from here too. Without this
-        #    sync, override.yml has the new key but dashboard-api keeps
-        #    seeing the old one and license.json never refreshes.
-        local env_file="$INSTALL_DIR/.env"
-        if [ -f "$env_file" ] && grep -qE "^[[:space:]]*${env_var}=" "$env_file"; then
-            cp "$env_file" "${env_file}.bak.$(date +%s)" 2>/dev/null || true
-            awk -v var="$env_var" -v key="$latest" '
-                {
-                    pat = "^[[:space:]]*" var "="
-                    if ($0 ~ pat) {
-                        print var "=" key
-                        next
-                    }
-                    print
-                }
-            ' "${env_file}" > "${env_file}.tmp" && mv "${env_file}.tmp" "${env_file}"
-        fi
-
-        # 3. .env.enc (sops) — re-encrypt if present so the next
-        #    dashboard-api boot reads the fresh key from the encrypted
-        #    source. Best-effort; banking-grade purge happens later.
-        if [ -f "$INSTALL_DIR/.env.enc" ] && command -v sops >/dev/null 2>&1; then
-            local age_key="${SOPS_AGE_KEY_FILE:-$INSTALL_DIR/.coderaft-age.key}"
-            [ ! -f "$age_key" ] && [ -f "/etc/coderaft/age.key" ] && age_key="/etc/coderaft/age.key"
-            if [ -f "$age_key" ] && [ -f "$INSTALL_DIR/.env" ]; then
-                SOPS_AGE_KEY_FILE="$age_key" sops --encrypt --input-type dotenv --output-type dotenv "$INSTALL_DIR/.env" > "$INSTALL_DIR/.env.enc.tmp" 2>/dev/null \
-                    && mv "$INSTALL_DIR/.env.enc.tmp" "$INSTALL_DIR/.env.enc" \
-                    || rm -f "$INSTALL_DIR/.env.enc.tmp"
-            fi
-        fi
-
-        echo "  🔄 License refreshed for ${env_var}"
-        return 1  # signal: restart needed
-    fi
-    return 0
-}
-
-refresh_all_licenses() {
-    echo ""
-    echo "  ▶ Checking for license drift..."
-    local restart_needed=0
-    for var in LICENSE_KEY RAVENSCAN_LICENSE_KEY REDFOX_LICENSE_KEY; do
-        refresh_license "$var" || restart_needed=1
-    done
-    if [ "$restart_needed" -eq 0 ]; then
-        echo "  ✅ All licenses are up to date"
-    else
-        echo "  ⚠️  At least one license was refreshed; services will be restarted"
-    fi
-    return 0
-}
-
-refresh_all_licenses || true
+# ── License key drift refresh: REMOVED (2026-07-31) ───────────────────────
+# refresh_license()/refresh_all_licenses() used to POST the local
+# LICENSE_KEY/RAVENSCAN_LICENSE_KEY/REDFOX_LICENSE_KEY (baked into
+# docker-compose.override.yml + .env) to the License Server's public
+# /api/licenses/validate before `docker compose up`, so a resigned/rotated
+# key baked into a product container's env didn't 403 with "superseded by a
+# newer version". That whole problem class is gone since #166
+# (2026-07-28): products no longer take their license via a boot-time env
+# var at all — they fetch the resolved license live from dashboard-api's
+# GET /api/dashboard/internal/license (which itself reads Coderaft Vault,
+# not .env). dashboard-api's removeLicenseKeyFromHostEnv() also actively
+# strips any stray LICENSE_KEY= line from .env/.env.enc on every boot, so
+# this function's writes were already being erased by the very next
+# dashboard-api start — and install.sh/templates no longer write these vars
+# into docker-compose.override.yml in the first place, so `current_key`
+# resolved empty (silent no-op) on every install that had booted a
+# post-#166 dashboard-api even once. Confirmed dead via exhaustive grep for
+# live env reads (not just comments) in all four product repos:
+# Audit_Entra (WolfGuard), secaudit (Ravenscan), Redfox, falconone — zero
+# hits. See scripts/update.sh's vault-migration D4 comment (task #150)
+# for the matching removal on the secrets-migration side.
 
 # ── Renew local HTTPS certs if older than 80 days ─────────────────────────
 # Preserve user-provided certs untouched. Only auto-renew the ones we
