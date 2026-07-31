@@ -401,6 +401,78 @@ CVEPROXYBLOCK
     echo "  ✓ Self-heal docker-compose.yml — coderaft-cve-proxy service added"
 fi
 
+# ── Self-heal: dashboard-api tmpfs for the ephemeral working .env (#148) ──
+# Banking-grade runtime exposure reduction (2026-07-31): the *working* .env
+# (resolved secret VALUES, passed to `docker compose --env-file`) moves off
+# the persistent bind-mounted install dir onto a tmpfs private to the
+# dashboard-api container — proven safe experimentally (--env-file is
+# interpolated client-side by the `docker compose` CLI process running
+# INSIDE that same container, never resolved by the Docker daemon). See the
+# #148 report for the full experimental writeup.
+if [ -f "$COMPOSE_PATH" ] && ! grep -qF '/run/coderaft-env' "$COMPOSE_PATH" \
+   && grep -qF './vault-tls/dashboard-api-client.key:/vault-tls/dashboard-api-client.key:ro' "$COMPOSE_PATH"; then
+    cp "$COMPOSE_PATH" "$COMPOSE_PATH.bak-tmpfsenv-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    sed -i.tmp 's|      - ./vault-tls/dashboard-api-client.key:/vault-tls/dashboard-api-client.key:ro|      - ./vault-tls/dashboard-api-client.key:/vault-tls/dashboard-api-client.key:ro\
+    tmpfs:\
+      - /run/coderaft-env:size=1m,mode=0700,uid=0|' "$COMPOSE_PATH"
+    rm -f "$COMPOSE_PATH.tmp"
+    echo "  ✓ Self-heal docker-compose.yml — dashboard-api tmpfs /run/coderaft-env added (#148)"
+fi
+
+# ── Self-heal: postgres → Docker native secrets:/POSTGRES_PASSWORD_FILE (#148) ──
+# The official postgres image already supports POSTGRES_PASSWORD_FILE — this
+# removes the resolved password from `docker inspect`/Config.Env. Unlike
+# --env-file (client-side, see the tmpfs self-heal above), a compose
+# `secrets: file:` source IS resolved by the actual Docker daemon as a
+# literal bind-mount source (confirmed experimentally — see #148 report), so
+# the file MUST exist on real host disk BEFORE the next `docker compose up`.
+# Backfill it from the CURRENTLY ACTIVE .env value first (not a fresh
+# random one) so the already-initialized postgres cluster's real credential
+# keeps matching — postgres only reads POSTGRES_PASSWORD*  at its very first
+# initdb, so a mismatched value here would silently break every product's
+# DB connection after this same update.
+if [ -f "$COMPOSE_PATH" ] && grep -qF 'POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}' "$COMPOSE_PATH" \
+   && ! grep -qF 'POSTGRES_PASSWORD_FILE' "$COMPOSE_PATH"; then
+    cp "$COMPOSE_PATH" "$COMPOSE_PATH.bak-pgsecret-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+
+    mkdir -p "${INSTALL_DIR}/secrets"
+    chmod 700 "${INSTALL_DIR}/secrets"
+    CURRENT_PG_PW="$(grep '^POSTGRES_PASSWORD=' "${INSTALL_DIR}/.env" 2>/dev/null | head -1 | cut -d= -f2-)"
+    if [ -n "$CURRENT_PG_PW" ]; then
+        printf '%s' "$CURRENT_PG_PW" > "${INSTALL_DIR}/secrets/postgres_password"
+        chmod 600 "${INSTALL_DIR}/secrets/postgres_password"
+        unset CURRENT_PG_PW
+
+        sed -i.tmp 's|      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD}|      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password|' "$COMPOSE_PATH"
+        # Insert AFTER the (postgres-only) POSTGRES_INITDB_ARGS line, i.e.
+        # right before postgres's own `volumes:` key — NOT before the
+        # `- postgres_data:...` list ITEM, which would nest `secrets:` inside
+        # `volumes:` and break the YAML (caught in testing, see #148 report).
+        awk '
+            /^[[:space:]]*POSTGRES_INITDB_ARGS: "--data-checksums"[[:space:]]*$/ && !done {
+                print
+                print "    secrets:"
+                print "      - postgres_password"
+                done=1
+                next
+            }
+            { print }
+        ' "$COMPOSE_PATH" > "$COMPOSE_PATH.tmp" && mv "$COMPOSE_PATH.tmp" "$COMPOSE_PATH"
+        if ! grep -qE '^secrets:[[:space:]]*$' "$COMPOSE_PATH"; then
+            {
+                echo ""
+                echo "secrets:"
+                echo "  postgres_password:"
+                echo "    file: ./secrets/postgres_password"
+            } >> "$COMPOSE_PATH"
+        fi
+        rm -f "$COMPOSE_PATH.tmp"
+        echo "  ✓ Self-heal docker-compose.yml — postgres migrated to secrets:/POSTGRES_PASSWORD_FILE (#148)"
+    else
+        echo "  ⚠ Self-heal skipped — could not read current POSTGRES_PASSWORD from .env (postgres secrets: migration deferred to next update run)"
+    fi
+fi
+
 # ── Self-heal: docker-compose.override.yml neo4j port (B26) ───────────────
 # Bind 127.0.0.1 + port paramétrable. Banking-grade.
 OVERRIDE_PATH="${INSTALL_DIR}/docker-compose.override.yml"

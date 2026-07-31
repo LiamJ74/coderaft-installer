@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — Banking-grade secrets Phase 3, runtime exposure reduction (task #148, 2026-07-31)
+- **dashboard-api's working `.env`** (rendered secret values, passed to
+  `docker compose --env-file`) moves off the persistent bind-mounted install
+  dir onto a **tmpfs private to the dashboard-api container**
+  (`/run/coderaft-env`, `tmpfs:` on the `dashboard-api` service in
+  `install.sh`/`update.sh`'s embedded compose). Confirmed experimentally safe:
+  `--env-file` is interpolated client-side by the `docker compose` CLI
+  process running *inside* dashboard-api's own container, never resolved by
+  the Docker daemon — a container-internal-only tmpfs is read correctly.
+- **`postgres` migrated to Docker-native `secrets:` + `POSTGRES_PASSWORD_FILE`**
+  (already supported by the official image) — `POSTGRES_PASSWORD` no longer
+  appears in `docker inspect`'s `Config.Env`. Unlike `.env`, the secret
+  *file* (`./secrets/postgres_password`) IS resolved by the Docker daemon as
+  a literal bind-mount source (confirmed experimentally — a tmpfs-only
+  source fails with "bind source path does not exist") and therefore stays
+  on persistent, host-visible disk. `install.sh` writes it on first boot;
+  `update.sh` self-heals it into existing installs, always seeded from the
+  currently-active `.env` value (never freshly generated) so an
+  already-initialized postgres cluster's real credential is never orphaned.
+- `docs/vault.md` updated with the experimental findings and the suggested
+  order for the remaining per-product `secrets:` migration (redis →
+  `CLOUDFLARE_TUNNEL_TOKEN` → RedFox JWT/passphrase → `DASHBOARD_SECRET`/
+  `XPRODUCT_INTERNAL_TOKEN` → rest — out of scope here).
+- **Known gap confirmed, not fixed here**: the "7-day grace then dashboard
+  banner to purge legacy stores" behavior was found to be documentation-only
+  — `update.sh` writes the `.migrated` sentinel but nothing reads it to
+  drive a purge banner or automated purge.
+- **Not done in this pass**: `install.ps1` (Windows) was NOT updated to
+  mirror these two changes — Windows installs keep the pre-#148 behavior
+  (plaintext `.env` on persistent disk, `POSTGRES_PASSWORD` as a plain env
+  var) until a follow-up PR ports this.
+
 ### Changed — TLS : mkcert supprimé, Caddy internal CA (2026-07-20)
 - **mkcert retiré entièrement** (`install.sh` + `install.ps1`) : plus de
   cascade winget→choco→scoop→GitHub Release. Caddy génère lui-même son CA
