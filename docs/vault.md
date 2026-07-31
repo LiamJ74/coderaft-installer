@@ -1,6 +1,13 @@
 # coderaft-vault — Operator Guide
 
-**Phase**: 0.5 — Vault integration wired into the oneliner installer.
+**Phase**: 3 (in progress) — dashboard-api's own secret store
+(`dashboard-api/vault.js`, `/data/vault.enc`) has been replaced by a Coderaft
+Vault client (task #149, 2026-07-31): `generateOverrideToDir()` reads/writes
+every product secret through the vault's `/v1/secret/*` API instead of the
+internal encrypted KV file. Per-product secret handling in WolfGuard /
+Ravenscan / RedFox themselves is unaffected by this change and remains
+tracked separately (see §7.2 point 7 of
+`coderaft-platform/SECRETS-FILE-MOUNTS-PLAN-2026-07-31.md`).
 
 ---
 
@@ -86,8 +93,11 @@ runs an automatic migration:
 2. **Recovery phrase gate** — same as fresh install.
 3. **Pulls and starts** the vault container (cosign verify if
    `STRICT_COSIGN_VERIFY=1`).
-4. **Migrates 13 secrets** from `.env` to the vault with round-trip
-   verification.
+4. **Migrates 20 secrets** from `.env` to the vault with round-trip
+   verification (task #149, 2026-07-31: added `tenant_encryption_key`,
+   `azure_client_secret`, `redfox_jwt_secret`, `redfox_oidc_client_secret`,
+   `xproduct_internal_token`, `admin_token`, `cloudflare_tunnel_token` — real
+   secrets that existed in `.env` but were not yet protected by this path).
 5. **Writes `.migrated` sentinel** on success. Re-runs are no-ops.
 6. **7-day grace** — legacy stores are NOT purged automatically.  
    The dashboard shows a banner after 7 days; one operator click completes
@@ -170,9 +180,9 @@ CODERAFT_TEST_MODE=1 CODERAFT_TEST_FAIL=4e bash scripts/update.sh
 
 | Phase | Scope |
 |-------|-------|
-| 0.5 (this) | Vault deployed from oneliner; existing installs migrate on update |
+| 0.5 | Vault deployed from oneliner; existing installs migrate on update |
 | 1 | dashboard-api migrates `auth_config` (Azure creds) to vault |
-| 2 | LICENSE_KEY lifecycle moves to vault |
-| 3 | Per-product secret stores replaced with vault client |
+| 2 | LICENSE_KEY lifecycle moves to vault — done, 2026-07-28 (#166) |
+| 3 (this, in progress) | Per-product secret stores replaced with vault client — dashboard-api's own store done (#149, 2026-07-31); WolfGuard/Ravenscan/RedFox's own per-product stores still pending |
 | 4 | Vault becomes JWT issuer (admin_token) |
 | 5 | Remove SOPS/.env.enc path; one vault, one master key |

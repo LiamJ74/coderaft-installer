@@ -1897,6 +1897,11 @@ services:
     # endpoint instead of a boot-time env var (confirmed for Ravenscan in
     # /Users/liam/secaudit/internal/license/dashboard_client.go +
     # internal/cli/serve.go). Migrating an already-dead value serves no purpose.
+    # Task #149 (2026-07-31): 7 keys added to close the gap identified in
+    # SECRETS-FILE-MOUNTS-PLAN-2026-07-31.md §5.6 — real secrets that were NOT
+    # migrated here, i.e. NOT protected by dashboard-api's regeneration path
+    # (generateOverrideToDir(), now Coderaft-Vault-backed via #149), only ever
+    # preserved verbatim if a copy already existed on disk.
     $secretMap = @(
         @("POSTGRES_PASSWORD",        "postgres_password"),
         @("REDIS_PASSWORD",           "redis_password"),
@@ -1907,7 +1912,14 @@ services:
         @("REDFOX_MASTER_PASSPHRASE", "redfox_master_passphrase"),
         @("REDFOX_JWT_PRIVATE_KEY",   "redfox_jwt_private_key"),
         @("REDFOX_JWT_PUBLIC_KEY",    "redfox_jwt_public_key"),
-        @("REDFOX_GW_SESSION_SECRET", "redfox_gw_session_secret")
+        @("REDFOX_GW_SESSION_SECRET", "redfox_gw_session_secret"),
+        @("TENANT_ENCRYPTION_KEY",     "tenant_encryption_key"),
+        @("AZURE_CLIENT_SECRET",       "azure_client_secret"),
+        @("REDFOX_JWT_SECRET",         "redfox_jwt_secret"),
+        @("REDFOX_OIDC_CLIENT_SECRET", "redfox_oidc_client_secret"),
+        @("XPRODUCT_INTERNAL_TOKEN",   "xproduct_internal_token"),
+        @("ADMIN_TOKEN",               "admin_token"),
+        @("CLOUDFLARE_TUNNEL_TOKEN",   "cloudflare_tunnel_token")
     )
     foreach ($pair in $secretMap) {
         $envKey = $pair[0]; $vaultKey = $pair[1]
