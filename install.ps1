@@ -216,6 +216,25 @@ function New-HexSecret($length) {
 
 $AbsoluteInstallDir = (Get-Location).Path
 
+# Task #150 (2026-07-31): install-config.env holds install-time / public
+# config (HOST_PROJECT_DIR, CODERAFT_HOST_OS, CODERAFT_HOST_ARCH) — never a
+# secret, never SOPS-encrypted. Every `docker compose` call below passes
+# `--env-file install-config.env --env-file .env` so both are interpolated.
+function Set-InstallConfigVar($Key, $Value) {
+    $path = "$(Get-Location)\install-config.env"
+    $text = if (Test-Path $path) { [System.IO.File]::ReadAllText($path, [System.Text.UTF8Encoding]::new($false)) } else { "" }
+    $lines = $text -split "`r?`n" | Where-Object { $_ -notmatch "^$Key=" -and $_ -ne "" }
+    $lines += "$Key=$Value"
+    [System.IO.File]::WriteAllText($path, (($lines -join "`n") + "`n"), [System.Text.UTF8Encoding]::new($false))
+}
+function Get-InstallConfigVar($Key) {
+    $path = "$(Get-Location)\install-config.env"
+    if (-not (Test-Path $path)) { return $null }
+    $m = Select-String -Path $path -Pattern "^$Key=(.+)$"
+    if ($m) { return $m.Matches.Groups[1].Value }
+    return $null
+}
+
 if ((Test-Path '.env') -and (Select-String -Path '.env' -Pattern '^POSTGRES_PASSWORD=' -Quiet)) {
     # Fix UTF-8 BOM if present (older installers wrote BOM which breaks Docker Compose)
     $envBytes = [System.IO.File]::ReadAllBytes("$(Get-Location)\.env")
@@ -224,13 +243,30 @@ if ((Test-Path '.env') -and (Select-String -Path '.env' -Pattern '^POSTGRES_PASS
         $envContent = [System.Text.Encoding]::UTF8.GetString($envBytes, 3, $envBytes.Length - 3)
         [System.IO.File]::WriteAllText("$(Get-Location)\.env", $envContent, [System.Text.UTF8Encoding]::new($false))
     }
-    # Always (re)write HOST_PROJECT_DIR with the current install dir — the
-    # location may have changed since the previous install, and a stale or
-    # missing value breaks docker-compose interpolation (warning + empty
-    # bind-mount path → dashboard-api cannot reach .env.enc → fake "first run").
+    # Existing install: HOST_PROJECT_DIR always (re)written to install-config.env
+    # with the current install dir — the location may have changed since the
+    # previous install, and a stale or missing value breaks docker-compose
+    # interpolation (warning + empty bind-mount path → dashboard-api cannot
+    # reach .env.enc → fake "first run").
+    Set-InstallConfigVar "HOST_PROJECT_DIR" $AbsoluteInstallDir
+    # Backfill CODERAFT_HOST_OS/ARCH: prefer install-config.env if a previous
+    # run of this new installer already wrote it, else migrate from .env
+    # (upgrade from an older installer version), else fall back to detection.
+    if (-not (Get-InstallConfigVar "CODERAFT_HOST_OS")) {
+        $legacyOS = (Select-String -Path '.env' -Pattern '^CODERAFT_HOST_OS=(.+)$' -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if ($legacyOS) {
+            Set-InstallConfigVar "CODERAFT_HOST_OS" $legacyOS.Matches.Groups[1].Value
+            $legacyArch = (Select-String -Path '.env' -Pattern '^CODERAFT_HOST_ARCH=(.+)$' -ErrorAction SilentlyContinue | Select-Object -First 1)
+            Set-InstallConfigVar "CODERAFT_HOST_ARCH" $(if ($legacyArch) { $legacyArch.Matches.Groups[1].Value } else { $CoderaftArch })
+        } else {
+            Set-InstallConfigVar "CODERAFT_HOST_OS" $CoderaftOS
+            Set-InstallConfigVar "CODERAFT_HOST_ARCH" $CoderaftArch
+        }
+    }
+    # Strip any legacy copies from .env now that install-config.env is authoritative.
     $envText = [System.IO.File]::ReadAllText("$(Get-Location)\.env", [System.Text.UTF8Encoding]::new($false))
-    $envLines = $envText -split "`r?`n" | Where-Object { $_ -notmatch '^HOST_PROJECT_DIR=' }
-    $envText = (($envLines -join "`n").TrimEnd()) + "`nHOST_PROJECT_DIR=$AbsoluteInstallDir`n"
+    $envLines = $envText -split "`r?`n" | Where-Object { $_ -notmatch '^(HOST_PROJECT_DIR|CODERAFT_HOST_OS|CODERAFT_HOST_ARCH)=' }
+    $envText = (($envLines -join "`n").TrimEnd()) + "`n"
     [System.IO.File]::WriteAllText("$(Get-Location)\.env", $envText, [System.Text.UTF8Encoding]::new($false))
     Write-Host "  ✓ Existing config preserved (HOST_PROJECT_DIR refreshed)" -ForegroundColor Green
 } else {
@@ -240,15 +276,24 @@ if ((Test-Path '.env') -and (Select-String -Path '.env' -Pattern '^POSTGRES_PASS
 POSTGRES_PASSWORD=$(New-HexSecret 24)
 REDIS_PASSWORD=$(New-HexSecret 24)
 DASHBOARD_SECRET=$(New-HexSecret 32)
-HOST_PROJECT_DIR=$AbsoluteInstallDir
 RAVENSCAN_CAPTURE_TOKEN=$(New-HexSecret 32)
-CODERAFT_HOST_OS=$CoderaftOS
-CODERAFT_HOST_ARCH=$CoderaftArch
 "@
     # Write without BOM — Docker Compose .env parser chokes on UTF-8 BOM
     [System.IO.File]::WriteAllText("$(Get-Location)\.env", $Env, [System.Text.UTF8Encoding]::new($false))
+    $ConfigEnv = @"
+# CodeRaft — install-time / public config (NOT a secret, NEVER SOPS-encrypted)
+# $(Get-Date -Format 'yyyy-MM-dd')
+HOST_PROJECT_DIR=$AbsoluteInstallDir
+CODERAFT_HOST_OS=$CoderaftOS
+CODERAFT_HOST_ARCH=$CoderaftArch
+"@
+    [System.IO.File]::WriteAllText("$(Get-Location)\install-config.env", $ConfigEnv, [System.Text.UTF8Encoding]::new($false))
     Write-Host "  ✓ Secrets generated" -ForegroundColor Green
+    Write-Host "  ✓ install-config.env generated" -ForegroundColor Green
 }
+
+# Every `docker compose` invocation from here on must read BOTH files.
+$ComposeEnvArgs = @("--env-file", "install-config.env", "--env-file", ".env")
 
 # Read the capture token back so we can hand it to the native daemon installer.
 $RavenscanCaptureToken = (Select-String -Path '.env' -Pattern '^RAVENSCAN_CAPTURE_TOKEN=' -Quiet) `
@@ -1360,7 +1405,7 @@ function Install-CaddyRootCA {
     Write-Host "  Waiting for Caddy to generate its internal CA (max 30s)…"
     $caReady = $false
     for ($i = 0; $i -lt 15; $i++) {
-        $code = Invoke-DockerExitCode -Arguments @("compose","exec","-T","caddy","test","-f",$caContainerPath)
+        $code = Invoke-DockerExitCode -Arguments (@("compose") + $ComposeEnvArgs + @("exec","-T","caddy","test","-f",$caContainerPath))
         if ($code -eq 0) { $caReady = $true; break }
         Start-Sleep -Seconds 2
     }
@@ -1371,7 +1416,7 @@ function Install-CaddyRootCA {
     }
 
     $caLocal = Join-Path (Get-Location) "caddy-root.crt"
-    $cpCode = Invoke-DockerExitCode -Arguments @("compose","cp","caddy:$caContainerPath",$caLocal)
+    $cpCode = Invoke-DockerExitCode -Arguments (@("compose") + $ComposeEnvArgs + @("cp","caddy:$caContainerPath",$caLocal))
     if ($cpCode -ne 0 -or -not (Test-Path $caLocal)) {
         Write-Host "  ⚠ Could not export the Caddy root CA — skipping trust install." -ForegroundColor Yellow
         return $false
@@ -1474,9 +1519,12 @@ function Ensure-HostsEntry {
 Ensure-HostsEntry
 
 # Helper scripts
+# Task #150: both env files are always passed explicitly — install-config.env
+# (plaintext config) + .env (secrets) — so compose interpolation never
+# silently loses either.
 Set-Content -Path 'start.ps1' -Value @'
 Write-Host "Starting CodeRaft..."
-docker compose up -d
+docker compose --env-file install-config.env --env-file .env up -d
 $Url = "http://localhost:3000"
 if ((Get-Content "$env:WINDIR\System32\drivers\etc\hosts" -ErrorAction SilentlyContinue) -match "coderaft\.local") {
     $Url = "https://coderaft.local"
@@ -1487,7 +1535,7 @@ Start-Process $Url
 
 Set-Content -Path 'stop.ps1' -Value @'
 Write-Host "Stopping CodeRaft..."
-docker compose down
+docker compose --env-file install-config.env --env-file .env down
 Write-Host "Done."
 '@ -Encoding UTF8
 
@@ -1497,8 +1545,8 @@ try {
 } catch {
     Set-Content -Path 'update.ps1' -Value @'
 Write-Host "Updating CodeRaft..."
-docker compose pull
-docker compose up -d --force-recreate --remove-orphans
+docker compose --env-file install-config.env --env-file .env pull
+docker compose --env-file install-config.env --env-file .env up -d --force-recreate --remove-orphans
 Write-Host "  Updated! Dashboard: http://localhost:3000"
 '@ -Encoding UTF8
 }
@@ -1681,7 +1729,7 @@ function Invoke-VaultUnsealFresh {
 
 Write-Host ""
 Write-Host "  Pulling platform images..."
-docker compose pull
+docker compose @ComposeEnvArgs pull
 if ($LASTEXITCODE -ne 0) {
     Write-Host ""
     Write-Host "  ✗ Image pull failed (exit $LASTEXITCODE). Aborting install." -ForegroundColor Red
@@ -1710,8 +1758,8 @@ function Invoke-DockerSilent {
         -ErrorAction SilentlyContinue | Out-Null
     Remove-Item -Path $stdout,$stderr -ErrorAction SilentlyContinue
 }
-Invoke-DockerSilent -Arguments @("compose","stop","coderaft-vault")
-Invoke-DockerSilent -Arguments @("compose","rm","-f","coderaft-vault")
+Invoke-DockerSilent -Arguments (@("compose") + $ComposeEnvArgs + @("stop","coderaft-vault"))
+Invoke-DockerSilent -Arguments (@("compose") + $ComposeEnvArgs + @("rm","-f","coderaft-vault"))
 
 # B-AGE-KEY-DIR (2026-07-16): the dashboard-api service bind-mounts
 # `./.coderaft-age.key:/keys/age.key:ro`. If the host file does not
@@ -1761,7 +1809,7 @@ if (-not (Test-Path $AgeKeyHost -PathType Leaf)) {
     }
 }
 
-docker compose up -d
+docker compose @ComposeEnvArgs up -d
 if ($LASTEXITCODE -ne 0) {
     Write-Host ""
     Write-Host "  ✗ docker compose up failed (exit $LASTEXITCODE). Aborting install." -ForegroundColor Red
