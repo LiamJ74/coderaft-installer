@@ -530,6 +530,95 @@ if (Test-Path $composePathB15) {
     }
 }
 
+# ── Self-heal: dashboard-api tmpfs for the ephemeral working .env (#148) ───
+# Banking-grade runtime exposure reduction (PowerShell parity with
+# update.sh's task #148 Phase 3 self-heal): the *working* .env (resolved
+# secret VALUES, passed to `docker compose --env-file`) moves off the
+# persistent bind-mounted install dir onto a tmpfs private to the
+# dashboard-api container — proven safe experimentally on macOS/Linux
+# (--env-file is interpolated client-side by the `docker compose` CLI
+# process running INSIDE that same container, never resolved by the Docker
+# daemon). Docker Desktop on Windows runs the Linux daemon in a VM, so
+# `tmpfs:` behaves identically here.
+$ComposePathTmpfs = Join-Path $INSTALL_DIR "docker-compose.yml"
+if (Test-Path $ComposePathTmpfs) {
+    $ComposeTextTmpfs = [System.IO.File]::ReadAllText($ComposePathTmpfs, [System.Text.UTF8Encoding]::new($false))
+    $TmpfsMarker = "      - ./vault-tls/dashboard-api-client.key:/vault-tls/dashboard-api-client.key:ro"
+    if (($ComposeTextTmpfs -notmatch [regex]::Escape('/run/coderaft-env')) -and $ComposeTextTmpfs.Contains($TmpfsMarker)) {
+        $BakTmpfs = "$ComposePathTmpfs.bak-tmpfsenv-" + (Get-Date -Format "yyyyMMddHHmmss")
+        try { Copy-Item -LiteralPath $ComposePathTmpfs -Destination $BakTmpfs -Force -ErrorAction SilentlyContinue } catch {}
+        $TmpfsReplacement = $TmpfsMarker + "`n    tmpfs:`n      - /run/coderaft-env:size=1m,mode=0700,uid=0"
+        $idxTmpfs = $ComposeTextTmpfs.IndexOf($TmpfsMarker)
+        $ComposeTextTmpfs = $ComposeTextTmpfs.Substring(0, $idxTmpfs) + $TmpfsReplacement + $ComposeTextTmpfs.Substring($idxTmpfs + $TmpfsMarker.Length)
+        [System.IO.File]::WriteAllText($ComposePathTmpfs, $ComposeTextTmpfs, [System.Text.UTF8Encoding]::new($false))
+        Write-Host "  ✓ Self-heal docker-compose.yml — dashboard-api tmpfs /run/coderaft-env ajouté (#148)"
+    }
+}
+
+# ── Self-heal: postgres → Docker native secrets:/POSTGRES_PASSWORD_FILE (#148) ──
+# The official postgres image already supports POSTGRES_PASSWORD_FILE — this
+# removes the resolved password from `docker inspect`/Config.Env (PowerShell
+# parity with update.sh's task #148 Phase 3 self-heal). Unlike --env-file
+# (client-side, see the tmpfs self-heal above), a compose `secrets: file:`
+# source IS resolved by the actual Docker daemon as a literal bind-mount
+# source, so the file MUST exist on real host disk BEFORE the next
+# `docker compose up`. Backfill it from the CURRENTLY ACTIVE .env value first
+# (not a fresh random one) so the already-initialized postgres cluster's real
+# credential keeps matching — postgres only reads POSTGRES_PASSWORD* at its
+# very first initdb, so a mismatched value here would silently break every
+# product's DB connection after this same update.
+$ComposePathPgSecret = Join-Path $INSTALL_DIR "docker-compose.yml"
+if (Test-Path $ComposePathPgSecret) {
+    $ComposeTextPgSecret = [System.IO.File]::ReadAllText($ComposePathPgSecret, [System.Text.UTF8Encoding]::new($false))
+    $PgPwMarker = '      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}'
+    if ($ComposeTextPgSecret.Contains($PgPwMarker) -and ($ComposeTextPgSecret -notmatch [regex]::Escape('POSTGRES_PASSWORD_FILE'))) {
+        $BakPgSecret = "$ComposePathPgSecret.bak-pgsecret-" + (Get-Date -Format "yyyyMMddHHmmss")
+        try { Copy-Item -LiteralPath $ComposePathPgSecret -Destination $BakPgSecret -Force -ErrorAction SilentlyContinue } catch {}
+
+        $SecretsDirPg = Join-Path $INSTALL_DIR "secrets"
+        New-Item -ItemType Directory -Force -Path $SecretsDirPg | Out-Null
+        $envPathPg = Join-Path $INSTALL_DIR ".env"
+        $currentPgPwMatch = Select-String -Path $envPathPg -Pattern '^POSTGRES_PASSWORD=(.+)$' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($currentPgPwMatch) {
+            $currentPgPw = $currentPgPwMatch.Matches.Groups[1].Value
+            $secretFilePg = Join-Path $SecretsDirPg "postgres_password"
+            [System.IO.File]::WriteAllText($secretFilePg, $currentPgPw, [System.Text.UTF8Encoding]::new($false))
+            try {
+                $aclPg = Get-Acl $secretFilePg
+                $rulePg = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                    [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
+                    "Read", "Allow")
+                $aclPg.AddAccessRule($rulePg)
+                Set-Acl $secretFilePg $aclPg -ErrorAction Stop
+            } catch { }
+
+            $ComposeTextPgSecret = $ComposeTextPgSecret.Replace(
+                $PgPwMarker,
+                "      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password"
+            )
+            # Insert `secrets:` right after the (postgres-only)
+            # POSTGRES_INITDB_ARGS line, i.e. right before postgres's own
+            # `volumes:` key — mirrors update.sh's awk insertion point
+            # exactly (inserting before the `- postgres_data:...` list ITEM
+            # instead would nest `secrets:` inside `volumes:` and break the YAML).
+            $initdbMarker = '      POSTGRES_INITDB_ARGS: "--data-checksums"'
+            if ($ComposeTextPgSecret.Contains($initdbMarker)) {
+                $ComposeTextPgSecret = $ComposeTextPgSecret.Replace(
+                    $initdbMarker,
+                    $initdbMarker + "`n    secrets:`n      - postgres_password"
+                )
+            }
+            if ($ComposeTextPgSecret -notmatch '(?m)^secrets:\s*$') {
+                $ComposeTextPgSecret = $ComposeTextPgSecret.TrimEnd() + "`n`nsecrets:`n  postgres_password:`n    file: ./secrets/postgres_password`n"
+            }
+            [System.IO.File]::WriteAllText($ComposePathPgSecret, $ComposeTextPgSecret, [System.Text.UTF8Encoding]::new($false))
+            Write-Host "  ✓ Self-heal docker-compose.yml — postgres migrated to secrets:/POSTGRES_PASSWORD_FILE (#148)"
+        } else {
+            Write-Host "  ⚠ Self-heal skipped — could not read current POSTGRES_PASSWORD from .env (postgres secrets: migration deferred to next update run)"
+        }
+    }
+}
+
 # ── Self-heal: docker-compose.override.yml neo4j port (B26) ───────────────
 # Bind 127.0.0.1 + port paramétrable (NEO4J_BOLT_PORT). Banking-grade :
 # pas d'exposition 0.0.0.0 par défaut. Côté prod, NEO4J_BOLT_PORT n'est

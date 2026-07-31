@@ -235,6 +235,37 @@ function Get-InstallConfigVar($Key) {
     return $null
 }
 
+# Task #148 Phase 3 (2026-07-31, PowerShell parity): postgres migrates to
+# Docker's native `secrets:` + POSTGRES_PASSWORD_FILE (the official postgres
+# image already supports this) instead of a plaintext POSTGRES_PASSWORD= env
+# var baked into Config.Env — mirrors install.sh's write_postgres_secret_file
+# (commit 04b2c14). Docker Desktop on Windows runs the Linux daemon in a VM,
+# so a non-swarm `secrets: file:` source is resolved exactly like on Linux/
+# macOS: the Docker DAEMON itself needs a real, host-visible file at this
+# path — same tree as docker-compose.yml — not something that could live on
+# a container-internal tmpfs. Written here (mirroring the .env bootstrap
+# right below) so it already exists before the very first `docker compose up`.
+function Write-PostgresSecretFile($PgPassword) {
+    New-Item -ItemType Directory -Force -Path "secrets" | Out-Null
+    # No chmod on Windows — rely on the same ACL pattern as vault-keys\age.key
+    # (B-VAULT-ACL): keep inheritance ON (Administrators/SYSTEM stay readable,
+    # required for Docker Desktop's 9P/plan9 file sharing to bind-mount this
+    # into the postgres container) and explicitly add the current user Read.
+    $secretPath = Join-Path (Get-Location) "secrets\postgres_password"
+    [System.IO.File]::WriteAllText($secretPath, $PgPassword, [System.Text.UTF8Encoding]::new($false))
+    try {
+        $acl = Get-Acl $secretPath
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
+            "Read", "Allow")
+        $acl.AddAccessRule($rule)
+        Set-Acl $secretPath $acl -ErrorAction Stop
+    } catch {
+        Write-Host "  ⚠ Could not tighten ACL on secrets\postgres_password ($($_.Exception.Message.Trim()))." -ForegroundColor Yellow
+        Write-Host "    Postgres will still start; inherited ACL from the parent directory applies." -ForegroundColor Yellow
+    }
+}
+
 if ((Test-Path '.env') -and (Select-String -Path '.env' -Pattern '^POSTGRES_PASSWORD=' -Quiet)) {
     # Fix UTF-8 BOM if present (older installers wrote BOM which breaks Docker Compose)
     $envBytes = [System.IO.File]::ReadAllBytes("$(Get-Location)\.env")
@@ -269,17 +300,35 @@ if ((Test-Path '.env') -and (Select-String -Path '.env' -Pattern '^POSTGRES_PASS
     $envText = (($envLines -join "`n").TrimEnd()) + "`n"
     [System.IO.File]::WriteAllText("$(Get-Location)\.env", $envText, [System.Text.UTF8Encoding]::new($false))
     Write-Host "  ✓ Existing config preserved (HOST_PROJECT_DIR refreshed)" -ForegroundColor Green
+    # Task #148 Phase 3 (PowerShell parity): upgrade from a pre-#148 install
+    # never had secrets\postgres_password — backfill it from the EXISTING
+    # .env value so postgres's `secrets:` block (added by this version)
+    # resolves to the SAME password postgres already has, instead of a fresh
+    # one that would mismatch the running cluster.
+    if (-not (Test-Path "secrets\postgres_password")) {
+        $existingPgPw = (Select-String -Path '.env' -Pattern '^POSTGRES_PASSWORD=(.+)$' -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if ($existingPgPw) {
+            Write-PostgresSecretFile $existingPgPw.Matches.Groups[1].Value
+            Write-Host "  ✓ secrets\postgres_password backfilled from existing .env (task #148)" -ForegroundColor Green
+        }
+    }
 } else {
     Write-Host "  Generating secrets..."
+    $PgPasswordBootstrap = New-HexSecret 24
     $Env = @"
 # CodeRaft Dashboard — $(Get-Date -Format 'yyyy-MM-dd')
-POSTGRES_PASSWORD=$(New-HexSecret 24)
+POSTGRES_PASSWORD=$PgPasswordBootstrap
 REDIS_PASSWORD=$(New-HexSecret 24)
 DASHBOARD_SECRET=$(New-HexSecret 32)
 RAVENSCAN_CAPTURE_TOKEN=$(New-HexSecret 32)
 "@
     # Write without BOM — Docker Compose .env parser chokes on UTF-8 BOM
     [System.IO.File]::WriteAllText("$(Get-Location)\.env", $Env, [System.Text.UTF8Encoding]::new($false))
+    # Task #148 Phase 3 (PowerShell parity): same value as .env's
+    # POSTGRES_PASSWORD above, materialized as a standalone file for
+    # postgres's `secrets:`/POSTGRES_PASSWORD_FILE — both must agree at the
+    # container's very first initdb.
+    Write-PostgresSecretFile $PgPasswordBootstrap
     $ConfigEnv = @"
 # CodeRaft — install-time / public config (NOT a secret, NEVER SOPS-encrypted)
 # $(Get-Date -Format 'yyyy-MM-dd')
@@ -1188,6 +1237,19 @@ services:
       - ./vault-tls/client-ca.crt:/vault-tls/client-ca.crt:ro
       - ./vault-tls/dashboard-api-client.crt:/vault-tls/dashboard-api-client.crt:ro
       - ./vault-tls/dashboard-api-client.key:/vault-tls/dashboard-api-client.key:ro
+    # Task #148 Phase 3 (banking-grade runtime exposure reduction, PowerShell
+    # parity with install.sh commit 04b2c14): the *working* .env (resolved
+    # secret VALUES, passed to `docker compose --env-file`) is written here
+    # instead of the persistent bind-mounted /host-compose (the `.:/host-compose`
+    # volume above). tmpfs is private to THIS container — wiped on every
+    # restart/recreate — and does NOT need to be host-daemon-visible: the
+    # `docker compose` CLI runs INSIDE this same container, and --env-file is
+    # interpolated client-side by that CLI process, never resolved by the
+    # daemon itself. Docker Desktop on Windows runs the Linux daemon in a VM,
+    # so `tmpfs:` behaves identically to Linux/macOS here — same conclusion
+    # reached experimentally for install.sh, no Windows-specific caveat found.
+    tmpfs:
+      - /run/coderaft-env:size=1m,mode=0700,uid=0
     security_opt: [no-new-privileges:true]
     restart: unless-stopped
 
@@ -1252,9 +1314,19 @@ services:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: coderaft
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      # Task #148 Phase 3 (PowerShell parity with install.sh commit 04b2c14):
+      # migrated to Docker's native `secrets:` — the official postgres image
+      # already supports POSTGRES_PASSWORD_FILE, so the resolved value no
+      # longer appears in `docker inspect`/Config.Env. The file is
+      # materialized by install.ps1 (first boot, Write-PostgresSecretFile)
+      # and by dashboard-api's generateOverrideToDir() (every subsequent
+      # regen) at ./secrets/postgres_password — see the `secrets:` top-level
+      # block below.
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
       POSTGRES_DB: coderaft
       POSTGRES_INITDB_ARGS: "--data-checksums"
+    secrets:
+      - postgres_password
     volumes:
       - postgres_data:/var/lib/postgresql/data
       # init-db.sql is intentionally NOT bind-mounted — when the
@@ -1316,6 +1388,17 @@ volumes:
   caddy_data:
   caddy_config:
   vault_data:
+
+# Task #148 Phase 3 (PowerShell parity with install.sh commit 04b2c14):
+# postgres's password, Docker-native file-based secret. Must be a real path
+# resolvable by the Docker DAEMON itself (unlike .env's --env-file, this is a
+# literal bind-mount source, not client-side interpolation) —
+# ./secrets/postgres_password, relative to this file's directory (=
+# --project-directory = HOST_PROJECT_DIR). Written by install.ps1 on first
+# boot and kept in sync by dashboard-api's generateOverrideToDir().
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password
 '@
 [System.IO.File]::WriteAllText("$(Get-Location)\docker-compose.yml", $Compose, [System.Text.UTF8Encoding]::new($false))
 
@@ -1725,6 +1808,131 @@ function Invoke-VaultUnsealFresh {
     return $true
 }
 
+# ── Vault bootstrap-secrets seeding (fresh install race fix, PowerShell parity) ──
+# Task #218 (2026-07-31): this script generates POSTGRES_PASSWORD/
+# REDIS_PASSWORD/DASHBOARD_SECRET/RAVENSCAN_CAPTURE_TOKEN above (either
+# fresh, or preserved from a previous run) and secrets\postgres_password is
+# what postgres's OWN initdb actually uses. Coderaft Vault, however, had no
+# seed at all until now: dashboard-api's vaultEnsure() (generateOverrideToDir(),
+# the Coderaft Vault client since #149) is the FIRST thing to ever write
+# these keys into the vault, and it only runs later — at the first product
+# deploy, well after this script has exited — on a truly fresh install.
+# Finding the vault empty at that point, it happily mints its OWN independent
+# random value instead of reusing what postgres/redis/the dashboard JWT
+# signer were actually bootstrapped with. Confirmed experimentally 2026-07-31
+# on macOS/bash (isolated test stack, distinct compose project, never the
+# live "coderaft" stack) — same code path, same risk on Windows.
+#
+# Fix: install.ps1 becomes the FIRST writer. Called right after the vault is
+# up and unsealed, BEFORE postgres (or any other service) starts.
+#
+# get-or-set semantics (never overwrite an existing vault value): mirrors
+# vaultEnsure()'s own behavior. Idempotent and safe to run on every
+# install.ps1 invocation, including a re-run against an EXISTING install
+# where the operator may have already rotated one of these secrets via the
+# dashboard (Coderaft Vault holds the rotated value; blindly overwriting it
+# with the stale local .env copy would silently undo that rotation).
+function Invoke-VaultSeedBootstrapSecrets {
+    if ($script:AbsoluteInstallDir -and (Test-Path $script:AbsoluteInstallDir)) {
+        Set-Location -LiteralPath $script:AbsoluteInstallDir
+    }
+    $vaultAgeKey = Join-Path (Get-Location) "vault-keys\age.key"
+    if (-not (Test-Path $vaultAgeKey)) {
+        Write-Host "  ✗ $vaultAgeKey not found — cannot seed vault" -ForegroundColor Red
+        return $false
+    }
+
+    $inspectFormat = '{{ index .Config.Labels "com.docker.compose.project" }}'
+    $inspectStdout = Join-Path $env:TEMP "coderaft-seed-inspect-out-$(Get-Random).log"
+    $inspectStderr = Join-Path $env:TEMP "coderaft-seed-inspect-err-$(Get-Random).log"
+    $inspectProc = Start-Process -FilePath "docker" -ArgumentList @(
+        "inspect", "coderaft-coderaft-vault-1", "--format", $inspectFormat
+    ) -NoNewWindow -PassThru `
+        -RedirectStandardOutput $inspectStdout `
+        -RedirectStandardError $inspectStderr `
+        -ErrorAction SilentlyContinue
+    if ($inspectProc -and -not $inspectProc.WaitForExit(60000)) {
+        try { $inspectProc.Kill() } catch {}
+    }
+    $vaultProject = ((Get-Content $inspectStdout -ErrorAction SilentlyContinue) -join "").Trim()
+    Remove-Item -Path $inspectStdout,$inspectStderr -ErrorAction SilentlyContinue
+    if (-not $vaultProject) { $vaultProject = "coderaft" }
+    $vaultNetwork = "${vaultProject}_coderaft-vault-net"
+    $absTlsDir = (Resolve-Path -LiteralPath "vault-tls").Path
+
+    function Invoke-VaultCurlSeed {
+        param([string]$Method, [string]$Path, [string]$JsonBody = "")
+        $dockerArgs = @("run", "--rm")
+        if ($JsonBody) { $dockerArgs += @("-i") }
+        $dockerArgs += @(
+            "--user", "0:0",
+            "--network", $vaultNetwork,
+            "-v", "${absTlsDir}:/tls:ro",
+            "curlimages/curl:latest",
+            "--cert", "/tls/dashboard-api-client.crt",
+            "--key",  "/tls/dashboard-api-client.key",
+            "--cacert", "/tls/client-ca.crt",
+            "-sS", "-X", $Method,
+            "https://coderaft-vault:8200$Path"
+        )
+        $bodyFile = $null
+        if ($JsonBody) {
+            $bodyFile = Join-Path $env:TEMP "coderaft-vault-seed-body-$(Get-Random).json"
+            [System.IO.File]::WriteAllText($bodyFile, $JsonBody, [System.Text.UTF8Encoding]::new($false))
+            $dockerArgs += @("-H", "Content-Type: application/json", "--data-binary", "@-")
+        }
+        $curlStdout = Join-Path $env:TEMP "coderaft-vault-seed-out-$(Get-Random).log"
+        $curlStderr = Join-Path $env:TEMP "coderaft-vault-seed-err-$(Get-Random).log"
+        $spArgs = @{
+            FilePath               = "docker"
+            ArgumentList           = $dockerArgs
+            NoNewWindow            = $true
+            Wait                   = $true
+            RedirectStandardOutput = $curlStdout
+            RedirectStandardError  = $curlStderr
+            ErrorAction            = "SilentlyContinue"
+        }
+        if ($bodyFile) { $spArgs['RedirectStandardInput'] = $bodyFile }
+        Start-Process @spArgs | Out-Null
+        $body = ""
+        if (Test-Path $curlStdout) {
+            $body = ((Get-Content $curlStdout -ErrorAction SilentlyContinue) -join "")
+        }
+        Remove-Item -Path $curlStdout,$curlStderr -ErrorAction SilentlyContinue
+        if ($bodyFile) { Remove-Item -Path $bodyFile -ErrorAction SilentlyContinue }
+        return $body
+    }
+
+    $seedFailed = $false
+    $pairs = @(
+        @{ EnvKey = "POSTGRES_PASSWORD";        VaultKey = "postgres_password" },
+        @{ EnvKey = "REDIS_PASSWORD";            VaultKey = "redis_password" },
+        @{ EnvKey = "DASHBOARD_SECRET";          VaultKey = "dashboard_secret" },
+        @{ EnvKey = "RAVENSCAN_CAPTURE_TOKEN";   VaultKey = "ravenscan_capture_token" }
+    )
+    foreach ($pair in $pairs) {
+        $envKey = $pair.EnvKey
+        $vaultKey = $pair.VaultKey
+        $match = Select-String -Path '.env' -Pattern "^$envKey=(.+)$" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $match) { continue }
+        $val = $match.Matches.Groups[1].Value
+        $existing = Invoke-VaultCurlSeed -Method "POST" -Path "/v1/secret/get" -JsonBody "{`"name`":`"$vaultKey`"}"
+        if ($existing -match '"value"\s*:') {
+            Write-Host "  ✓ $vaultKey already present in Coderaft Vault (left untouched)" -ForegroundColor Green
+            continue
+        }
+        $setBody = "{`"name`":`"$vaultKey`",`"value`":`"$val`"}"
+        $resp = Invoke-VaultCurlSeed -Method "POST" -Path "/v1/secret/set" -JsonBody $setBody
+        if ($resp -match '"ok"\s*:\s*true') {
+            Write-Host "  ✓ Seeded $vaultKey in Coderaft Vault" -ForegroundColor Green
+        } else {
+            Write-Host "  ✗ Failed to seed $vaultKey in Coderaft Vault: $resp" -ForegroundColor Red
+            $seedFailed = $true
+        }
+    }
+    return -not $seedFailed
+}
+
 # ── Pull & Start ─────────────────────────────────────────────────────────────
 
 Write-Host ""
@@ -1809,11 +2017,16 @@ if (-not (Test-Path $AgeKeyHost -PathType Leaf)) {
     }
 }
 
-docker compose @ComposeEnvArgs up -d
+# Task #218 (2026-07-31): start coderaft-vault ALONE first — it must be up,
+# unsealed, AND seeded with the bootstrap secrets above (or already holding
+# them, on a re-run) BEFORE postgres/redis/dashboard-api are created. See
+# Invoke-VaultSeedBootstrapSecrets's header comment for the full race and its
+# confirmed real-world impact (mirrors install.sh commit for task #218).
+docker compose @ComposeEnvArgs up -d coderaft-vault
 if ($LASTEXITCODE -ne 0) {
     Write-Host ""
-    Write-Host "  ✗ docker compose up failed (exit $LASTEXITCODE). Aborting install." -ForegroundColor Red
-    Write-Host "    Run 'docker compose logs' to investigate." -ForegroundColor Yellow
+    Write-Host "  ✗ docker compose up coderaft-vault failed (exit $LASTEXITCODE). Aborting install." -ForegroundColor Red
+    Write-Host "    Run 'docker compose logs coderaft-vault' to investigate." -ForegroundColor Yellow
     exit 1
 }
 
@@ -1823,6 +2036,27 @@ $vaultOk = Invoke-VaultUnsealFresh
 if (-not $vaultOk) {
     Write-Host "  ⚠ Vault unseal failed — dashboard may show 'vault unavailable'." -ForegroundColor Yellow
     Write-Host "    Re-run the installer or run: docker compose restart coderaft-vault"
+}
+
+Write-Host ""
+Write-Host "  Seeding bootstrap secrets into Coderaft Vault..."
+$seedOk = Invoke-VaultSeedBootstrapSecrets
+if (-not $seedOk) {
+    Write-Host "  ⚠ Could not seed one or more bootstrap secrets into Coderaft Vault." -ForegroundColor Yellow
+    Write-Host "    dashboard-api will mint its own value(s) on first deploy, which"
+    Write-Host "    may then MISMATCH what postgres/redis were actually initialized"
+    Write-Host "    with. Re-run the installer once the vault is reachable, or seed"
+    Write-Host "    manually — see docs/vault.md."
+}
+
+Write-Host ""
+Write-Host "  Starting remaining services..."
+docker compose @ComposeEnvArgs up -d
+if ($LASTEXITCODE -ne 0) {
+    Write-Host ""
+    Write-Host "  ✗ docker compose up failed (exit $LASTEXITCODE). Aborting install." -ForegroundColor Red
+    Write-Host "    Run 'docker compose logs' to investigate." -ForegroundColor Yellow
+    exit 1
 }
 
 Write-Host ""

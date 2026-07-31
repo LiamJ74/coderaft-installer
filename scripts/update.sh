@@ -473,6 +473,88 @@ if [ -f "$COMPOSE_PATH" ] && grep -qF 'POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}' 
     fi
 fi
 
+# ── Self-heal: redis → Docker native secrets: file (#219) ─────────────────
+# Logical follow-up of #148 (postgres). Redis has no native `_FILE` env var
+# convention, but its entrypoint is a real shell (redis:7-alpine, unlike the
+# distroless vault) — `--requirepass`/`redis-cli -a` read the value from the
+# secrets file via a `sh -c`/`CMD-SHELL` command override instead. Unlike
+# postgres (POSTGRES_PASSWORD_FILE only matters once, at initdb on an empty
+# volume), redis re-reads --requirepass on EVERY (re)creation — so this file
+# must always be kept current, exactly like resolvedSecrets.REDIS_PASSWORD is
+# in dashboard-api's generateOverrideToDir() (server.js task #219 companion
+# change). Backfill from the CURRENTLY ACTIVE .env value first (not a fresh
+# random one) so the running redis's real credential keeps matching.
+if [ -f "$COMPOSE_PATH" ] && grep -qF 'command: redis-server --requirepass ${REDIS_PASSWORD} --maxmemory 128mb' "$COMPOSE_PATH" \
+   && ! grep -qF '/run/secrets/redis_password' "$COMPOSE_PATH"; then
+    cp "$COMPOSE_PATH" "$COMPOSE_PATH.bak-redissecret-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+
+    mkdir -p "${INSTALL_DIR}/secrets"
+    chmod 700 "${INSTALL_DIR}/secrets"
+    CURRENT_REDIS_PW="$(grep '^REDIS_PASSWORD=' "${INSTALL_DIR}/.env" 2>/dev/null | head -1 | cut -d= -f2-)"
+    if [ -n "$CURRENT_REDIS_PW" ]; then
+        printf '%s' "$CURRENT_REDIS_PW" > "${INSTALL_DIR}/secrets/redis_password"
+        chmod 600 "${INSTALL_DIR}/secrets/redis_password"
+        unset CURRENT_REDIS_PW
+
+        # Replace the command: and healthcheck: lines, and inject `user:` +
+        # `secrets:` right after them — mirrors the redis service block
+        # shipped by the current install.sh/update.sh compose heredoc.
+        # B-REDIS-ANCHOR: `retries: 5` alone is NOT a unique anchor — postgres's
+        # own healthcheck block (earlier in the file) uses the exact same
+        # line. Gate the `retries: 5` match on having already seen (and
+        # replaced) redis's own `command:` line first, so this never
+        # misfires into postgres's block.
+        awk '
+            /^[[:space:]]*command: redis-server --requirepass \$\{REDIS_PASSWORD\} --maxmemory 128mb[[:space:]]*$/ {
+                print "    user: \"999:1000\""
+                print "    command: [\"sh\", \"-c\", \"redis-server --requirepass \\\"$(cat /run/secrets/redis_password)\\\" --maxmemory 128mb\"]"
+                inRedis=1
+                next
+            }
+            inRedis && /^[[:space:]]*test: \["CMD", "redis-cli", "-a", "\$\{REDIS_PASSWORD\}", "ping"\][[:space:]]*$/ {
+                print "      test: [\"CMD-SHELL\", \"redis-cli --no-auth-warning -a \\\"$(cat /run/secrets/redis_password)\\\" ping\"]"
+                next
+            }
+            inRedis && !secretsDone && /^[[:space:]]*retries: 5[[:space:]]*$/ {
+                print
+                print "    secrets:"
+                print "      - redis_password"
+                secretsDone=1
+                next
+            }
+            { print }
+        ' "$COMPOSE_PATH" > "$COMPOSE_PATH.tmp" && mv "$COMPOSE_PATH.tmp" "$COMPOSE_PATH"
+
+        # Top-level `secrets:` heading may already exist (postgres #148
+        # self-heal above, or a prior update run) — add redis_password as a
+        # sibling entry rather than creating a second `secrets:` key, which
+        # would be invalid YAML (duplicate top-level mapping key).
+        if grep -qE '^secrets:[[:space:]]*$' "$COMPOSE_PATH"; then
+            awk '
+                /^secrets:[[:space:]]*$/ && !done {
+                    print
+                    print "  redis_password:"
+                    print "    file: ./secrets/redis_password"
+                    done=1
+                    next
+                }
+                { print }
+            ' "$COMPOSE_PATH" > "$COMPOSE_PATH.tmp" && mv "$COMPOSE_PATH.tmp" "$COMPOSE_PATH"
+        else
+            {
+                echo ""
+                echo "secrets:"
+                echo "  redis_password:"
+                echo "    file: ./secrets/redis_password"
+            } >> "$COMPOSE_PATH"
+        fi
+        rm -f "$COMPOSE_PATH.tmp"
+        echo "  ✓ Self-heal docker-compose.yml — redis migrated to secrets: file (#219)"
+    else
+        echo "  ⚠ Self-heal skipped — could not read current REDIS_PASSWORD from .env (redis secrets: migration deferred to next update run)"
+    fi
+fi
+
 # ── Self-heal: docker-compose.override.yml neo4j port (B26) ───────────────
 # Bind 127.0.0.1 + port paramétrable. Banking-grade.
 OVERRIDE_PATH="${INSTALL_DIR}/docker-compose.override.yml"

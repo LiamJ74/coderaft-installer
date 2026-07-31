@@ -215,6 +215,21 @@ write_postgres_secret_file() {
     chmod 600 secrets/postgres_password
 }
 
+# Task #219 (2026-07-31, logical follow-up of #148 Phase 3): redis has no
+# native `_FILE` env var convention like postgres's image does, but its
+# entrypoint is a real shell (redis:7-alpine, unlike the distroless vault) —
+# so `--requirepass` is read from this file via a `sh -c` command override
+# instead (see the redis service block below). Same host-visible-disk
+# constraint as postgres's secrets file: Compose's non-swarm `secrets: file:`
+# is resolved by the Docker DAEMON itself.
+write_redis_secret_file() {
+    local redis_pw="$1"
+    mkdir -p secrets
+    chmod 700 secrets
+    printf '%s' "$redis_pw" > secrets/redis_password
+    chmod 600 secrets/redis_password
+}
+
 if [ -f ".env" ] && grep -q '^POSTGRES_PASSWORD=' .env 2>/dev/null; then
     # Existing install. Always (re)write HOST_PROJECT_DIR with the current
     # install dir — the location may have changed since the previous install,
@@ -249,6 +264,11 @@ if [ -f ".env" ] && grep -q '^POSTGRES_PASSWORD=' .env 2>/dev/null; then
         write_postgres_secret_file "$(grep '^POSTGRES_PASSWORD=' .env | head -1 | cut -d= -f2-)"
         echo "  ✓ secrets/postgres_password backfilled from existing .env (task #148)"
     fi
+    # Task #219: same backfill, redis.
+    if [ ! -f secrets/redis_password ] && grep -q '^REDIS_PASSWORD=' .env 2>/dev/null; then
+        write_redis_secret_file "$(grep '^REDIS_PASSWORD=' .env | head -1 | cut -d= -f2-)"
+        echo "  ✓ secrets/redis_password backfilled from existing .env (task #219)"
+    fi
     # Backward compat: legacy install without .env.enc — show warning in dashboard
     if [ ! -f "${AGE_KEY_LOCAL}" ] && [ ! -f "${AGE_KEY_PATH}" ]; then
         echo "  ⚠ Legacy install detected: no age key found."
@@ -259,10 +279,11 @@ if [ -f ".env" ] && grep -q '^POSTGRES_PASSWORD=' .env 2>/dev/null; then
 else
     echo "  Generating secrets..."
     PG_PASSWORD_BOOTSTRAP="$(gen_hex 24)"
+    REDIS_PASSWORD_BOOTSTRAP="$(gen_hex 24)"
     cat > .env << ENVFILE
 # CodeRaft Dashboard — $(date -u +"%Y-%m-%d")
 POSTGRES_PASSWORD=${PG_PASSWORD_BOOTSTRAP}
-REDIS_PASSWORD=$(gen_hex 24)
+REDIS_PASSWORD=${REDIS_PASSWORD_BOOTSTRAP}
 DASHBOARD_SECRET=$(gen_hex 32)
 RAVENSCAN_CAPTURE_TOKEN=$(gen_hex 32)
 ENVFILE
@@ -272,6 +293,9 @@ ENVFILE
     # both must agree at the container's very first initdb.
     write_postgres_secret_file "${PG_PASSWORD_BOOTSTRAP}"
     unset PG_PASSWORD_BOOTSTRAP
+    # Task #219: same idea, redis.
+    write_redis_secret_file "${REDIS_PASSWORD_BOOTSTRAP}"
+    unset REDIS_PASSWORD_BOOTSTRAP
     cat > install-config.env << CONFIGFILE
 # CodeRaft — install-time / public config (NOT a secret, NEVER SOPS-encrypted)
 # $(date -u +"%Y-%m-%d")
@@ -1310,12 +1334,27 @@ services:
 
   redis:
     image: redis:7-alpine
-    command: redis-server --requirepass ${REDIS_PASSWORD} --maxmemory 128mb
+    # Task #219 (2026-07-31, logical follow-up of #148 Phase 3): redis has
+    # no native `_FILE` env var convention like postgres's image does — read
+    # the password from the mounted secrets file via a shell command
+    # override instead (redis:7-alpine is a real shell image, unlike the
+    # distroless vault). `user: "999:1000"` pins the container to the
+    # image's own unprivileged `redis` account directly (its built-in
+    # UID:GID) — the stock entrypoint only auto-drops root to that user for
+    # its OWN default `redis-server ...` CMD path, and skips that step for
+    # any other command (including this `sh -c` override), which would
+    # otherwise silently run as root. No persistent volume is mounted for
+    # this service, so there is no ownership/chown concern from bypassing
+    # the image's startup fixup step.
+    user: "999:1000"
+    command: ["sh", "-c", "redis-server --requirepass \"$(cat /run/secrets/redis_password)\" --maxmemory 128mb"]
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$(cat /run/secrets/redis_password)\" ping"]
       interval: 5s
       timeout: 5s
       retries: 5
+    secrets:
+      - redis_password
     # B-PRODUCT-DB-NET: same reason as postgres — product workers also
     # connect to redis://redis:6379 and must resolve the hostname.
     networks: [coderaft-backend]
@@ -1352,6 +1391,10 @@ volumes:
 secrets:
   postgres_password:
     file: ./secrets/postgres_password
+  # Task #219 (2026-07-31): same idea, redis — see the redis service's
+  # `secrets:`/`user:`/`command:` above and write_redis_secret_file() above.
+  redis_password:
+    file: ./secrets/redis_password
 COMPOSE
 
 # ── Caddyfile (env-templated TLS: internal CA / wildcard / ACME) ─────────────
@@ -1719,6 +1762,108 @@ vault_unseal_fresh() {
     echo "  ✓ coderaft-vault is healthy (sealed:false)"
 }
 
+# ── Vault bootstrap-secrets seeding (fresh install race fix) ────────────────
+# Task #218 (2026-07-31): this script generates POSTGRES_PASSWORD/
+# REDIS_PASSWORD/DASHBOARD_SECRET/RAVENSCAN_CAPTURE_TOKEN above (either fresh,
+# or preserved from a previous run — see the .env generation block) and
+# secrets/postgres_password is what postgres's OWN initdb actually uses.
+# Coderaft Vault, however, had no seed at all until now: dashboard-api's
+# vaultEnsure() (generateOverrideToDir(), the Coderaft Vault client since
+# #149) is the FIRST thing to ever write these keys into the vault, and it
+# only runs later — at the first product deploy, well after this script has
+# exited — on a truly fresh install. Finding the vault empty at that point,
+# it happily mints its OWN independent random value instead of reusing what
+# postgres/redis/the dashboard JWT signer were actually bootstrapped with.
+#
+# Confirmed experimentally 2026-07-31 (isolated test stack, distinct compose
+# project, never the live "coderaft" stack): after a fresh install.sh run,
+# Coderaft Vault's postgres_password key was completely absent while
+# secrets/postgres_password already held the real value used for postgres's
+# initdb; simulating vaultEnsure()'s own generator (crypto.randomBytes(24)
+# .toString("hex")) against the empty key produced a DIFFERENT value, exactly
+# the divergence this function exists to prevent.
+#
+# Fix: install.sh becomes the FIRST writer. Called right after the vault is
+# up and unsealed, BEFORE postgres (or any other service) starts — so
+# Coderaft Vault is always the single, unique source of truth from the very
+# first second, never a second independent generator.
+#
+# get-or-set semantics (never overwrite an existing vault value): mirrors
+# vaultEnsure()'s own behavior and update.sh's _vault_set/_vault_get
+# migration pattern. This keeps the function idempotent and safe to run on
+# every install.sh invocation, including a re-run against an EXISTING
+# install where the operator may have already rotated one of these secrets
+# via the dashboard (Coderaft Vault holds the rotated value; blindly
+# overwriting it with the stale local .env copy would silently undo that
+# rotation).
+vault_seed_bootstrap_secrets() {
+    local vault_age_key="vault-keys/age.key"
+    if [ ! -f "$vault_age_key" ]; then
+        echo "  ✗ vault-keys/age.key not found — cannot seed vault" >&2
+        return 1
+    fi
+
+    local vault_project
+    vault_project=$(docker inspect coderaft-coderaft-vault-1 \
+        --format '{{ index .Config.Labels "com.docker.compose.project" }}' 2>/dev/null || true)
+    [ -z "$vault_project" ] && vault_project="coderaft"
+    local vault_network="${vault_project}_coderaft-vault-net"
+
+    local abs_tls_dir
+    abs_tls_dir="$(cd vault-tls && pwd)"
+
+    _vault_curl_seed() {
+        local method="$1" path="$2" body="${3:-}"
+        local curl_args=(
+            "run" "--rm"
+            "--user" "0:0"
+            "--network" "$vault_network"
+            "-v" "${abs_tls_dir}:/tls:ro"
+            "curlimages/curl:latest"
+            "--cert" "/tls/dashboard-api-client.crt"
+            "--key"  "/tls/dashboard-api-client.key"
+            "--cacert" "/tls/client-ca.crt"
+            "-sS" "-X" "$method"
+            "https://coderaft-vault:8200${path}"
+        )
+        if [ -n "$body" ]; then
+            curl_args+=("-H" "Content-Type: application/json" "-d" "$body")
+        fi
+        docker "${curl_args[@]}" 2>&1
+    }
+
+    local seed_failed=0
+    local pair env_key vault_key val existing resp
+    for pair in \
+        "POSTGRES_PASSWORD:postgres_password" \
+        "REDIS_PASSWORD:redis_password" \
+        "DASHBOARD_SECRET:dashboard_secret" \
+        "RAVENSCAN_CAPTURE_TOKEN:ravenscan_capture_token"; do
+        env_key="${pair%%:*}"
+        vault_key="${pair##*:}"
+        val=$(grep "^${env_key}=" .env 2>/dev/null | head -1 | cut -d= -f2-)
+        if [ -z "$val" ]; then
+            continue
+        fi
+        existing=$(_vault_curl_seed "POST" "/v1/secret/get" "{\"name\":\"${vault_key}\"}")
+        if echo "$existing" | grep -q '"value"[[:space:]]*:'; then
+            # Already seeded — either by this exact function on a previous
+            # run, or since rotated by the operator via the dashboard. Never
+            # overwrite: Coderaft Vault is the sole source of truth once set.
+            echo "  ✓ ${vault_key} already present in Coderaft Vault (left untouched)"
+            continue
+        fi
+        resp=$(_vault_curl_seed "POST" "/v1/secret/set" "{\"name\":\"${vault_key}\",\"value\":\"${val}\"}")
+        if echo "$resp" | grep -q '"ok"[[:space:]]*:[[:space:]]*true'; then
+            echo "  ✓ Seeded ${vault_key} in Coderaft Vault"
+        else
+            echo "  ✗ Failed to seed ${vault_key} in Coderaft Vault: ${resp}" >&2
+            seed_failed=1
+        fi
+    done
+    return $seed_failed
+}
+
 if [ "${CODERAFT_TEST_MODE:-0}" = "1" ]; then
     echo ""
     echo "  [CODERAFT_TEST_MODE] Skipping docker compose pull and up"
@@ -1740,10 +1885,18 @@ else
     # Running container with stale certs in Docker Desktop memory).
     docker compose "${COMPOSE_ENV_ARGS[@]}" stop coderaft-vault 2>/dev/null || true
     docker compose "${COMPOSE_ENV_ARGS[@]}" rm -f coderaft-vault 2>/dev/null || true
-    if ! docker compose "${COMPOSE_ENV_ARGS[@]}" up -d; then
+    # Task #218 (2026-07-31): start coderaft-vault ALONE first — it must be
+    # up, unsealed, AND seeded with the bootstrap secrets above (or already
+    # holding them, on a re-run) BEFORE postgres/redis/dashboard-api are
+    # created. Previously the whole stack (postgres included) started in one
+    # shot here and unseal only happened afterwards, leaving a window where
+    # nothing had ever told Coderaft Vault what value postgres's own initdb
+    # was using — see vault_seed_bootstrap_secrets()'s header comment for the
+    # full race and its confirmed real-world impact.
+    if ! docker compose "${COMPOSE_ENV_ARGS[@]}" up -d coderaft-vault; then
         echo ""
-        echo "  ✗ docker compose up failed. Aborting install."
-        echo "    Run 'docker compose logs' to investigate."
+        echo "  ✗ docker compose up coderaft-vault failed. Aborting install."
+        echo "    Run 'docker compose logs coderaft-vault' to investigate."
         exit 1
     fi
 
@@ -1753,6 +1906,25 @@ else
         echo "  ⚠ Vault unseal failed — dashboard may show 'vault unavailable'."
         echo "    Re-run the installer or run: docker compose restart coderaft-vault"
     }
+
+    echo ""
+    echo "  Seeding bootstrap secrets into Coderaft Vault..."
+    vault_seed_bootstrap_secrets || {
+        echo "  ⚠ Could not seed one or more bootstrap secrets into Coderaft Vault."
+        echo "    dashboard-api will mint its own value(s) on first deploy, which"
+        echo "    may then MISMATCH what postgres/redis were actually initialized"
+        echo "    with. Re-run the installer once the vault is reachable, or seed"
+        echo "    manually — see docs/vault.md."
+    }
+
+    echo ""
+    echo "  Starting remaining services..."
+    if ! docker compose "${COMPOSE_ENV_ARGS[@]}" up -d; then
+        echo ""
+        echo "  ✗ docker compose up failed. Aborting install."
+        echo "    Run 'docker compose logs' to investigate."
+        exit 1
+    fi
 
     echo ""
     echo "  Setting up HTTPS trust (Caddy internal CA)..."
