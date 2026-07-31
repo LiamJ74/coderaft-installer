@@ -193,6 +193,28 @@ upsert_install_config() {
     chmod 600 install-config.env 2>/dev/null || true
 }
 
+# Task #148 (2026-07-31): postgres migrates to Docker's native `secrets:` +
+# POSTGRES_PASSWORD_FILE (the official postgres image already supports this)
+# instead of a plaintext POSTGRES_PASSWORD= env var baked into Config.Env.
+# Unlike `.env` (read client-side by the `docker compose` CLI process running
+# INSIDE dashboard-api's own container — proven safe on a tmpfs, see the
+# dashboard-api service's `tmpfs:` mount below), a compose `secrets: file:`
+# source IS resolved by the actual Docker DAEMON as a literal bind-mount
+# source (confirmed experimentally 2026-07-31: a secrets file living only on
+# a container-internal tmpfs made `docker compose up` fail on the daemon side
+# with "bind source path does not exist") — so this file MUST live on real,
+# persistent, host-visible disk, same tree as docker-compose.yml itself.
+# Written here (mirroring the .env bootstrap right below) so it already
+# exists before the very first `docker compose up` — postgres's `secrets:`
+# block would otherwise fail outright on a truly fresh install.
+write_postgres_secret_file() {
+    local pg_pw="$1"
+    mkdir -p secrets
+    chmod 700 secrets
+    printf '%s' "$pg_pw" > secrets/postgres_password
+    chmod 600 secrets/postgres_password
+}
+
 if [ -f ".env" ] && grep -q '^POSTGRES_PASSWORD=' .env 2>/dev/null; then
     # Existing install. Always (re)write HOST_PROJECT_DIR with the current
     # install dir — the location may have changed since the previous install,
@@ -219,6 +241,14 @@ if [ -f ".env" ] && grep -q '^POSTGRES_PASSWORD=' .env 2>/dev/null; then
             && mv .env.tmp .env
     fi
     chmod 600 .env install-config.env
+    # Task #148: upgrade from a pre-#148 install never had secrets/postgres_password —
+    # backfill it from the EXISTING .env value so postgres's `secrets:` block
+    # (added by this version) resolves to the SAME password postgres already
+    # has, instead of a fresh one that would mismatch the running cluster.
+    if [ ! -f secrets/postgres_password ]; then
+        write_postgres_secret_file "$(grep '^POSTGRES_PASSWORD=' .env | head -1 | cut -d= -f2-)"
+        echo "  ✓ secrets/postgres_password backfilled from existing .env (task #148)"
+    fi
     # Backward compat: legacy install without .env.enc — show warning in dashboard
     if [ ! -f "${AGE_KEY_LOCAL}" ] && [ ! -f "${AGE_KEY_PATH}" ]; then
         echo "  ⚠ Legacy install detected: no age key found."
@@ -228,14 +258,20 @@ if [ -f ".env" ] && grep -q '^POSTGRES_PASSWORD=' .env 2>/dev/null; then
     echo "  ✓ Existing config preserved"
 else
     echo "  Generating secrets..."
+    PG_PASSWORD_BOOTSTRAP="$(gen_hex 24)"
     cat > .env << ENVFILE
 # CodeRaft Dashboard — $(date -u +"%Y-%m-%d")
-POSTGRES_PASSWORD=$(gen_hex 24)
+POSTGRES_PASSWORD=${PG_PASSWORD_BOOTSTRAP}
 REDIS_PASSWORD=$(gen_hex 24)
 DASHBOARD_SECRET=$(gen_hex 32)
 RAVENSCAN_CAPTURE_TOKEN=$(gen_hex 32)
 ENVFILE
     chmod 600 .env
+    # Task #148: same value as .env's POSTGRES_PASSWORD above, materialized
+    # as a standalone file for postgres's `secrets:`/POSTGRES_PASSWORD_FILE —
+    # both must agree at the container's very first initdb.
+    write_postgres_secret_file "${PG_PASSWORD_BOOTSTRAP}"
+    unset PG_PASSWORD_BOOTSTRAP
     cat > install-config.env << CONFIGFILE
 # CodeRaft — install-time / public config (NOT a secret, NEVER SOPS-encrypted)
 # $(date -u +"%Y-%m-%d")
@@ -1154,6 +1190,19 @@ services:
       - ./vault-tls/client-ca.crt:/vault-tls/client-ca.crt:ro
       - ./vault-tls/dashboard-api-client.crt:/vault-tls/dashboard-api-client.crt:ro
       - ./vault-tls/dashboard-api-client.key:/vault-tls/dashboard-api-client.key:ro
+    # Task #148 (banking-grade runtime exposure reduction, 2026-07-31): the
+    # *working* .env (resolved secret VALUES, passed to `docker compose
+    # --env-file`) is written here instead of the persistent bind-mounted
+    # /host-compose (the `.:/host-compose` volume above). tmpfs is private to
+    # THIS container — wiped on every restart/recreate — and does NOT need to
+    # be host-daemon-visible: the `docker compose` CLI runs INSIDE this same
+    # container (docker-cli-compose baked into the image, talking to the
+    # daemon over tcp://docker-proxy:2375), and --env-file is interpolated
+    # client-side by that CLI process, never resolved by the daemon itself.
+    # Confirmed experimentally 2026-07-31 in an isolated throwaway compose
+    # project (see #148 report).
+    tmpfs:
+      - /run/coderaft-env:size=1m,mode=0700,uid=0
     security_opt: [no-new-privileges:true]
     restart: unless-stopped
 
@@ -1224,9 +1273,17 @@ services:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: coderaft
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      # Task #148 (2026-07-31): migrated to Docker's native `secrets:` — the
+      # official postgres image already supports POSTGRES_PASSWORD_FILE, so
+      # the resolved value no longer appears in `docker inspect`/Config.Env.
+      # The file is materialized by install.sh (first boot) and by
+      # dashboard-api's generateOverrideToDir() (every subsequent regen) at
+      # ./secrets/postgres_password — see the `secrets:` top-level block below.
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
       POSTGRES_DB: coderaft
       POSTGRES_INITDB_ARGS: "--data-checksums"
+    secrets:
+      - postgres_password
     volumes:
       - postgres_data:/var/lib/postgresql/data
       # init-db.sql is intentionally NOT bind-mounted — when the
@@ -1285,6 +1342,16 @@ volumes:
   caddy_data:
   caddy_config:
   vault_data:
+
+# Task #148 (2026-07-31): postgres's password, Docker-native file-based
+# secret. Must be a real path resolvable by the Docker DAEMON itself (unlike
+# .env's --env-file, this is a literal bind-mount source, not client-side
+# interpolation) — ./secrets/postgres_password, relative to this file's
+# directory (= --project-directory = HOST_PROJECT_DIR). Written by install.sh
+# on first boot and kept in sync by dashboard-api's generateOverrideToDir().
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password
 COMPOSE
 
 # ── Caddyfile (env-templated TLS: internal CA / wildcard / ACME) ─────────────

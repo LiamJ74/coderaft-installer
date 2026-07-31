@@ -151,6 +151,59 @@ is absent, restore `vault-keys/age.key` from a manual backup.
 
 ---
 
+## Runtime exposure reduction (task #148, 2026-07-31)
+
+Two follow-ups to the Phase 3 dashboard-api-as-vault-client migration, both
+about *where secret VALUES sit on disk*, not about which store is
+authoritative (Coderaft Vault remains the sole authority for both):
+
+1. **The working `.env`** (rendered secret values, passed to `docker compose
+   --env-file`) now lives on a **tmpfs private to the dashboard-api
+   container** (`/run/coderaft-env`, mounted via `tmpfs:` on the
+   `dashboard-api` service) instead of the persistent bind-mounted install
+   directory. It is wiped on every container restart/recreation and
+   regenerated fresh from Coderaft Vault + `install-config.env` on the next
+   boot/deploy — never a durable copy at rest. This is safe because
+   `--env-file` is interpolated **client-side** by the `docker compose` CLI
+   process, which runs *inside* the dashboard-api container itself (baked-in
+   `docker-cli-compose`, talking to the daemon over the socket/proxy) — the
+   Docker daemon never needs to resolve that path itself. Confirmed
+   experimentally: a tmpfs mounted only inside the orchestrating container,
+   never bind-mounted to any real host path, was read correctly by
+   `docker compose --env-file <tmpfs-path>` and the resulting container's
+   `Config.Env` showed the correctly interpolated value.
+2. **`postgres` migrated to Docker's native `secrets:` + `POSTGRES_PASSWORD_FILE`**
+   — the official image already supports it, so `POSTGRES_PASSWORD` no
+   longer appears in `docker inspect`'s `Config.Env` for the postgres
+   container. Unlike `.env`, this file (`./secrets/postgres_password`) **is**
+   resolved by the Docker daemon itself as a literal bind-mount source (a
+   container-internal-only tmpfs fails here with "bind source path does not
+   exist" — confirmed experimentally), so it stays on the persistent,
+   host-visible install directory, next to `docker-compose.yml`. Written by
+   `install.sh` on first boot and self-healed into existing installs by
+   `update.sh`, always seeded from the CURRENTLY ACTIVE `.env` value (never a
+   freshly generated one) so an already-initialized postgres cluster's real
+   credential is never orphaned by the migration.
+
+**Suggested order for the rest of the `secrets:` migration** (per-product,
+each touches application entrypoint code, budgeted separately): redis →
+`CLOUDFLARE_TUNNEL_TOKEN` → RedFox JWT/passphrase (file-mount pattern already
+precedented via `REDFOX_JWT_KEY_PATH`) → `DASHBOARD_SECRET`/
+`XPRODUCT_INTERNAL_TOKEN` → the rest. Out of scope for #148.
+
+**Known gap confirmed while doing this work**: the "7-day grace, then a
+dashboard banner to purge legacy stores" behavior described in the Update
+path section above is **only documented, not implemented**. `update.sh`
+writes the `vault-data/.migrated` sentinel with a UTC timestamp, but no
+dashboard-api route or frontend component reads that file to drive a purge
+banner or automated purge — grep of `apps/shell/src` and `dashboard-api/`
+for `.migrated`/`vault-data` turns up nothing beyond the one comment in
+`server.js` explaining why `generateOverrideToDir()` deliberately does NOT
+do this migration itself. Tracked as a separate follow-up, not implemented
+here.
+
+---
+
 ## Test-mode install
 
 Set `CODERAFT_TEST_MODE=1` to auto-accept the `CONFIRMED` prompt and skip
@@ -183,6 +236,6 @@ CODERAFT_TEST_MODE=1 CODERAFT_TEST_FAIL=4e bash scripts/update.sh
 | 0.5 | Vault deployed from oneliner; existing installs migrate on update |
 | 1 | dashboard-api migrates `auth_config` (Azure creds) to vault |
 | 2 | LICENSE_KEY lifecycle moves to vault — done, 2026-07-28 (#166) |
-| 3 (this, in progress) | Per-product secret stores replaced with vault client — dashboard-api's own store done (#149, 2026-07-31); WolfGuard/Ravenscan/RedFox's own per-product stores still pending |
+| 3 (this, in progress) | Per-product secret stores replaced with vault client — dashboard-api's own store done (#149, 2026-07-31); runtime exposure reduction done (#148, 2026-07-31: working `.env` on tmpfs, postgres on `secrets:`/POSTGRES_PASSWORD_FILE — see below); WolfGuard/Ravenscan/RedFox's own per-product stores AND their `secrets:` migration still pending |
 | 4 | Vault becomes JWT issuer (admin_token) |
 | 5 | Remove SOPS/.env.enc path; one vault, one master key |
