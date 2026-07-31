@@ -127,17 +127,20 @@ Write-Host ""
 function Test-Command($name) {
     if (-not (Get-Command $name -ErrorAction SilentlyContinue)) {
         Write-Host "  ✗ $name is required but not installed." -ForegroundColor Red
-        exit 1
+        return $false
     }
     Write-Host "  ✓ $name found" -ForegroundColor Green
+    return $true
 }
 
 Write-Host "  Checking prerequisites..."
-Test-Command docker
+# Not 'exit' — irm|iex runs this script in the caller's own scope, so exit
+# would close their whole shell instead of just ending this script.
+if (-not (Test-Command docker)) { return }
 & docker compose version *> $null
 if ($LASTEXITCODE -ne 0) {
     Write-Host "  ✗ 'docker compose' plugin is required." -ForegroundColor Red
-    exit 1
+    return
 }
 Write-Host "  ✓ docker compose found" -ForegroundColor Green
 

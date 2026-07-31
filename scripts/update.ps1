@@ -34,7 +34,7 @@ $PRODUCT_SLUG = if ($Product) { $Product } elseif ($env:CODERAFT_PRODUCT) { $env
 if ($PRODUCT_SLUG -and ($PRODUCT_SLUG -notin @("entra-audit", "secaudit", "redfox", "mantisstrike", "falconone"))) {
     Write-Host "ERROR: unknown product slug '$PRODUCT_SLUG'" -ForegroundColor Red
     Write-Host "Valid slugs: entra-audit, secaudit, redfox, mantisstrike, falconone"
-    exit 1
+    return  # not 'exit' — irm|iex runs this in the caller's own scope, so exit would close their whole shell
 }
 
 $DASHBOARD_API       = if ($env:DASHBOARD_API)       { $env:DASHBOARD_API }       else { "http://localhost:3000" }
@@ -157,7 +157,7 @@ if ($PRODUCT_SLUG) {
     if (-not $ADMIN_TOKEN) {
         Write-Host "  ERROR: ADMIN_TOKEN not found - the per-product update needs the dashboard API." -ForegroundColor Red
         Write-Host "  Set `$env:ADMIN_TOKEN, or ensure the dashboard-api container is running."
-        exit 1
+        return  # not 'exit' — irm|iex runs this in the caller's own scope, so exit would close their whole shell
     }
 
     $headers = @{ Authorization = "Bearer $ADMIN_TOKEN"; "Content-Type" = "application/json" }
@@ -170,7 +170,7 @@ if ($PRODUCT_SLUG) {
     } catch {
         Write-Host "  ERROR: failed to start the update: $($_.Exception.Message)" -ForegroundColor Red
         Write-Host "  (409 = another operation is already running; 403 = product not licensed)"
-        exit 1
+        return  # not 'exit' — irm|iex runs this in the caller's own scope, so exit would close their whole shell
     }
     Write-Host "  Update started. Waiting for completion (snapshot -> backup -> pull -> recreate -> health)..."
 
@@ -196,28 +196,28 @@ if ($PRODUCT_SLUG) {
         "healthy" {
             Write-Host ""
             Write-Host "  [OK] $PRODUCT_SLUG updated successfully - all services healthy." -ForegroundColor Green
-            exit 0
+            return  # not 'exit' — irm|iex runs this in the caller's own scope, so exit would close their whole shell
         }
         "rolled_back" {
             Write-Host ""
             Write-Host "  [FAIL] Update failed - automatic rollback restored the previous version." -ForegroundColor Red
-            exit 1
+            return  # not 'exit' — irm|iex runs this in the caller's own scope, so exit would close their whole shell
         }
         "rollback_failed" {
             Write-Host ""
             Write-Host "  [CRITICAL] Update AND rollback failed - manual intervention required." -ForegroundColor Red
             Write-Host "  Snapshots: GET $DASHBOARD_API/api/dashboard/products/$PRODUCT_SLUG/snapshots"
-            exit 2
+            return  # not 'exit' — irm|iex runs this in the caller's own scope, so exit would close their whole shell
         }
         "failed" {
             Write-Host ""
             Write-Host "  [FAIL] Update failed before any service was modified (e.g. backup failure)." -ForegroundColor Red
-            exit 1
+            return  # not 'exit' — irm|iex runs this in the caller's own scope, so exit would close their whole shell
         }
         default {
             Write-Host ""
             Write-Host "  [?] Update still running after 10 min - check the dashboard for live status." -ForegroundColor Yellow
-            exit 1
+            return  # not 'exit' — irm|iex runs this in the caller's own scope, so exit would close their whole shell
         }
     }
 }
@@ -310,7 +310,7 @@ if (-not $env:CODERAFT_UPDATE_REEXEC) {
         Start-Sleep -Seconds 1
         $env:CODERAFT_UPDATE_REEXEC = "1"
         & $PSBin -NoProfile -ExecutionPolicy Bypass -File ".\update.ps1"
-        exit $LASTEXITCODE
+        return  # not 'exit' — irm|iex runs this in the caller's own scope, so exit would close their whole shell
     }
 }
 
@@ -657,11 +657,11 @@ if (-not $composeOK) {
             Write-Host "    ✓ compose repaired"
         } else {
             Write-Host "  ERROR: self-heal failed. Inspect docker-compose.override.yml manually."
-            exit 1
+            return  # not 'exit' — irm|iex runs this in the caller's own scope, so exit would close their whole shell
         }
     } catch {
         Write-Host "  ERROR: cannot restart dashboard-api — $($_.Exception.Message)"
-        exit 1
+        return  # not 'exit' — irm|iex runs this in the caller's own scope, so exit would close their whole shell
     }
     $LASTEXITCODE = 0
 } else {
@@ -892,6 +892,116 @@ function Invoke-CveProxyAclSelfHeal {
     Write-Host "  [update] Self-heal ACL: cve-proxy entry created"
 }
 
+# ── Live vault ACL reconciliation (post-bootstrap installs) ─────────────────
+# Invoke-FalconOneAclSelfHeal/Invoke-CveProxyAclSelfHeal above only patch the
+# STATIC acl.yaml file. coderaft-vault's loadOrBootstrapACL (cmd/coderaft-
+# vault/main.go) reads that file ONLY on a vault's very first-ever boot —
+# every later boot loads the ACL from its own persisted, encrypted store,
+# and acl.yaml is "never consulted again" (see internal/api/acl_handlers.go's
+# own header comment: dynamic ACL management replaces a static acl.yaml
+# edit, invisible to the audit trail, with an authenticated admin-API call —
+# by design, not a bug to fix in coderaft-vault). On any vault that already
+# went through its first boot before a given client existed — i.e. every
+# already-provisioned install, since falconone/cve-proxy both shipped well
+# after vault Phase 0 — patching the file alone is therefore a NO-OP against
+# the live, running vault: it keeps rejecting that client (this is exactly
+# what surfaced as a 401 on `set cve-proxy/cve_engine_api_key`, previously
+# worked around with a manual `PUT /v1/admin/acl/cve-proxy` curl) until the
+# persisted ACL is reconciled through the vault's own authenticated admin
+# API. This closes that gap so update.ps1 does it itself instead of
+# requiring a manual live patch — additive-only (only ever touches the ONE
+# named client's entry, via the same admin endpoint's existing safety
+# checks), idempotent (no-ops once the live vault already has the entry),
+# and non-fatal if the vault is absent/sealed/unreachable (the acl.yaml seed
+# above still covers a genuine fresh install).
+function Invoke-VaultAclLiveSelfHeal {
+    param(
+        [Parameter(Mandatory = $true)][string]$InstallDir,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$San,
+        [Parameter(Mandatory = $true)][string[]]$Permissions
+    )
+
+    $tlsDir   = Join-Path $InstallDir "vault-tls"
+    $certFile = Join-Path $tlsDir "dashboard-api-client.crt"
+    $keyFile  = Join-Path $tlsDir "dashboard-api-client.key"
+    $caFile   = Join-Path $tlsDir "client-ca.crt"
+    if (-not (Test-Path $certFile) -or -not (Test-Path $keyFile) -or -not (Test-Path $caFile)) { return }
+
+    $inspOut = Join-Path $env:TEMP "coderaft-acl-insp-$(Get-Random).log"
+    $inspErr = Join-Path $env:TEMP "coderaft-acl-insp-err-$(Get-Random).log"
+    $inspProc = Start-Process -FilePath "docker" -ArgumentList @("inspect", "coderaft-coderaft-vault-1") `
+        -NoNewWindow -PassThru -RedirectStandardOutput $inspOut -RedirectStandardError $inspErr -ErrorAction SilentlyContinue
+    if ($inspProc -and -not $inspProc.WaitForExit(15000)) { try { $inspProc.Kill() } catch {} }
+    $vaultUp = (Test-Path $inspOut) -and (((Get-Content $inspOut -Raw -ErrorAction SilentlyContinue)) -match '"Id"')
+    Remove-Item -Path $inspOut, $inspErr -ErrorAction SilentlyContinue
+    if (-not $vaultUp) { return }
+
+    $projOut = Join-Path $env:TEMP "coderaft-acl-proj-$(Get-Random).log"
+    $projErr = Join-Path $env:TEMP "coderaft-acl-proj-err-$(Get-Random).log"
+    $projProc = Start-Process -FilePath "docker" -ArgumentList @("inspect", "coderaft-coderaft-vault-1", "--format", '{{ index .Config.Labels "com.docker.compose.project" }}') `
+        -NoNewWindow -PassThru -RedirectStandardOutput $projOut -RedirectStandardError $projErr -ErrorAction SilentlyContinue
+    if ($projProc -and -not $projProc.WaitForExit(15000)) { try { $projProc.Kill() } catch {} }
+    $project = ((Get-Content $projOut -ErrorAction SilentlyContinue) -join "").Trim()
+    Remove-Item -Path $projOut, $projErr -ErrorAction SilentlyContinue
+    if (-not $project) { $project = "coderaft" }
+    $network  = "${project}_coderaft-vault-net"
+    $absTlsDir = (Resolve-Path -LiteralPath $tlsDir).Path
+
+    function _AclLiveCurl {
+        param([string]$Method, [string]$Path, [string]$JsonBody = "")
+        $dockerArgs = @("run", "--rm")
+        if ($JsonBody) { $dockerArgs += @("-i") }
+        $dockerArgs += @(
+            "--user", "0:0", "--network", $network,
+            "-v", "${absTlsDir}:/tls:ro",
+            "curlimages/curl:latest",
+            "--cert", "/tls/dashboard-api-client.crt",
+            "--key", "/tls/dashboard-api-client.key",
+            "--cacert", "/tls/client-ca.crt",
+            "-sS", "-m", "10", "-X", $Method,
+            "https://coderaft-vault:8200$Path"
+        )
+        $bodyFile = $null
+        if ($JsonBody) {
+            $bodyFile = Join-Path $env:TEMP "coderaft-acl-body-$(Get-Random).json"
+            [System.IO.File]::WriteAllText($bodyFile, $JsonBody, [System.Text.UTF8Encoding]::new($false))
+            $dockerArgs += @("-H", "Content-Type: application/json", "--data-binary", "@-")
+        }
+        $curlOut = Join-Path $env:TEMP "coderaft-acl-out-$(Get-Random).log"
+        $curlErr = Join-Path $env:TEMP "coderaft-acl-err-$(Get-Random).log"
+        $spArgs = @{
+            FilePath = "docker"; ArgumentList = $dockerArgs; NoNewWindow = $true; Wait = $true
+            RedirectStandardOutput = $curlOut; RedirectStandardError = $curlErr; ErrorAction = "SilentlyContinue"
+        }
+        if ($bodyFile) { $spArgs['RedirectStandardInput'] = $bodyFile }
+        Start-Process @spArgs | Out-Null
+        $result = ""
+        if (Test-Path $curlOut) { $result = ((Get-Content $curlOut -ErrorAction SilentlyContinue) -join "") }
+        Remove-Item -Path $curlOut, $curlErr -ErrorAction SilentlyContinue
+        if ($bodyFile) { Remove-Item -Path $bodyFile -ErrorAction SilentlyContinue }
+        return $result
+    }
+
+    $health = _AclLiveCurl -Method "GET" -Path "/v1/health"
+    if ($health -notmatch '"sealed":false') {
+        Write-Host "  [update] Vault ACL live self-heal ($Name): vault sealed/unreachable — skipped, will apply on the vault's next real bootstrap"
+        return
+    }
+
+    $current = _AclLiveCurl -Method "GET" -Path "/v1/admin/acl"
+    if ($current -match [regex]::Escape("`"name`":`"$Name`"")) { return }
+
+    $permsJson = "[" + (($Permissions | ForEach-Object { "`"$_`"" }) -join ",") + "]"
+    $body = "{`"cert_san`":`"$San`",`"permissions`":$permsJson}"
+    $resp = _AclLiveCurl -Method "PUT" -Path "/v1/admin/acl/$Name" -JsonBody $body
+    if ($resp -match '"ok":true') {
+        Write-Host "  [update] Vault ACL live self-heal: $Name granted on the RUNNING vault (acl.yaml alone would not have reached it)"
+    } else {
+        Write-Host "  [update] Vault ACL live self-heal: PUT /v1/admin/acl/$Name failed — will retry on next update: $resp"
+    }
+}
+
 # ── Vault client cert self-heal (any product whose cert was never
 # generated, e.g. cve-proxy on installs migrated before it shipped) ─────────
 # Additive-only, requires client-ca.key to still be present.
@@ -1000,7 +1110,7 @@ if ($vaultNeedsMigration) {
         Copy-Item $envPath (Join-Path $vaultBak "env") -ErrorAction Stop
     } else {
         Write-Host "  ✗ .env not found — cannot backup. Vault migration aborted." -ForegroundColor Red
-        exit 1
+        return  # not 'exit' — irm|iex runs this in the caller's own scope, so exit would close their whole shell
     }
     $envEncPath = Join-Path $INSTALL_DIR ".env.enc"
     if (Test-Path $envEncPath) { Copy-Item $envEncPath (Join-Path $vaultBak "env.enc") -ErrorAction SilentlyContinue }
@@ -1163,11 +1273,11 @@ if ($vaultNeedsMigration) {
             Write-Host "  Full log: $log" -ForegroundColor Yellow
         }
         Write-Host ""
-        Write-Host "  Press any key to acknowledge before the window closes..." -ForegroundColor Yellow
+        Write-Host "  Press any key to acknowledge..." -ForegroundColor Yellow
         if (-not $env:CODERAFT_TEST_MODE) {
             try { [void][System.Console]::ReadKey($true) } catch { Start-Sleep -Seconds 30 }
         }
-        exit 1
+        return  # not 'exit' — irm|iex runs this in the caller's own scope, so exit would close their whole shell
     }
 
     # ── 4c Vault directories (always) ─────────────────────────────────────
@@ -1191,11 +1301,11 @@ if ($vaultNeedsMigration) {
                 Invoke-WebRequest -Uri $ageUrl -OutFile $ageZip -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
                 Expand-Archive -Path $ageZip -DestinationPath $ageTmp -Force -ErrorAction Stop
                 $ageKeygenExe = Get-ChildItem -Path $ageTmp -Filter "age-keygen.exe" -Recurse | Select-Object -First 1
-                if (-not $ageKeygenExe) { Invoke-VaultMigrationRollback "age-keygen.exe missing in downloaded archive" }
+                if (-not $ageKeygenExe) { Invoke-VaultMigrationRollback "age-keygen.exe missing in downloaded archive"; return }
                 $ageKeygen = [pscustomobject]@{ Path = $ageKeygenExe.FullName }
                 Write-Host "    ✓ age-keygen downloaded to $($ageKeygen.Path)"
             } catch {
-                Invoke-VaultMigrationRollback "age-keygen download failed: $($_.Exception.Message)"
+                Invoke-VaultMigrationRollback "age-keygen download failed: $($_.Exception.Message)"; return
             }
         }
 
@@ -1207,7 +1317,7 @@ if ($vaultNeedsMigration) {
             -RedirectStandardError $ageGenStderr `
             -ErrorAction SilentlyContinue
         Remove-Item -Path $ageGenStderr -ErrorAction SilentlyContinue
-        if (-not (Test-Path $vaultAgeKey)) { Invoke-VaultMigrationRollback "age-keygen failed" }
+        if (-not (Test-Path $vaultAgeKey)) { Invoke-VaultMigrationRollback "age-keygen failed"; return }
 
         $recoveryPhrase = ""
         if ($env:CODERAFT_TEST_MODE -ne "1") {
@@ -1254,7 +1364,7 @@ if ($vaultNeedsMigration) {
         } else {
             $reply = Read-Host "  Type CONFIRMED (all caps) once you have securely stored the phrase"
         }
-        if ($reply -ne "CONFIRMED") { Invoke-VaultMigrationRollback "operator did not confirm recovery phrase" }
+        if ($reply -ne "CONFIRMED") { Invoke-VaultMigrationRollback "operator did not confirm recovery phrase"; return }
         Write-Host "  ✓ Recovery phrase confirmed" -ForegroundColor Green
     } else {
         Write-Host "  ✓ Vault age key already exists — reusing"
@@ -1363,7 +1473,7 @@ chmod 644 cve-proxy-client.key cve-proxy-client.crt 2>/dev/null || true
     }
     Remove-Item -Path $mRunOut,$mRunErr,$opensslScriptFile2 -ErrorAction SilentlyContinue
     if (-not (Test-Path (Join-Path $tlsDir "vault.crt"))) {
-        Invoke-VaultMigrationRollback "openssl-in-alpine cert generation failed (see $migrationLog)"
+        Invoke-VaultMigrationRollback "openssl-in-alpine cert generation failed (see $migrationLog)"; return
     }
     $configYaml = @'
 server:
@@ -1433,7 +1543,7 @@ clients:
     Invoke-FalconOneTlsBootstrap -InstallDir $INSTALL_DIR
 
     # ── 4d Pull and start vault ────────────────────────────────────────────
-    if ($env:CODERAFT_TEST_FAIL -eq "4d") { Invoke-VaultMigrationRollback "injected test failure at 4d" }
+    if ($env:CODERAFT_TEST_FAIL -eq "4d") { Invoke-VaultMigrationRollback "injected test failure at 4d"; return }
 
     # All docker output (stdout + stderr) is logged to migration.log inside the
     # backup dir AND streamed to the console. No more silent failures.
@@ -1531,7 +1641,7 @@ services:
             -ErrorAction SilentlyContinue
         if (Test-Path $vPullOut) { Get-Content $vPullOut -ErrorAction SilentlyContinue | Tee-Object -FilePath $migrationLog -Append | Out-Host }
         Remove-Item -Path $vPullOut,$vPullErr -ErrorAction SilentlyContinue
-        if ($vPullProc.ExitCode -ne 0) { Invoke-VaultMigrationRollback "docker pull failed (see $migrationLog)" }
+        if ($vPullProc.ExitCode -ne 0) { Invoke-VaultMigrationRollback "docker pull failed (see $migrationLog)"; return }
     }
 
     Write-Host "  Starting vault container..."
@@ -1585,7 +1695,7 @@ services:
     }
     Remove-Item -Path $vUpOut,$vUpErr -ErrorAction SilentlyContinue
     Pop-Location -ErrorAction SilentlyContinue
-    if ($upExit -ne 0) { Invoke-VaultMigrationRollback "docker compose up coderaft-vault failed (see $migrationLog)" }
+    if ($upExit -ne 0) { Invoke-VaultMigrationRollback "docker compose up coderaft-vault failed (see $migrationLog)"; return }
 
     # The vault image is distroless — no shell, no wget. We can't `docker
     # compose exec coderaft-vault sh ...`. Use a curlimages/curl sidecar on
@@ -1685,7 +1795,7 @@ services:
     if (-not $vaultReachable) {
         Write-Host "  Last health probe output (see $migrationLog for full log):" -ForegroundColor Yellow
         Get-Content -Path $migrationLog -Tail 5 | ForEach-Object { Write-Host "    $_" -ForegroundColor Yellow }
-        Invoke-VaultMigrationRollback "coderaft-vault did not respond to TLS probes"
+        Invoke-VaultMigrationRollback "coderaft-vault did not respond to TLS probes"; return
     }
 
     # Unseal if sealed (PassphraseSealer = 1 share = the age private key bytes)
@@ -1698,7 +1808,7 @@ services:
         "[$(Get-Date -Format o)] unseal response → $unsealResp" | Out-File -FilePath $migrationLog -Append -Encoding utf8
         if ($unsealResp -notmatch '"ok"\s*:\s*true|"sealed"\s*:\s*false') {
             Write-Host "  Unseal response: $unsealResp" -ForegroundColor Yellow
-            Invoke-VaultMigrationRollback "vault unseal failed (see $migrationLog)"
+            Invoke-VaultMigrationRollback "vault unseal failed (see $migrationLog)"; return
         }
         Write-Host "  ✓ Vault unsealed"
     }
@@ -1708,12 +1818,12 @@ services:
     "[$(Get-Date -Format o)] final health → $finalHealth" | Out-File -FilePath $migrationLog -Append -Encoding utf8
     if ($finalHealth -notmatch '"sealed"\s*:\s*false') {
         Write-Host "  Final health: $finalHealth" -ForegroundColor Yellow
-        Invoke-VaultMigrationRollback "vault still sealed after unseal call"
+        Invoke-VaultMigrationRollback "vault still sealed after unseal call"; return
     }
     Write-Host "  ✓ coderaft-vault is healthy"
 
     # ── 4e Migrate secrets ────────────────────────────────────────────────
-    if ($env:CODERAFT_TEST_FAIL -eq "4e") { Invoke-VaultMigrationRollback "injected test failure at 4e" }
+    if ($env:CODERAFT_TEST_FAIL -eq "4e") { Invoke-VaultMigrationRollback "injected test failure at 4e"; return }
 
     function Set-VaultSecret {
         param([string]$Name, [string]$Value)
@@ -1770,7 +1880,7 @@ services:
             }
         }
     }
-    if (-not $migrationOk) { Invoke-VaultMigrationRollback "secret migration verify failed" }
+    if (-not $migrationOk) { Invoke-VaultMigrationRollback "secret migration verify failed"; return }
     Write-Host "  ✓ Secrets migrated and verified"
 
     # ── 4g Sentinel ───────────────────────────────────────────────────────
@@ -1811,6 +1921,13 @@ services:
 # permissions healed.
 Invoke-FalconOneTlsBootstrap -InstallDir $INSTALL_DIR
 Invoke-FalconOneAclSelfHeal -AclPath (Join-Path $INSTALL_DIR "vault-config\acl.yaml")
+Invoke-VaultAclLiveSelfHeal -InstallDir $INSTALL_DIR -Name "falconone" -San "falconone.coderaft.local" -Permissions @(
+    "read:license_key", "read:falconone_*", "read:platform/identity/oidc",
+    "sign:falconone_agent_cert", "read:falconone/nvd_api_key",
+    "read:falconone/audit_hmac_key", "write:falconone/audit_hmac_key",
+    "read:falconone/pki/agents-ca/cert", "read:pki/falconone-agents-ca*",
+    "write:pki/falconone-agents-ca*"
+)
 
 # ── cve-proxy vault client cert + ACL self-heal ──────────────────────────────
 # coderaft-cve-proxy is a shared platform sidecar (in front of the central
@@ -1818,6 +1935,9 @@ Invoke-FalconOneAclSelfHeal -AclPath (Join-Path $INSTALL_DIR "vault-config\acl.y
 Invoke-VaultClientCertSelfHeal -InstallDir $INSTALL_DIR -Name "falconone" -San "falconone.coderaft.local"
 Invoke-VaultClientCertSelfHeal -InstallDir $INSTALL_DIR -Name "cve-proxy" -San "cve-proxy.coderaft.local"
 Invoke-CveProxyAclSelfHeal -AclPath (Join-Path $INSTALL_DIR "vault-config\acl.yaml")
+Invoke-VaultAclLiveSelfHeal -InstallDir $INSTALL_DIR -Name "cve-proxy" -San "cve-proxy.coderaft.local" -Permissions @(
+    "read:cve-proxy/*", "write:cve-proxy/*"
+)
 
 # ── Banking-grade plaintext purge (auto) ──────────────────────────────────
 # When .env.enc exists, the plaintext .env MUST be purged. The oneliner
@@ -1959,11 +2079,11 @@ if ($postgresRunning) {
         } else {
             Write-Host "  ERROR: pg_dumpall failed (exit $($proc.ExitCode)). Update cancelled."
             Write-Host "  Check that the postgres container is healthy: docker compose ps"
-            exit 1
+            return  # not 'exit' — irm|iex runs this in the caller's own scope, so exit would close their whole shell
         }
     } catch {
         Write-Host "  ERROR: pg_dumpall failed — $($_.Exception.Message)"
-        exit 1
+        return  # not 'exit' — irm|iex runs this in the caller's own scope, so exit would close their whole shell
     }
 } else {
     Write-Host "  PostgreSQL not detected — backup skipped (dashboard without DB)."
@@ -2289,7 +2409,7 @@ Write-Host "  Downloading new images..."
 & docker @ComposeArgs pull
 if ($LASTEXITCODE -ne 0) {
     Write-Host "  ERROR: docker compose pull failed."
-    exit 1
+    return  # not 'exit' — irm|iex runs this in the caller's own scope, so exit would close their whole shell
 }
 
 # Note: `--pull always` retried a per-service GHCR manifest check at redeploy
@@ -2299,7 +2419,7 @@ if ($LASTEXITCODE -ne 0) {
 & docker @ComposeArgs up -d --force-recreate --remove-orphans
 if ($LASTEXITCODE -ne 0) {
     Write-Host "  ERROR: docker compose up failed."
-    exit 1
+    return  # not 'exit' — irm|iex runs this in the caller's own scope, so exit would close their whole shell
 }
 
 # ── #137 fix: refresh certs/server-ca.pem — Caddy TLS mode-aware (#187) ──
@@ -2489,7 +2609,7 @@ if (-not $healthOk) {
         Write-Host "  rollback.ps1 not found. Manual rollback required."
         Write-Host "  Command: docker compose down; docker compose up -d"
     }
-    exit 1
+    return  # not 'exit' — irm|iex runs this in the caller's own scope, so exit would close their whole shell
 }
 
 # ── B-IPV6-KILL-VERIFY (2026-07-24) ───────────────────────────────────────

@@ -635,6 +635,82 @@ CVEPROXYACL
     echo "  [install] Self-heal ACL: cve-proxy entry created"
 }
 
+# ── Live vault ACL reconciliation (post-bootstrap installs) ─────────────────
+# _falconone_acl_selfheal/_cveproxy_acl_selfheal above only patch the STATIC
+# acl.yaml file. coderaft-vault's loadOrBootstrapACL (cmd/coderaft-vault/
+# main.go) reads that file ONLY on a vault's very first-ever boot — every
+# later boot loads the ACL from its own persisted, encrypted store, and
+# acl.yaml is "never consulted again" (see internal/api/acl_handlers.go's own
+# header comment: dynamic ACL management replaces a static acl.yaml edit,
+# invisible to the audit trail, with an authenticated admin-API call — by
+# design, not a bug to fix in coderaft-vault). On any vault that already went
+# through its first boot before a given client existed — i.e. every
+# already-provisioned install, since falconone/cve-proxy both shipped well
+# after vault Phase 0 — patching the file alone is therefore a NO-OP against
+# the live, running vault: it keeps rejecting that client (this is exactly
+# what surfaced as a 401 on `set cve-proxy/cve_engine_api_key`, previously
+# worked around with a manual `PUT /v1/admin/acl/cve-proxy` curl) until the
+# persisted ACL is reconciled through the vault's own authenticated admin
+# API. This closes that gap so update.sh does it itself instead of requiring
+# a manual live patch — additive-only (only ever touches the ONE named
+# client's entry, via the same admin endpoint's existing safety checks),
+# idempotent (no-ops once the live vault already has the entry), and
+# non-fatal if the vault is absent/sealed/unreachable (the acl.yaml seed
+# above still covers a genuine fresh install).
+_vault_acl_live_selfheal() {
+    local name="$1" cert_san="$2"
+    shift 2
+    local perms=("$@")
+
+    command -v docker >/dev/null 2>&1 || return 0
+    docker inspect coderaft-coderaft-vault-1 >/dev/null 2>&1 || return 0
+    [ -f "${INSTALL_DIR}/vault-tls/dashboard-api-client.crt" ] || return 0
+    [ -f "${INSTALL_DIR}/vault-tls/dashboard-api-client.key" ] || return 0
+    [ -f "${INSTALL_DIR}/vault-tls/client-ca.crt" ] || return 0
+
+    local project net abs_tls
+    project=$(docker inspect coderaft-coderaft-vault-1 --format '{{ index .Config.Labels "com.docker.compose.project" }}' 2>/dev/null || true)
+    [ -z "$project" ] && project="coderaft"
+    net="${project}_coderaft-vault-net"
+    abs_tls="$(cd "${INSTALL_DIR}/vault-tls" && pwd)"
+
+    _vault_curl_live() {
+        local method="$1" path="$2" body="${3:-}"
+        local args=(run --rm --user 0:0 --network "$net" -v "${abs_tls}:/tls:ro" curlimages/curl:latest
+            --cert /tls/dashboard-api-client.crt --key /tls/dashboard-api-client.key --cacert /tls/client-ca.crt
+            -sS -m 10 -X "$method" "https://coderaft-vault:8200${path}")
+        if [ -n "$body" ]; then
+            args+=(-H "Content-Type: application/json" -d "$body")
+        fi
+        docker "${args[@]}" 2>&1
+    }
+
+    local health
+    health=$(_vault_curl_live GET /v1/health)
+    if ! echo "$health" | grep -q '"sealed":false'; then
+        echo "  [update] Vault ACL live self-heal (${name}): vault sealed/unreachable — skipped, will apply on the vault's next real bootstrap"
+        return 0
+    fi
+
+    local current
+    current=$(_vault_curl_live GET /v1/admin/acl)
+    if echo "$current" | grep -q "\"name\":\"${name}\""; then
+        return 0
+    fi
+
+    local perms_json="" p
+    for p in "${perms[@]}"; do perms_json="${perms_json},\"${p}\""; done
+    perms_json="[${perms_json#,}]"
+
+    local resp
+    resp=$(_vault_curl_live PUT "/v1/admin/acl/${name}" "{\"cert_san\":\"${cert_san}\",\"permissions\":${perms_json}}")
+    if echo "$resp" | grep -q '"ok":true'; then
+        echo "  [update] Vault ACL live self-heal: ${name} granted on the RUNNING vault (acl.yaml alone would not have reached it)"
+    else
+        echo "  [update] Vault ACL live self-heal: PUT /v1/admin/acl/${name} failed — will retry on next update: ${resp}" >&2
+    fi
+}
+
 # ── Vault client cert self-heal (any product whose cert was never
 # generated, e.g. falconone/cve-proxy on installs provisioned before they
 # shipped) — additive-only, requires client-ca.key to still be present.
@@ -1267,6 +1343,12 @@ ACLEOF
 # permissions healed.
 _falconone_tls_bootstrap "${INSTALL_DIR}"
 _falconone_acl_selfheal "${INSTALL_DIR}/vault-config/acl.yaml"
+_vault_acl_live_selfheal "falconone" "falconone.coderaft.local" \
+    "read:license_key" "read:falconone_*" "read:platform/identity/oidc" \
+    "sign:falconone_agent_cert" "read:falconone/nvd_api_key" \
+    "read:falconone/audit_hmac_key" "write:falconone/audit_hmac_key" \
+    "read:falconone/pki/agents-ca/cert" "read:pki/falconone-agents-ca*" \
+    "write:pki/falconone-agents-ca*"
 
 # ── cve-proxy vault client cert + ACL self-heal ──────────────────────────────
 # coderaft-cve-proxy is a shared platform sidecar, not tied to any single
@@ -1276,6 +1358,8 @@ _falconone_acl_selfheal "${INSTALL_DIR}/vault-config/acl.yaml"
 _vault_client_cert_selfheal "falconone" "falconone.coderaft.local"
 _vault_client_cert_selfheal "cve-proxy" "cve-proxy.coderaft.local"
 _cveproxy_acl_selfheal "${INSTALL_DIR}/vault-config/acl.yaml"
+_vault_acl_live_selfheal "cve-proxy" "cve-proxy.coderaft.local" \
+    "read:cve-proxy/*" "write:cve-proxy/*"
 
 # ── Banking-grade plaintext .env handling ──────────────────────────────────
 # B-PLAINTEXT-PURGE (2026-06-14): The previous block deleted .env when an
