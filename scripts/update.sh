@@ -25,6 +25,21 @@ HEALTHCHECK_RETRIES="${HEALTHCHECK_RETRIES:-30}"
 HEALTHCHECK_DELAY="${HEALTHCHECK_DELAY:-3}"
 INSTALL_DIR="${INSTALL_DIR:-$PWD}"
 
+# ── install-config.env: install-time / public config, NEVER encrypted ──────
+# Task #150 (2026-07-31): HOST_PROJECT_DIR / CODERAFT_HOST_OS / CODERAFT_HOST_ARCH
+# are not secrets. They used to be written straight into .env (then swept into
+# .env.enc by SOPS) — this file is now their canonical home, plaintext, mode
+# 600, NEVER passed to `sops --encrypt`. Defined this early (before the first
+# `docker compose` call below) so every invocation in this script — including
+# ADMIN_TOKEN auto-discovery — can pass `--env-file install-config.env
+# --env-file .env` consistently. The file is created empty if this is the
+# first run of a #150-aware update.sh on an older install; the self-heal
+# blocks further down backfill its actual content.
+INSTALL_CONFIG_PATH="${INSTALL_DIR}/install-config.env"
+touch "$INSTALL_CONFIG_PATH" 2>/dev/null || true
+chmod 600 "$INSTALL_CONFIG_PATH" 2>/dev/null || true
+COMPOSE_ENV_ARGS=(--env-file "$INSTALL_CONFIG_PATH" --env-file "${INSTALL_DIR}/.env")
+
 # ── Argument parsing ───────────────────────────────────────────────────────
 # --product <slug>  Update ONE product only (granular update). Delegates to
 #                   the dashboard-api per-product endpoint, which snapshots
@@ -109,8 +124,8 @@ discover_admin_token() {
     # 5. Auto-discovery from running dashboard-api container (preferred,
     #    avoids any manual setup — dashboard-api auto-generates the token
     #    at boot and persists it to /data/admin_token).
-    if (cd "$INSTALL_DIR" 2>/dev/null && docker compose ps --services 2>/dev/null | grep -q '^dashboard-api$'); then
-        val=$(cd "$INSTALL_DIR" && docker compose exec -T dashboard-api cat /data/admin_token 2>/dev/null < /dev/null | tr -d '[:space:]')
+    if (cd "$INSTALL_DIR" 2>/dev/null && docker compose "${COMPOSE_ENV_ARGS[@]}" ps --services 2>/dev/null | grep -q '^dashboard-api$'); then
+        val=$(cd "$INSTALL_DIR" && docker compose "${COMPOSE_ENV_ARGS[@]}" exec -T dashboard-api cat /data/admin_token 2>/dev/null < /dev/null | tr -d '[:space:]')
         if [ -n "$val" ]; then
             printf '%s' "$val"
             return 0
@@ -247,19 +262,67 @@ if [ -z "$CODERAFT_UPDATE_REEXEC" ]; then
     fi
 fi
 
-# ── Self-heal CODERAFT_HOST_OS in .env (B25) ──────────────────────────────
+# ── install-config.env helpers (see bootstrap near top of script, task #150) ─
+# NOTE: `grep ... > file.tmp && mv file.tmp file` creates file.tmp with the
+# CURRENT umask, not the original file's mode — an explicit chmod 600 after
+# every mv is required or a rewrite silently loosens permissions (regression
+# caught in review: the pre-#150 HOST_PROJECT_DIR self-heal had this chmod
+# inline; refactoring it into a shared helper must keep it).
+upsert_install_config() {
+    local key="$1" val="$2"
+    if grep -q "^${key}=" "$INSTALL_CONFIG_PATH" 2>/dev/null; then
+        grep -v "^${key}=" "$INSTALL_CONFIG_PATH" > "${INSTALL_CONFIG_PATH}.tmp" \
+            && printf '%s=%s\n' "$key" "$val" >> "${INSTALL_CONFIG_PATH}.tmp" \
+            && mv "${INSTALL_CONFIG_PATH}.tmp" "$INSTALL_CONFIG_PATH"
+    else
+        printf '%s=%s\n' "$key" "$val" >> "$INSTALL_CONFIG_PATH"
+    fi
+    chmod 600 "$INSTALL_CONFIG_PATH" 2>/dev/null || true
+}
+strip_from_main_env() {
+    local key="$1"
+    local env_path="${INSTALL_DIR}/.env"
+    if [ -f "$env_path" ] && grep -qE "^${key}=" "$env_path" 2>/dev/null; then
+        grep -vE "^${key}=" "$env_path" > "${env_path}.tmp" && mv "${env_path}.tmp" "$env_path"
+        chmod 600 "$env_path" 2>/dev/null || true
+    fi
+}
+
+# ── Self-heal CODERAFT_HOST_OS in install-config.env (B25) ────────────────
 # Les installs antérieures préservaient .env sans ajouter CODERAFT_HOST_OS.
 # Dashboard-api lit cette valeur pour le mode capture (native vs sidecar).
+# Migration #150 : si une valeur existe encore dans l'ancien .env (installs
+# pré-#150), on la déplace vers install-config.env plutôt que de la dupliquer.
 ENV_PATH_HO="${INSTALL_DIR}/.env"
-if [ -f "$ENV_PATH_HO" ] && ! grep -qE '^\s*CODERAFT_HOST_OS\s*=' "$ENV_PATH_HO"; then
-    case "$(uname -s)" in
-        Darwin) HOST_OS_VAL="macos" ;;
-        Linux)  HOST_OS_VAL="linux" ;;
-        *)      HOST_OS_VAL="linux" ;;
-    esac
-    printf '\nCODERAFT_HOST_OS=%s\n' "$HOST_OS_VAL" >> "$ENV_PATH_HO"
-    echo "  ✓ Self-heal .env — CODERAFT_HOST_OS=$HOST_OS_VAL ajouté"
+if ! grep -qE '^\s*CODERAFT_HOST_OS\s*=' "$INSTALL_CONFIG_PATH" 2>/dev/null; then
+    if [ -f "$ENV_PATH_HO" ] && grep -qE '^\s*CODERAFT_HOST_OS\s*=' "$ENV_PATH_HO"; then
+        HOST_OS_VAL=$(grep -E '^\s*CODERAFT_HOST_OS\s*=' "$ENV_PATH_HO" | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | xargs)
+        upsert_install_config CODERAFT_HOST_OS "$HOST_OS_VAL"
+        echo "  ✓ CODERAFT_HOST_OS migré .env → install-config.env ($HOST_OS_VAL)"
+    else
+        case "$(uname -s)" in
+            Darwin) HOST_OS_VAL="macos" ;;
+            Linux)  HOST_OS_VAL="linux" ;;
+            *)      HOST_OS_VAL="linux" ;;
+        esac
+        upsert_install_config CODERAFT_HOST_OS "$HOST_OS_VAL"
+        echo "  ✓ Self-heal install-config.env — CODERAFT_HOST_OS=$HOST_OS_VAL ajouté"
+    fi
 fi
+strip_from_main_env "CODERAFT_HOST_OS"
+if ! grep -qE '^\s*CODERAFT_HOST_ARCH\s*=' "$INSTALL_CONFIG_PATH" 2>/dev/null; then
+    if [ -f "$ENV_PATH_HO" ] && grep -qE '^\s*CODERAFT_HOST_ARCH\s*=' "$ENV_PATH_HO"; then
+        HOST_ARCH_VAL=$(grep -E '^\s*CODERAFT_HOST_ARCH\s*=' "$ENV_PATH_HO" | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | xargs)
+    else
+        case "$(uname -m)" in
+            arm64|aarch64) HOST_ARCH_VAL="arm64" ;;
+            x86_64|amd64)  HOST_ARCH_VAL="amd64" ;;
+            *)             HOST_ARCH_VAL="amd64" ;;
+        esac
+    fi
+    upsert_install_config CODERAFT_HOST_ARCH "$HOST_ARCH_VAL"
+fi
+strip_from_main_env "CODERAFT_HOST_ARCH"
 
 # ── Self-heal: docker-compose.yml drift (B24 — depends_on coderaft-vault) ──
 # Les installs antérieures déclaraient coderaft-vault avec
@@ -348,30 +411,23 @@ if [ -f "$OVERRIDE_PATH" ] && grep -qE '"7687:7687"|- 7687:7687' "$OVERRIDE_PATH
     echo "  ✓ Self-heal docker-compose.override.yml — neo4j 127.0.0.1 only + paramétrable"
 fi
 
-# ── Self-heal HOST_PROJECT_DIR in .env ────────────────────────────────────
+# ── Self-heal HOST_PROJECT_DIR in install-config.env ──────────────────────
 # Older oneliners (and any install where the dir was renamed/moved) leave
-# .env without HOST_PROJECT_DIR, which causes:
+# it without HOST_PROJECT_DIR, which causes:
 #   - docker compose warning "HOST_PROJECT_DIR not set" on every command
 #   - dashboard-api boots with empty HOST_PROJECT_DIR → cannot reach
 #     /host-compose paths → license.json invisible → fake "first run" UX
-# Always (re)write the line with the resolved current install dir.
+# Always (re)write the line with the resolved current install dir. Task #150:
+# canonical home is install-config.env, not .env — strip any legacy copy.
 if [ -f "$INSTALL_DIR/.env" ]; then
     ABSOLUTE_INSTALL_DIR="$(cd "$INSTALL_DIR" && pwd)"
     if [ -n "$ABSOLUTE_INSTALL_DIR" ]; then
-        if grep -q '^HOST_PROJECT_DIR=' "$INSTALL_DIR/.env" 2>/dev/null; then
-            CURRENT=$(grep '^HOST_PROJECT_DIR=' "$INSTALL_DIR/.env" | head -1 | cut -d= -f2-)
-            if [ "$CURRENT" != "$ABSOLUTE_INSTALL_DIR" ]; then
-                grep -v '^HOST_PROJECT_DIR=' "$INSTALL_DIR/.env" > "$INSTALL_DIR/.env.tmp" \
-                    && printf 'HOST_PROJECT_DIR=%s\n' "$ABSOLUTE_INSTALL_DIR" >> "$INSTALL_DIR/.env.tmp" \
-                    && mv "$INSTALL_DIR/.env.tmp" "$INSTALL_DIR/.env" \
-                    && chmod 600 "$INSTALL_DIR/.env" \
-                    && echo "  ✓ HOST_PROJECT_DIR refreshed ($ABSOLUTE_INSTALL_DIR)"
-            fi
-        else
-            printf 'HOST_PROJECT_DIR=%s\n' "$ABSOLUTE_INSTALL_DIR" >> "$INSTALL_DIR/.env"
-            chmod 600 "$INSTALL_DIR/.env" 2>/dev/null || true
-            echo "  ✓ HOST_PROJECT_DIR added ($ABSOLUTE_INSTALL_DIR)"
+        CURRENT=$(grep '^HOST_PROJECT_DIR=' "$INSTALL_CONFIG_PATH" 2>/dev/null | head -1 | cut -d= -f2-)
+        if [ "$CURRENT" != "$ABSOLUTE_INSTALL_DIR" ]; then
+            upsert_install_config HOST_PROJECT_DIR "$ABSOLUTE_INSTALL_DIR"
+            echo "  ✓ HOST_PROJECT_DIR refreshed in install-config.env ($ABSOLUTE_INSTALL_DIR)"
         fi
+        strip_from_main_env "HOST_PROJECT_DIR"
     fi
 fi
 
@@ -384,7 +440,7 @@ fi
 # clean override, then we continue normally.
 echo ""
 echo "  Checking compose integrity..."
-if ! docker compose ps >/dev/null 2>&1; then
+if ! docker compose "${COMPOSE_ENV_ARGS[@]}" ps >/dev/null 2>&1; then
     echo "  ⚠ docker-compose.override.yml appears corrupted — auto-recovery..."
     if [ -f "docker-compose.override.yml" ]; then
         cp docker-compose.override.yml "docker-compose.override.yml.broken-$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
@@ -392,9 +448,9 @@ if ! docker compose ps >/dev/null 2>&1; then
         echo "    ✓ override backed up + removed"
     fi
     docker pull ghcr.io/liamj74/coderaft-dashboard-api:latest >/dev/null 2>&1 || true
-    if docker compose up -d postgres redis dashboard-api >/dev/null 2>&1; then
+    if docker compose "${COMPOSE_ENV_ARGS[@]}" up -d postgres redis dashboard-api >/dev/null 2>&1; then
         sleep 6
-        if docker compose ps >/dev/null 2>&1; then
+        if docker compose "${COMPOSE_ENV_ARGS[@]}" ps >/dev/null 2>&1; then
             echo "    ✓ compose repaired"
         else
             echo "  ERROR: self-heal failed. Inspect docker-compose.override.yml manually."
@@ -776,7 +832,7 @@ _vault_migration_needed() {
         echo "  ✓ Vault migration already complete (sentinel found)"
         return 1
     fi
-    if (cd "${INSTALL_DIR}" 2>/dev/null && docker compose ps coderaft-vault 2>/dev/null | grep -q "running"); then
+    if (cd "${INSTALL_DIR}" 2>/dev/null && docker compose "${COMPOSE_ENV_ARGS[@]}" ps coderaft-vault 2>/dev/null | grep -q "running"); then
         echo "  ✓ coderaft-vault already running — skipping migration"
         return 1
     fi
@@ -792,7 +848,7 @@ _vault_migration_needed() {
 _vault_migration_needed || true
 _VAULT_NEEDS_MIGRATION=0
 if ! [ -f "${INSTALL_DIR}/vault-data/.migrated" ] && \
-   ! (cd "${INSTALL_DIR}" 2>/dev/null && docker compose ps coderaft-vault 2>/dev/null | grep -q "running") 2>/dev/null; then
+   ! (cd "${INSTALL_DIR}" 2>/dev/null && docker compose "${COMPOSE_ENV_ARGS[@]}" ps coderaft-vault 2>/dev/null | grep -q "running") 2>/dev/null; then
     _VAULT_NEEDS_MIGRATION=1
 fi
 
@@ -817,20 +873,20 @@ if [ "${_VAULT_NEEDS_MIGRATION}" = "1" ]; then
     [ -f "${INSTALL_DIR}/.coderaft-age.key" ] && cp "${INSTALL_DIR}/.coderaft-age.key" "${_VAULT_BAK}/age.key"          || true
 
     # Postgres auth_config dump
-    if (cd "${INSTALL_DIR}" 2>/dev/null && docker compose ps postgres 2>/dev/null | grep -q "running") 2>/dev/null; then
-        cd "${INSTALL_DIR}" && docker compose exec -T postgres \
+    if (cd "${INSTALL_DIR}" 2>/dev/null && docker compose "${COMPOSE_ENV_ARGS[@]}" ps postgres 2>/dev/null | grep -q "running") 2>/dev/null; then
+        cd "${INSTALL_DIR}" && docker compose "${COMPOSE_ENV_ARGS[@]}" exec -T postgres \
             pg_dump -U coderaft -t auth_config coderaft < /dev/null 2>/dev/null \
             > "${_VAULT_BAK}/auth_config.sql" || true
         cd - >/dev/null
     fi
 
     # Docker cp for container-side files (best-effort — containers may not be running)
-    (cd "${INSTALL_DIR}" 2>/dev/null && docker compose ps ravenscan 2>/dev/null | grep -q "running") 2>/dev/null && \
-        (cd "${INSTALL_DIR}" && docker compose cp "ravenscan:.ravenscan/ravenscan.db" "${_VAULT_BAK}/ravenscan.db" 2>/dev/null || true)
-    (cd "${INSTALL_DIR}" 2>/dev/null && docker compose ps dashboard-api 2>/dev/null | grep -q "running") 2>/dev/null && {
+    (cd "${INSTALL_DIR}" 2>/dev/null && docker compose "${COMPOSE_ENV_ARGS[@]}" ps ravenscan 2>/dev/null | grep -q "running") 2>/dev/null && \
+        (cd "${INSTALL_DIR}" && docker compose "${COMPOSE_ENV_ARGS[@]}" cp "ravenscan:.ravenscan/ravenscan.db" "${_VAULT_BAK}/ravenscan.db" 2>/dev/null || true)
+    (cd "${INSTALL_DIR}" 2>/dev/null && docker compose "${COMPOSE_ENV_ARGS[@]}" ps dashboard-api 2>/dev/null | grep -q "running") 2>/dev/null && {
         cd "${INSTALL_DIR}"
-        docker compose cp "dashboard-api:/data/vault.enc"    "${_VAULT_BAK}/dashboard-vault.enc" 2>/dev/null || true
-        docker compose cp "dashboard-api:/data/admin_token"  "${_VAULT_BAK}/admin_token"         2>/dev/null || true
+        docker compose "${COMPOSE_ENV_ARGS[@]}" cp "dashboard-api:/data/vault.enc"    "${_VAULT_BAK}/dashboard-vault.enc" 2>/dev/null || true
+        docker compose "${COMPOSE_ENV_ARGS[@]}" cp "dashboard-api:/data/admin_token"  "${_VAULT_BAK}/admin_token"         2>/dev/null || true
         cd - >/dev/null
     }
     echo "  ✓ Pre-flight backup complete"
@@ -894,16 +950,16 @@ if [ "${_VAULT_NEEDS_MIGRATION}" = "1" ]; then
     # ── 4d Pull and start vault ────────────────────────────────────────────
     _VAULT_ROLLBACK() {
         echo "  ✗ Vault migration failed — rolling back..." >&2
-        (cd "${INSTALL_DIR}" 2>/dev/null && docker compose down 2>/dev/null) || true
+        (cd "${INSTALL_DIR}" 2>/dev/null && docker compose "${COMPOSE_ENV_ARGS[@]}" down 2>/dev/null) || true
         # Restore flat files
         [ -f "${_VAULT_BAK}/env" ]   && cp "${_VAULT_BAK}/env"   "${INSTALL_DIR}/.env"
         [ -f "${_VAULT_BAK}/env.enc" ] && cp "${_VAULT_BAK}/env.enc" "${INSTALL_DIR}/.env.enc"
         [ -f "${_VAULT_BAK}/age.key" ] && cp "${_VAULT_BAK}/age.key" "${INSTALL_DIR}/.coderaft-age.key"
         # Restore postgres
         if [ -s "${_VAULT_BAK}/auth_config.sql" ] && \
-           (cd "${INSTALL_DIR}" 2>/dev/null && docker compose up -d postgres 2>/dev/null); then
+           (cd "${INSTALL_DIR}" 2>/dev/null && docker compose "${COMPOSE_ENV_ARGS[@]}" up -d postgres 2>/dev/null); then
             sleep 5
-            (cd "${INSTALL_DIR}" && docker compose exec -T postgres \
+            (cd "${INSTALL_DIR}" && docker compose "${COMPOSE_ENV_ARGS[@]}" exec -T postgres \
                 psql -U coderaft coderaft < "${_VAULT_BAK}/auth_config.sql" > /dev/null 2>&1 || true)
         fi
         # Remove vault from compose if present (revert)
@@ -916,7 +972,7 @@ txt = open('${INSTALL_DIR}/docker-compose.yml').read()
 print('  ⚠ Remove coderaft-vault service from docker-compose.yml manually', file=sys.stderr)
 " 2>/dev/null || echo "  ⚠ Remove coderaft-vault from docker-compose.yml manually" >&2
         fi
-        (cd "${INSTALL_DIR}" 2>/dev/null && docker compose up -d 2>/dev/null) || true
+        (cd "${INSTALL_DIR}" 2>/dev/null && docker compose "${COMPOSE_ENV_ARGS[@]}" up -d 2>/dev/null) || true
         echo ""
         echo "  Rollback complete. Backup is at: ${_VAULT_BAK}" >&2
         echo "  The legacy secrets stores are intact." >&2
@@ -1000,6 +1056,8 @@ VAULTOVERRIDE
     else
         _VAULT_COMPOSE_ARGS=(-f "${INSTALL_DIR}/docker-compose.yml" -f "${INSTALL_DIR}/docker-compose.vault.yml")
     fi
+    # Task #150: both env files, always explicit (see COMPOSE_ENV_ARGS above).
+    _VAULT_COMPOSE_ARGS+=(--env-file "${INSTALL_CONFIG_PATH}" --env-file "${INSTALL_DIR}/.env")
 
     # B9 fix: explicit stop+rm guarantees the container reloads cert/config
     # from bind mounts. --force-recreate alone has been observed to leave
@@ -1116,28 +1174,29 @@ VAULTOVERRIDE
     echo "  Migrating secrets to vault..."
     _VAULT_MIGRATE_OK=1
 
-    # a. LICENSE_KEY
-    _LK=$(_env_val LICENSE_KEY)
-    if [ -n "$_LK" ]; then
-        _vault_set "license_key" "$_LK" || { _VAULT_MIGRATE_OK=0; echo "  ✗ Failed to migrate license_key" >&2; }
-        _READBACK=$(_vault_get "license_key")
-        [ "$_READBACK" = "$_LK" ] || { _VAULT_MIGRATE_OK=0; echo "  ✗ Round-trip verify failed: license_key" >&2; }
-    fi
+    # Task #150 (2026-07-31): LICENSE_KEY / REDFOX_LICENSE_KEY / RAVENSCAN_LICENSE_KEY
+    # migration removed. All three are dead since #166 (2026-07-28): the license
+    # no longer lives in .env/docker-compose at all — dashboard-api reads it
+    # exclusively from Coderaft Vault (hydrateLicenseFromVault()), and each
+    # product now pulls the resolved key live from dashboard-api's internal
+    # endpoint instead of a boot-time env var (confirmed for Ravenscan in
+    # /Users/liam/secaudit/internal/license/dashboard_client.go +
+    # internal/cli/serve.go, both explicit about the 2026-07-28 migration;
+    # `grep -r "os.Getenv(\"RAVENSCAN_LICENSE_KEY\")"` returns zero hits in that
+    # repo). Migrating an already-dead value into the vault serves no purpose.
 
     # b-f. Infrastructure / product secrets from .env
     for _SECRET_MAP in \
         "POSTGRES_PASSWORD:postgres_password" \
         "REDIS_PASSWORD:redis_password" \
-        "DASHBOARD_SECRET:dashboard_secret_legacy" \
+        "DASHBOARD_SECRET:dashboard_secret" \
         "NEO4J_PASSWORD:neo4j_password" \
         "RAVENSCAN_SECRET_KEY:ravenscan_secret_key" \
         "RAVENSCAN_CAPTURE_TOKEN:ravenscan_capture_token" \
-        "RAVENSCAN_LICENSE_KEY:ravenscan_license_key" \
         "REDFOX_MASTER_PASSPHRASE:redfox_master_passphrase" \
         "REDFOX_JWT_PRIVATE_KEY:redfox_jwt_private_key" \
         "REDFOX_JWT_PUBLIC_KEY:redfox_jwt_public_key" \
-        "REDFOX_GW_SESSION_SECRET:redfox_gw_session_secret" \
-        "REDFOX_LICENSE_KEY:redfox_license_key"; do
+        "REDFOX_GW_SESSION_SECRET:redfox_gw_session_secret"; do
         _ENV_KEY="${_SECRET_MAP%%:*}"
         _VAULT_KEY="${_SECRET_MAP##*:}"
         _VAL=$(_env_val "$_ENV_KEY")
@@ -1406,8 +1465,8 @@ fi
 echo ""
 echo "  Live Capture sanity check..."
 HOST_OS_VALUE=""
-if [ -f .env ]; then
-    HOST_OS_VALUE=$(grep -E '^\s*CODERAFT_HOST_OS\s*=' .env 2>/dev/null | tail -1 | cut -d= -f2 | tr -d '"' | tr -d "'" | tr '[:upper:]' '[:lower:]' | xargs)
+if [ -f "$INSTALL_CONFIG_PATH" ]; then
+    HOST_OS_VALUE=$(grep -E '^\s*CODERAFT_HOST_OS\s*=' "$INSTALL_CONFIG_PATH" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d '"' | tr -d "'" | tr '[:upper:]' '[:lower:]' | xargs)
 fi
 case "$HOST_OS_VALUE" in
     windows|macos)
@@ -1438,13 +1497,13 @@ mkdir -p "$BACKUP_DIR"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 BACKUP_FILE="$BACKUP_DIR/preupdate-${TIMESTAMP}.sql.gz"
 
-if docker compose ps postgres --quiet 2>/dev/null | grep -q .; then
+if docker compose "${COMPOSE_ENV_ARGS[@]}" ps postgres --quiet 2>/dev/null | grep -q .; then
     # `< /dev/null` is CRITICAL: without it, `docker compose exec -T` inherits
     # stdin, and when the updater is launched via `curl … | bash`, stdin = pipe
     # containing the rest of the script that bash has not read yet. docker exec
     # drains those bytes → bash hits EOF prematurely and the script exits
     # silently after "Backup saved" (no error, no rollback).
-    if docker compose exec -T postgres pg_dumpall -U coderaft < /dev/null 2>/dev/null | gzip > "$BACKUP_FILE"; then
+    if docker compose "${COMPOSE_ENV_ARGS[@]}" exec -T postgres pg_dumpall -U coderaft < /dev/null 2>/dev/null | gzip > "$BACKUP_FILE"; then
         echo "  Backup saved: $BACKUP_FILE"
     else
         echo "  ERROR: pg_dump failed. Update cancelled (no backup = no update)."
@@ -1491,6 +1550,9 @@ if { [ -f "./docker-compose.vault.yml" ] || [ -f "./vault-data/.migrated" ]; } &
     fi
     COMPOSE_ARGS+=(-f ./docker-compose.vault.yml)
 fi
+# Task #150: install-config.env (plaintext config) + .env (secrets) — both
+# always explicit so compose interpolation never silently loses either.
+COMPOSE_ARGS+=(--env-file ./install-config.env --env-file ./.env)
 
 IMAGES_TO_UPDATE=()
 

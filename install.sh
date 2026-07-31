@@ -169,15 +169,56 @@ gen_hex() { openssl rand -hex "$1" 2>/dev/null || head -c "$1" /dev/urandom | od
 
 ABSOLUTE_INSTALL_DIR="$(pwd)"
 
+# ── install-config.env: install-time / public config, NEVER encrypted ──────
+# Task #150 (2026-07-31): HOST_PROJECT_DIR / CODERAFT_HOST_OS / CODERAFT_HOST_ARCH
+# are not secrets — they used to be written straight into .env, which then got
+# swept into .env.enc by SOPS below, conflating install-time topology with real
+# credentials (root cause referenced literally as #150 in dashboard-api's own
+# comments). They now live in their own plaintext file, mode 600, that is
+# NEVER passed to `sops --encrypt`. docker-compose interpolation reads it via
+# `--env-file install-config.env --env-file .env` (see every `docker compose`
+# invocation below and in start.sh/stop.sh/update.sh).
+upsert_install_config() {
+    local key="$1" val="$2"
+    if [ -f install-config.env ] && grep -q "^${key}=" install-config.env 2>/dev/null; then
+        grep -v "^${key}=" install-config.env > install-config.env.tmp \
+            && printf '%s=%s\n' "$key" "$val" >> install-config.env.tmp \
+            && mv install-config.env.tmp install-config.env
+    else
+        printf '%s=%s\n' "$key" "$val" >> install-config.env
+    fi
+    # Defense-in-depth: `> file.tmp && mv` creates file.tmp under the current
+    # umask, not the original mode — belt-and-braces even though every call
+    # site today already re-asserts chmod 600 right after.
+    chmod 600 install-config.env 2>/dev/null || true
+}
+
 if [ -f ".env" ] && grep -q '^POSTGRES_PASSWORD=' .env 2>/dev/null; then
-    # Always (re)write HOST_PROJECT_DIR with current install dir — the location
-    # may have changed since the previous install, and a stale or missing value
-    # breaks docker-compose interpolation (warning + empty bind-mount path →
-    # dashboard-api cannot reach .env.enc → fake "first run").
-    grep -v '^HOST_PROJECT_DIR=' .env > .env.tmp 2>/dev/null \
-        && printf 'HOST_PROJECT_DIR=%s\n' "${ABSOLUTE_INSTALL_DIR}" >> .env.tmp \
-        && mv .env.tmp .env \
-        && chmod 600 .env
+    # Existing install. Always (re)write HOST_PROJECT_DIR with the current
+    # install dir — the location may have changed since the previous install,
+    # and a stale or missing value breaks docker-compose interpolation
+    # (warning + empty bind-mount path → dashboard-api cannot reach .env.enc
+    # → fake "first run").
+    touch install-config.env
+    upsert_install_config HOST_PROJECT_DIR "${ABSOLUTE_INSTALL_DIR}"
+    # Backfill CODERAFT_HOST_OS/ARCH from install-config.env if already there
+    # (re-run of the new installer), else from .env (upgrade from a version
+    # that still wrote them there), else from the OS/arch detected above.
+    if grep -q '^CODERAFT_HOST_OS=' install-config.env 2>/dev/null; then
+        :
+    elif grep -q '^CODERAFT_HOST_OS=' .env 2>/dev/null; then
+        upsert_install_config CODERAFT_HOST_OS "$(grep '^CODERAFT_HOST_OS=' .env | head -1 | cut -d= -f2-)"
+        upsert_install_config CODERAFT_HOST_ARCH "$(grep '^CODERAFT_HOST_ARCH=' .env | head -1 | cut -d= -f2- || echo "${CODERAFT_ARCH}")"
+    else
+        upsert_install_config CODERAFT_HOST_OS "${CODERAFT_OS}"
+        upsert_install_config CODERAFT_HOST_ARCH "${CODERAFT_ARCH}"
+    fi
+    # Strip any legacy copies from .env now that install-config.env is authoritative.
+    if grep -qE '^(HOST_PROJECT_DIR|CODERAFT_HOST_OS|CODERAFT_HOST_ARCH)=' .env 2>/dev/null; then
+        grep -vE '^(HOST_PROJECT_DIR|CODERAFT_HOST_OS|CODERAFT_HOST_ARCH)=' .env > .env.tmp \
+            && mv .env.tmp .env
+    fi
+    chmod 600 .env install-config.env
     # Backward compat: legacy install without .env.enc — show warning in dashboard
     if [ ! -f "${AGE_KEY_LOCAL}" ] && [ ! -f "${AGE_KEY_PATH}" ]; then
         echo "  ⚠ Legacy install detected: no age key found."
@@ -192,14 +233,27 @@ else
 POSTGRES_PASSWORD=$(gen_hex 24)
 REDIS_PASSWORD=$(gen_hex 24)
 DASHBOARD_SECRET=$(gen_hex 32)
-HOST_PROJECT_DIR=${ABSOLUTE_INSTALL_DIR}
 RAVENSCAN_CAPTURE_TOKEN=$(gen_hex 32)
-CODERAFT_HOST_OS=${CODERAFT_OS}
-CODERAFT_HOST_ARCH=${CODERAFT_ARCH}
 ENVFILE
     chmod 600 .env
+    cat > install-config.env << CONFIGFILE
+# CodeRaft — install-time / public config (NOT a secret, NEVER SOPS-encrypted)
+# $(date -u +"%Y-%m-%d")
+HOST_PROJECT_DIR=${ABSOLUTE_INSTALL_DIR}
+CODERAFT_HOST_OS=${CODERAFT_OS}
+CODERAFT_HOST_ARCH=${CODERAFT_ARCH}
+CONFIGFILE
+    chmod 600 install-config.env
     echo "  ✓ Secrets generated"
+    echo "  ✓ install-config.env generated"
 fi
+
+# Every `docker compose` invocation from here on must read BOTH files —
+# install-config.env (plaintext config) first, then .env (secrets) so a
+# stray key collision (should never happen, see #150 var lists) resolves in
+# favor of the secrets file. Order has no practical effect today since the
+# two files are disjoint by construction.
+COMPOSE_ENV_ARGS=(--env-file install-config.env --env-file .env)
 
 # ── Encrypt .env → .env.enc and purge plaintext (banking-grade) ─────────────
 # Runs on first install OR on a re-install where plaintext is still around. The
@@ -1305,7 +1359,7 @@ trust_caddy_ca() {
 
     # Detect the active TLS mode from the running Caddyfile
     local caddyfile
-    caddyfile="$(docker compose exec -T caddy cat /etc/caddy/Caddyfile 2>/dev/null || true)"
+    caddyfile="$(docker compose "${COMPOSE_ENV_ARGS[@]}" exec -T caddy cat /etc/caddy/Caddyfile 2>/dev/null || true)"
     local tls_mode="unknown"
     if echo "$caddyfile" | grep -qE '^\s*tls\s+internal\s*$'; then
         tls_mode="internal"
@@ -1338,7 +1392,7 @@ trust_caddy_ca() {
             echo "  Waiting for Caddy to generate its internal CA (max 30s)…"
             local i ca_ready=0
             for i in $(seq 1 15); do
-                if docker compose exec -T caddy test -f "$ca_container_path" >/dev/null 2>&1; then
+                if docker compose "${COMPOSE_ENV_ARGS[@]}" exec -T caddy test -f "$ca_container_path" >/dev/null 2>&1; then
                     ca_ready=1
                     break
                 fi
@@ -1349,7 +1403,7 @@ trust_caddy_ca() {
                 echo "    Download it later from the dashboard: Setup → TLS → Download CA."
                 return 1
             fi
-            if ! docker compose cp "caddy:${ca_container_path}" caddy-root.crt >/dev/null 2>&1; then
+            if ! docker compose "${COMPOSE_ENV_ARGS[@]}" cp "caddy:${ca_container_path}" caddy-root.crt >/dev/null 2>&1; then
                 echo "  ⚠ Could not export the Caddy root CA — skipping trust install."
                 return 1
             fi
@@ -1430,10 +1484,13 @@ ensure_hosts_entry() {
 ensure_hosts_entry || true
 
 # Helper scripts
+# Task #150: both env files are always passed explicitly — install-config.env
+# (plaintext config) + .env (secrets, plaintext or SOPS-managed depending on
+# migration state) — so compose interpolation never silently loses either.
 cat > start.sh << 'EOF'
 #!/bin/bash
 echo "Starting CodeRaft..."
-docker compose up -d
+docker compose --env-file install-config.env --env-file .env up -d
 if grep -q "coderaft.local" /etc/hosts 2>/dev/null; then
     echo "  Dashboard: https://coderaft.local"
 else
@@ -1444,14 +1501,14 @@ EOF
 cat > stop.sh << 'EOF'
 #!/bin/bash
 echo "Stopping CodeRaft..."
-docker compose down
+docker compose --env-file install-config.env --env-file .env down
 echo "  Done."
 EOF
 
 curl -fsSL "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/update.sh" -o update.sh 2>/dev/null || cat > update.sh << 'EOF'
 #!/bin/bash
 echo "Updating CodeRaft..."
-docker compose pull && docker compose up -d --force-recreate --remove-orphans
+docker compose --env-file install-config.env --env-file .env pull && docker compose --env-file install-config.env --env-file .env up -d --force-recreate --remove-orphans
 echo "  Updated! Dashboard: http://localhost:3000"
 EOF
 
@@ -1602,7 +1659,7 @@ if [ "${CODERAFT_TEST_MODE:-0}" = "1" ]; then
 else
     echo ""
     echo "  Pulling platform images..."
-    if ! docker compose pull; then
+    if ! docker compose "${COMPOSE_ENV_ARGS[@]}" pull; then
         echo ""
         echo "  ✗ Image pull failed. Aborting install."
         echo "    Check Docker daemon, network connectivity, or GHCR auth."
@@ -1614,9 +1671,9 @@ else
     # B9 fix: explicit stop+rm for vault container before up so fresh certs
     # are picked up from bind mounts (--force-recreate alone can leave a
     # Running container with stale certs in Docker Desktop memory).
-    docker compose stop coderaft-vault 2>/dev/null || true
-    docker compose rm -f coderaft-vault 2>/dev/null || true
-    if ! docker compose up -d; then
+    docker compose "${COMPOSE_ENV_ARGS[@]}" stop coderaft-vault 2>/dev/null || true
+    docker compose "${COMPOSE_ENV_ARGS[@]}" rm -f coderaft-vault 2>/dev/null || true
+    if ! docker compose "${COMPOSE_ENV_ARGS[@]}" up -d; then
         echo ""
         echo "  ✗ docker compose up failed. Aborting install."
         echo "    Run 'docker compose logs' to investigate."

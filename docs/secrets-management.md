@@ -18,9 +18,12 @@ La règle stricte est : **aucun secret en clair sur disque** (`feedback_no_plain
 /etc/coderaft/age.pub      ← clé publique correspondante (dans age.key, ligne "# public key:")
 .env.enc                   ← fichier chiffré (dans Git, commit et versioning OK)
 .env                       ← gitignored, généré au boot par sops --decrypt
+install-config.env         ← gitignored, JAMAIS chiffré (config install-time non-secrète)
 ```
 
 Au démarrage de chaque conteneur produit, l'entrypoint détecte si `/run/secrets/age.key` et `.env.enc` sont présents, et décrypte automatiquement.
+
+**`install-config.env` (task #150, 2026-07-31)** : `HOST_PROJECT_DIR` / `CODERAFT_HOST_OS` / `CODERAFT_HOST_ARCH` ne sont pas des secrets — ce sont des paramètres d'installation publics (chemin hôte, OS/arch détectés). Les mélanger avec les vrais secrets dans `.env` avant chiffrement SOPS n'apportait aucune protection et compliquait le périmètre d'audit. Ils vivent désormais dans `install-config.env`, toujours en clair, mode 600, jamais passé à `sops --encrypt`. `install.sh`/`update.sh` (et leurs équivalents `.ps1`) invoquent systématiquement `docker compose --env-file install-config.env --env-file .env ...` pour que l'interpolation Compose voit les deux fichiers.
 
 ---
 

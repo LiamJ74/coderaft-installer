@@ -44,6 +44,43 @@ $HEALTHCHECK_RETRIES = if ($env:HEALTHCHECK_RETRIES) { [int]$env:HEALTHCHECK_RET
 $HEALTHCHECK_DELAY   = if ($env:HEALTHCHECK_DELAY)   { [int]$env:HEALTHCHECK_DELAY }   else { 3 }
 $INSTALL_DIR         = if ($env:INSTALL_DIR)         { $env:INSTALL_DIR }         else { (Get-Location).Path }
 
+# ── install-config.env: install-time / public config, NEVER encrypted ──────
+# Task #150 (2026-07-31): HOST_PROJECT_DIR / CODERAFT_HOST_OS / CODERAFT_HOST_ARCH
+# are not secrets. They used to be written straight into .env (then swept into
+# .env.enc by SOPS) — this file is now their canonical home, plaintext, NEVER
+# passed to SOPS. Defined this early so every `docker compose` call in this
+# script can pass `--env-file install-config.env --env-file .env` (mirrors
+# $ComposeEnvArgs in install.ps1). Created empty here if this is the first run
+# of a #150-aware update.ps1 on an older install; self-heal blocks further
+# down backfill its actual content.
+$INSTALL_CONFIG_PATH = Join-Path $INSTALL_DIR "install-config.env"
+if (-not (Test-Path $INSTALL_CONFIG_PATH)) {
+    [System.IO.File]::WriteAllText($INSTALL_CONFIG_PATH, "", [System.Text.UTF8Encoding]::new($false))
+}
+function Set-InstallConfigVar($Key, $Value) {
+    $text = [System.IO.File]::ReadAllText($script:INSTALL_CONFIG_PATH, [System.Text.UTF8Encoding]::new($false))
+    $lines = $text -split "`r?`n" | Where-Object { $_ -notmatch "^$Key=" -and $_ -ne "" }
+    $lines += "$Key=$Value"
+    [System.IO.File]::WriteAllText($script:INSTALL_CONFIG_PATH, (($lines -join "`n") + "`n"), [System.Text.UTF8Encoding]::new($false))
+}
+function Get-InstallConfigVar($Key) {
+    if (-not (Test-Path $script:INSTALL_CONFIG_PATH)) { return $null }
+    $m = Select-String -Path $script:INSTALL_CONFIG_PATH -Pattern "^$Key=(.+)$"
+    if ($m) { return $m.Matches.Groups[1].Value }
+    return $null
+}
+function Remove-FromMainEnv($Key) {
+    $envPath = Join-Path $INSTALL_DIR ".env"
+    if (Test-Path $envPath) {
+        $text = [System.IO.File]::ReadAllText($envPath, [System.Text.UTF8Encoding]::new($false))
+        if ($text -match "(?m)^$Key=") {
+            $lines = $text -split "`r?`n" | Where-Object { $_ -notmatch "^$Key=" }
+            [System.IO.File]::WriteAllText($envPath, (($lines -join "`n").TrimEnd() + "`n"), [System.Text.UTF8Encoding]::new($false))
+        }
+    }
+}
+$ComposeEnvArgs = @("--env-file", $INSTALL_CONFIG_PATH, "--env-file", (Join-Path $INSTALL_DIR ".env"))
+
 # ── Windows Defender exclusion ───────────────────────────────────────────
 # `docker compose pull` writes fresh signed binaries into the install dir
 # on every update. Defender can quarantine a just-pulled executable mid-
@@ -108,7 +145,7 @@ function Find-AdminToken {
         # as NativeCommandError in PS 5.1. Use Start-Process + temp files.
         $svcStdout = Join-Path $env:TEMP "coderaft-svc-out-$(Get-Random).log"
         $svcStderr = Join-Path $env:TEMP "coderaft-svc-err-$(Get-Random).log"
-        $svcProc = Start-Process -FilePath "docker" -ArgumentList @("compose","ps","--services") `
+        $svcProc = Start-Process -FilePath "docker" -ArgumentList (@("compose") + $ComposeEnvArgs + @("ps","--services")) `
             -NoNewWindow -PassThru `
             -RedirectStandardOutput $svcStdout `
             -RedirectStandardError  $svcStderr `
@@ -122,7 +159,7 @@ function Find-AdminToken {
         if ($services -match '(?m)^dashboard-api$') {
             $catStdout = Join-Path $env:TEMP "coderaft-cat-out-$(Get-Random).log"
             $catStderr = Join-Path $env:TEMP "coderaft-cat-err-$(Get-Random).log"
-            $catProc = Start-Process -FilePath "docker" -ArgumentList @("compose","exec","-T","dashboard-api","cat","/data/admin_token") `
+            $catProc = Start-Process -FilePath "docker" -ArgumentList (@("compose") + $ComposeEnvArgs + @("exec","-T","dashboard-api","cat","/data/admin_token")) `
                 -NoNewWindow -PassThru `
                 -RedirectStandardOutput $catStdout `
                 -RedirectStandardError  $catStderr `
@@ -314,22 +351,34 @@ if (-not $env:CODERAFT_UPDATE_REEXEC) {
     }
 }
 
-# ── Self-heal CODERAFT_HOST_OS in .env (B25) ──────────────────────────────
+# ── Self-heal CODERAFT_HOST_OS in install-config.env (B25) ────────────────
 # Les installs antérieures préservaient .env sans ajouter CODERAFT_HOST_OS
 # (seul le path "fresh secrets" l'écrivait). Dashboard-api lit cette valeur
 # pour décider du mode capture daemon (native Windows Service vs Docker
 # sidecar Linux). Sans CODERAFT_HOST_OS, le setup wizard affiche
 # "CODERAFT_HOST_OS configured: ✗ not set" et capture ne fonctionne pas.
-$envPathForHostOS = Join-Path $INSTALL_DIR ".env"
-if (Test-Path $envPathForHostOS) {
-    $envTextHO = [System.IO.File]::ReadAllText($envPathForHostOS, [System.Text.UTF8Encoding]::new($false))
-    if ($envTextHO -notmatch '(?m)^\s*CODERAFT_HOST_OS\s*=') {
-        $hostOSValue = "windows"  # update.ps1 ne tourne que sur Windows
-        $envTextHO = $envTextHO.TrimEnd() + "`nCODERAFT_HOST_OS=$hostOSValue`n"
-        [System.IO.File]::WriteAllText($envPathForHostOS, $envTextHO, [System.Text.UTF8Encoding]::new($false))
-        Write-Host "  ✓ Self-heal .env — CODERAFT_HOST_OS=$hostOSValue ajouté"
+# Migration #150 : si une valeur existe encore dans l'ancien .env (installs
+# pré-#150), on la déplace vers install-config.env plutôt que de la dupliquer.
+if (-not (Get-InstallConfigVar "CODERAFT_HOST_OS")) {
+    $envPathForHostOS = Join-Path $INSTALL_DIR ".env"
+    $legacyHostOS = $null
+    if (Test-Path $envPathForHostOS) {
+        $envTextHO = [System.IO.File]::ReadAllText($envPathForHostOS, [System.Text.UTF8Encoding]::new($false))
+        if ($envTextHO -match '(?m)^\s*CODERAFT_HOST_OS\s*=(.+)$') { $legacyHostOS = $Matches[1].Trim().Trim('"').Trim("'") }
+    }
+    $hostOSValue = if ($legacyHostOS) { $legacyHostOS } else { "windows" }  # update.ps1 ne tourne que sur Windows
+    Set-InstallConfigVar "CODERAFT_HOST_OS" $hostOSValue
+    if ($legacyHostOS) {
+        Write-Host "  ✓ CODERAFT_HOST_OS migré .env → install-config.env ($hostOSValue)"
+    } else {
+        Write-Host "  ✓ Self-heal install-config.env — CODERAFT_HOST_OS=$hostOSValue ajouté"
     }
 }
+if (-not (Get-InstallConfigVar "CODERAFT_HOST_ARCH")) {
+    Set-InstallConfigVar "CODERAFT_HOST_ARCH" "amd64"
+}
+Remove-FromMainEnv "CODERAFT_HOST_OS"
+Remove-FromMainEnv "CODERAFT_HOST_ARCH"
 
 # ── Self-heal: docker-compose.yml drift (B24 — depends_on coderaft-vault) ──
 # Les installs antérieures déclaraient coderaft-vault avec
@@ -558,32 +607,21 @@ if (Test-Path $composePathCveProxy) {
     }
 }
 
-# ── Self-heal HOST_PROJECT_DIR in .env ────────────────────────────────────
+# ── Self-heal HOST_PROJECT_DIR in install-config.env ──────────────────────
 # Older oneliners (and any install where the dir was renamed/moved) leave
-# .env without HOST_PROJECT_DIR, which causes:
+# it without HOST_PROJECT_DIR, which causes:
 #   - docker compose warning "HOST_PROJECT_DIR not set" on every command
 #   - dashboard-api boots with empty HOST_PROJECT_DIR → cannot reach
 #     /host-compose paths → license.json invisible → fake "first run" UX
-# Always (re)write the line with the resolved current install dir.
-$envPath = Join-Path $INSTALL_DIR ".env"
-if (Test-Path $envPath) {
-    $absoluteInstallDir = (Resolve-Path -LiteralPath $INSTALL_DIR).Path
-    if ($absoluteInstallDir) {
-        $envText = [System.IO.File]::ReadAllText($envPath, [System.Text.UTF8Encoding]::new($false))
-        $existingMatch = [regex]::Match($envText, '(?m)^HOST_PROJECT_DIR=(.*)$')
-        $needsRewrite = $false
-        if ($existingMatch.Success) {
-            if ($existingMatch.Groups[1].Value -ne $absoluteInstallDir) { $needsRewrite = $true }
-        } else {
-            $needsRewrite = $true
-        }
-        if ($needsRewrite) {
-            $lines = $envText -split "`r?`n" | Where-Object { $_ -notmatch '^HOST_PROJECT_DIR=' }
-            $newText = (($lines -join "`n").TrimEnd()) + "`nHOST_PROJECT_DIR=$absoluteInstallDir`n"
-            [System.IO.File]::WriteAllText($envPath, $newText, [System.Text.UTF8Encoding]::new($false))
-            Write-Host "  ✓ HOST_PROJECT_DIR refreshed ($absoluteInstallDir)"
-        }
+# Always (re)write the line with the resolved current install dir. Task #150:
+# canonical home is install-config.env, not .env — strip any legacy copy.
+$absoluteInstallDir = (Resolve-Path -LiteralPath $INSTALL_DIR).Path
+if ($absoluteInstallDir) {
+    if ((Get-InstallConfigVar "HOST_PROJECT_DIR") -ne $absoluteInstallDir) {
+        Set-InstallConfigVar "HOST_PROJECT_DIR" $absoluteInstallDir
+        Write-Host "  ✓ HOST_PROJECT_DIR refreshed in install-config.env ($absoluteInstallDir)"
     }
+    Remove-FromMainEnv "HOST_PROJECT_DIR"
 }
 
 # ── Self-heal compose YAML ────────────────────────────────────────────────
@@ -598,7 +636,7 @@ try {
     # stderr as NativeCommandError in PS 5.1. Use Start-Process + temp files.
     $psCheckOut = Join-Path $env:TEMP "coderaft-pscheck-out-$(Get-Random).log"
     $psCheckErr = Join-Path $env:TEMP "coderaft-pscheck-err-$(Get-Random).log"
-    $psCheckProc = Start-Process -FilePath "docker" -ArgumentList @("compose","ps") `
+    $psCheckProc = Start-Process -FilePath "docker" -ArgumentList (@("compose") + $ComposeEnvArgs + @("ps")) `
         -NoNewWindow -PassThru `
         -RedirectStandardOutput $psCheckOut `
         -RedirectStandardError  $psCheckErr `
@@ -633,7 +671,7 @@ if (-not $composeOK) {
         # surfaces as NativeCommandError in PS 5.1. Redirect stderr only.
         $upHealErr = Join-Path $env:TEMP "coderaft-upheal-err-$(Get-Random).log"
         $upHealOut = Join-Path $env:TEMP "coderaft-upheal-out-$(Get-Random).log"
-        $upHealProc = Start-Process -FilePath "docker" -ArgumentList @("compose","up","-d","postgres","redis","dashboard-api") `
+        $upHealProc = Start-Process -FilePath "docker" -ArgumentList (@("compose") + $ComposeEnvArgs + @("up","-d","postgres","redis","dashboard-api")) `
             -NoNewWindow -Wait -PassThru `
             -RedirectStandardOutput $upHealOut `
             -RedirectStandardError  $upHealErr `
@@ -643,7 +681,7 @@ if (-not $composeOK) {
         Start-Sleep -Seconds 6
         $psHealOut = Join-Path $env:TEMP "coderaft-psheal-out-$(Get-Random).log"
         $psHealErr = Join-Path $env:TEMP "coderaft-psheal-err-$(Get-Random).log"
-        $psHealProc = Start-Process -FilePath "docker" -ArgumentList @("compose","ps") `
+        $psHealProc = Start-Process -FilePath "docker" -ArgumentList (@("compose") + $ComposeEnvArgs + @("ps")) `
             -NoNewWindow -PassThru `
             -RedirectStandardOutput $psHealOut `
             -RedirectStandardError  $psHealErr `
@@ -1077,7 +1115,7 @@ try {
     # B20 (2026-06-08): `& docker compose ps ... 2>$null` → NativeCommandError PS 5.1
     $vaultPsOut = Join-Path $env:TEMP "coderaft-vaultps-out-$(Get-Random).log"
     $vaultPsErr = Join-Path $env:TEMP "coderaft-vaultps-err-$(Get-Random).log"
-    $vaultPsProc = Start-Process -FilePath "docker" -ArgumentList @("compose","ps","coderaft-vault") `
+    $vaultPsProc = Start-Process -FilePath "docker" -ArgumentList (@("compose") + $ComposeEnvArgs + @("ps","coderaft-vault")) `
         -NoNewWindow -PassThru `
         -RedirectStandardOutput $vaultPsOut `
         -RedirectStandardError  $vaultPsErr `
@@ -1122,7 +1160,7 @@ if ($vaultNeedsMigration) {
         # B20 (2026-06-08): `& docker compose ps ... 2>$null` → NativeCommandError PS 5.1
         $pgPsOut = Join-Path $env:TEMP "coderaft-pgps-out-$(Get-Random).log"
         $pgPsErr = Join-Path $env:TEMP "coderaft-pgps-err-$(Get-Random).log"
-        $pgPsProc = Start-Process -FilePath "docker" -ArgumentList @("compose","ps","postgres") `
+        $pgPsProc = Start-Process -FilePath "docker" -ArgumentList (@("compose") + $ComposeEnvArgs + @("ps","postgres")) `
             -NoNewWindow -PassThru `
             -RedirectStandardOutput $pgPsOut `
             -RedirectStandardError  $pgPsErr `
@@ -1137,7 +1175,7 @@ if ($vaultNeedsMigration) {
         if ($pgRunning) {
             $bakSql = Join-Path $vaultBak "auth_config.sql"
             $proc = Start-Process -FilePath "docker" `
-                -ArgumentList @("compose","exec","-T","postgres","pg_dump","-U","coderaft","-t","auth_config","coderaft") `
+                -ArgumentList (@("compose") + $ComposeEnvArgs + @("exec","-T","postgres","pg_dump","-U","coderaft","-t","auth_config","coderaft")) `
                 -RedirectStandardOutput $bakSql -NoNewWindow -PassThru -Wait
             if ($proc.ExitCode -ne 0) { Remove-Item $bakSql -ErrorAction SilentlyContinue }
         }
@@ -1147,7 +1185,7 @@ if ($vaultNeedsMigration) {
     try {
         $rvPsOut = Join-Path $env:TEMP "coderaft-rvps-out-$(Get-Random).log"
         $rvPsErr = Join-Path $env:TEMP "coderaft-rvps-err-$(Get-Random).log"
-        $rvPsProc = Start-Process -FilePath "docker" -ArgumentList @("compose","ps","ravenscan") `
+        $rvPsProc = Start-Process -FilePath "docker" -ArgumentList (@("compose") + $ComposeEnvArgs + @("ps","ravenscan")) `
             -NoNewWindow -PassThru `
             -RedirectStandardOutput $rvPsOut `
             -RedirectStandardError  $rvPsErr `
@@ -1161,7 +1199,7 @@ if ($vaultNeedsMigration) {
         if ($rvRunning) {
             $rvCpErr = Join-Path $env:TEMP "coderaft-rvcp-err-$(Get-Random).log"
             $rvCpOut = Join-Path $env:TEMP "coderaft-rvcp-out-$(Get-Random).log"
-            Start-Process -FilePath "docker" -ArgumentList @("compose","cp","ravenscan:.ravenscan/ravenscan.db",(Join-Path $vaultBak "ravenscan.db")) `
+            Start-Process -FilePath "docker" -ArgumentList (@("compose") + $ComposeEnvArgs + @("cp","ravenscan:.ravenscan/ravenscan.db",(Join-Path $vaultBak "ravenscan.db"))) `
                 -NoNewWindow -Wait `
                 -RedirectStandardOutput $rvCpOut `
                 -RedirectStandardError  $rvCpErr `
@@ -1172,7 +1210,7 @@ if ($vaultNeedsMigration) {
     try {
         $apiPsOut = Join-Path $env:TEMP "coderaft-apips-out-$(Get-Random).log"
         $apiPsErr = Join-Path $env:TEMP "coderaft-apips-err-$(Get-Random).log"
-        $apiPsProc = Start-Process -FilePath "docker" -ArgumentList @("compose","ps","dashboard-api") `
+        $apiPsProc = Start-Process -FilePath "docker" -ArgumentList (@("compose") + $ComposeEnvArgs + @("ps","dashboard-api")) `
             -NoNewWindow -PassThru `
             -RedirectStandardOutput $apiPsOut `
             -RedirectStandardError  $apiPsErr `
@@ -1186,7 +1224,7 @@ if ($vaultNeedsMigration) {
         if ($apiRunning) {
             $cp1Out = Join-Path $env:TEMP "coderaft-cp1-out-$(Get-Random).log"
             $cp1Err = Join-Path $env:TEMP "coderaft-cp1-err-$(Get-Random).log"
-            Start-Process -FilePath "docker" -ArgumentList @("compose","cp","dashboard-api:/data/vault.enc",(Join-Path $vaultBak "dashboard-vault.enc")) `
+            Start-Process -FilePath "docker" -ArgumentList (@("compose") + $ComposeEnvArgs + @("cp","dashboard-api:/data/vault.enc",(Join-Path $vaultBak "dashboard-vault.enc"))) `
                 -NoNewWindow -Wait `
                 -RedirectStandardOutput $cp1Out `
                 -RedirectStandardError  $cp1Err `
@@ -1194,7 +1232,7 @@ if ($vaultNeedsMigration) {
             Remove-Item -Path $cp1Out,$cp1Err -ErrorAction SilentlyContinue
             $cp2Out = Join-Path $env:TEMP "coderaft-cp2-out-$(Get-Random).log"
             $cp2Err = Join-Path $env:TEMP "coderaft-cp2-err-$(Get-Random).log"
-            Start-Process -FilePath "docker" -ArgumentList @("compose","cp","dashboard-api:/data/admin_token",(Join-Path $vaultBak "admin_token")) `
+            Start-Process -FilePath "docker" -ArgumentList (@("compose") + $ComposeEnvArgs + @("cp","dashboard-api:/data/admin_token",(Join-Path $vaultBak "admin_token"))) `
                 -NoNewWindow -Wait `
                 -RedirectStandardOutput $cp2Out `
                 -RedirectStandardError  $cp2Err `
@@ -1216,7 +1254,7 @@ if ($vaultNeedsMigration) {
             # B20 (2026-06-08): all docker commands in rollback helper → Start-Process
             $rbDownOut = Join-Path $env:TEMP "coderaft-rbdown-out-$(Get-Random).log"
             $rbDownErr = Join-Path $env:TEMP "coderaft-rbdown-err-$(Get-Random).log"
-            Start-Process -FilePath "docker" -ArgumentList @("compose","down") `
+            Start-Process -FilePath "docker" -ArgumentList (@("compose") + $ComposeEnvArgs + @("down")) `
                 -NoNewWindow -Wait `
                 -RedirectStandardOutput $rbDownOut `
                 -RedirectStandardError  $rbDownErr `
@@ -1231,7 +1269,7 @@ if ($vaultNeedsMigration) {
             try {
                 $rbPgOut = Join-Path $env:TEMP "coderaft-rbpg-out-$(Get-Random).log"
                 $rbPgErr = Join-Path $env:TEMP "coderaft-rbpg-err-$(Get-Random).log"
-                Start-Process -FilePath "docker" -ArgumentList @("compose","up","-d","postgres") `
+                Start-Process -FilePath "docker" -ArgumentList (@("compose") + $ComposeEnvArgs + @("up","-d","postgres")) `
                     -NoNewWindow -Wait `
                     -RedirectStandardOutput $rbPgOut `
                     -RedirectStandardError  $rbPgErr `
@@ -1241,7 +1279,7 @@ if ($vaultNeedsMigration) {
                 # pipe SQL into psql via Start-Process stdin redirect
                 $rbPsqlOut = Join-Path $env:TEMP "coderaft-rbpsql-out-$(Get-Random).log"
                 $rbPsqlErr = Join-Path $env:TEMP "coderaft-rbpsql-err-$(Get-Random).log"
-                Start-Process -FilePath "docker" -ArgumentList @("compose","exec","-T","postgres","psql","-U","coderaft","coderaft") `
+                Start-Process -FilePath "docker" -ArgumentList (@("compose") + $ComposeEnvArgs + @("exec","-T","postgres","psql","-U","coderaft","coderaft")) `
                     -NoNewWindow -Wait `
                     -RedirectStandardInput  $authSql `
                     -RedirectStandardOutput $rbPsqlOut `
@@ -1253,7 +1291,7 @@ if ($vaultNeedsMigration) {
         try {
             $rbUpOut = Join-Path $env:TEMP "coderaft-rbup-out-$(Get-Random).log"
             $rbUpErr = Join-Path $env:TEMP "coderaft-rbup-err-$(Get-Random).log"
-            Start-Process -FilePath "docker" -ArgumentList @("compose","up","-d") `
+            Start-Process -FilePath "docker" -ArgumentList (@("compose") + $ComposeEnvArgs + @("up","-d")) `
                 -NoNewWindow -Wait `
                 -RedirectStandardOutput $rbUpOut `
                 -RedirectStandardError  $rbUpErr `
@@ -1628,6 +1666,8 @@ services:
     } else {
         $vaultComposeArgs = @("-f", "docker-compose.yml", "-f", "docker-compose.vault.yml")
     }
+    # Task #150: both env files, always explicit (see $ComposeEnvArgs above).
+    $vaultComposeArgs = $vaultComposeArgs + $ComposeEnvArgs
 
     if ($env:CODERAFT_TEST_MODE -ne "1") {
         Write-Host "  Pulling vault image..."
@@ -1849,20 +1889,25 @@ services:
     Write-Host "  Migrating secrets to vault..."
     $migrationOk = $true
 
+    # Task #150 (2026-07-31): LICENSE_KEY / REDFOX_LICENSE_KEY / RAVENSCAN_LICENSE_KEY
+    # migration removed. All three are dead since #166 (2026-07-28): the license
+    # no longer lives in .env/docker-compose at all — dashboard-api reads it
+    # exclusively from Coderaft Vault (hydrateLicenseFromVault()), and each
+    # product now pulls the resolved key live from dashboard-api's internal
+    # endpoint instead of a boot-time env var (confirmed for Ravenscan in
+    # /Users/liam/secaudit/internal/license/dashboard_client.go +
+    # internal/cli/serve.go). Migrating an already-dead value serves no purpose.
     $secretMap = @(
-        @("LICENSE_KEY",              "license_key"),
         @("POSTGRES_PASSWORD",        "postgres_password"),
         @("REDIS_PASSWORD",           "redis_password"),
-        @("DASHBOARD_SECRET",         "dashboard_secret_legacy"),
+        @("DASHBOARD_SECRET",         "dashboard_secret"),
         @("NEO4J_PASSWORD",           "neo4j_password"),
         @("RAVENSCAN_SECRET_KEY",     "ravenscan_secret_key"),
         @("RAVENSCAN_CAPTURE_TOKEN",  "ravenscan_capture_token"),
-        @("RAVENSCAN_LICENSE_KEY",    "ravenscan_license_key"),
         @("REDFOX_MASTER_PASSPHRASE", "redfox_master_passphrase"),
         @("REDFOX_JWT_PRIVATE_KEY",   "redfox_jwt_private_key"),
         @("REDFOX_JWT_PUBLIC_KEY",    "redfox_jwt_public_key"),
-        @("REDFOX_GW_SESSION_SECRET", "redfox_gw_session_secret"),
-        @("REDFOX_LICENSE_KEY",       "redfox_license_key")
+        @("REDFOX_GW_SESSION_SECRET", "redfox_gw_session_secret")
     )
     foreach ($pair in $secretMap) {
         $envKey = $pair[0]; $vaultKey = $pair[1]
@@ -1998,11 +2043,9 @@ if ((Test-Path $envEnc) -and (Test-Path $envPlain)) {
 Write-Host ""
 Write-Host "  Live Capture sanity check..."
 $hostOsValue = ""
-if (Test-Path ".env") {
-    $envLine = Get-Content ".env" | Where-Object { $_ -match '^\s*CODERAFT_HOST_OS\s*=' } | Select-Object -Last 1
-    if ($envLine) {
-        $hostOsValue = ($envLine -replace '^\s*CODERAFT_HOST_OS\s*=', '').Trim().Trim('"').Trim("'").ToLower()
-    }
+$hostOsFromConfig = Get-InstallConfigVar "CODERAFT_HOST_OS"
+if ($hostOsFromConfig) {
+    $hostOsValue = $hostOsFromConfig.Trim().Trim('"').Trim("'").ToLower()
 }
 switch ($hostOsValue) {
     { @("windows", "macos") -contains $_ } {
@@ -2052,7 +2095,7 @@ try {
     # B20 (2026-06-08): `& docker compose ps ... 2>$null` → NativeCommandError PS 5.1
     $pgQOut = Join-Path $env:TEMP "coderaft-pgq-out-$(Get-Random).log"
     $pgQErr = Join-Path $env:TEMP "coderaft-pgq-err-$(Get-Random).log"
-    $pgQProc = Start-Process -FilePath "docker" -ArgumentList @("compose","ps","postgres","--quiet") `
+    $pgQProc = Start-Process -FilePath "docker" -ArgumentList (@("compose") + $ComposeEnvArgs + @("ps","postgres","--quiet")) `
         -NoNewWindow -PassThru `
         -RedirectStandardOutput $pgQOut `
         -RedirectStandardError  $pgQErr `
@@ -2070,7 +2113,7 @@ if ($postgresRunning) {
     try {
         # Start-Process redirects stdout cleanly (no PS encoding issues)
         $proc = Start-Process -FilePath "docker" `
-            -ArgumentList @("compose", "exec", "-T", "postgres", "pg_dumpall", "-U", "coderaft") `
+            -ArgumentList (@("compose") + $ComposeEnvArgs + @("exec", "-T", "postgres", "pg_dumpall", "-U", "coderaft")) `
             -RedirectStandardOutput $BACKUP_FILE `
             -NoNewWindow -PassThru -Wait
 
@@ -2136,6 +2179,8 @@ if (-not $vaultInMainTop -and (Test-Path ".\docker-compose.vault.yml")) {
     }
     $ComposeArgs += @("-f", ".\docker-compose.vault.yml")
 }
+# Task #150: both env files, always explicit (see $ComposeEnvArgs above).
+$ComposeArgs += $ComposeEnvArgs
 
 # ── Refresh license keys (drift "superseded") ─────────────────────────────
 # When the License Server resigns a license (e.g. feature added, key
