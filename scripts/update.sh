@@ -1186,6 +1186,15 @@ VAULTOVERRIDE
     # repo). Migrating an already-dead value into the vault serves no purpose.
 
     # b-f. Infrastructure / product secrets from .env
+    #
+    # Task #149 (2026-07-31): 7 keys added to close the gap identified in
+    # SECRETS-FILE-MOUNTS-PLAN-2026-07-31.md §5.6 — real secrets that were
+    # NOT migrated here, i.e. NOT protected by dashboard-api's regeneration
+    # path (generateOverrideToDir(), now Coderaft-Vault-backed via #149),
+    # only ever preserved verbatim if a copy already existed on disk.
+    # TENANT_ENCRYPTION_KEY / AZURE_CLIENT_SECRET / REDFOX_JWT_SECRET /
+    # REDFOX_OIDC_CLIENT_SECRET / XPRODUCT_INTERNAL_TOKEN / ADMIN_TOKEN /
+    # CLOUDFLARE_TUNNEL_TOKEN.
     for _SECRET_MAP in \
         "POSTGRES_PASSWORD:postgres_password" \
         "REDIS_PASSWORD:redis_password" \
@@ -1196,7 +1205,14 @@ VAULTOVERRIDE
         "REDFOX_MASTER_PASSPHRASE:redfox_master_passphrase" \
         "REDFOX_JWT_PRIVATE_KEY:redfox_jwt_private_key" \
         "REDFOX_JWT_PUBLIC_KEY:redfox_jwt_public_key" \
-        "REDFOX_GW_SESSION_SECRET:redfox_gw_session_secret"; do
+        "REDFOX_GW_SESSION_SECRET:redfox_gw_session_secret" \
+        "TENANT_ENCRYPTION_KEY:tenant_encryption_key" \
+        "AZURE_CLIENT_SECRET:azure_client_secret" \
+        "REDFOX_JWT_SECRET:redfox_jwt_secret" \
+        "REDFOX_OIDC_CLIENT_SECRET:redfox_oidc_client_secret" \
+        "XPRODUCT_INTERNAL_TOKEN:xproduct_internal_token" \
+        "ADMIN_TOKEN:admin_token" \
+        "CLOUDFLARE_TUNNEL_TOKEN:cloudflare_tunnel_token"; do
         _ENV_KEY="${_SECRET_MAP%%:*}"
         _VAULT_KEY="${_SECRET_MAP##*:}"
         _VAL=$(_env_val "$_ENV_KEY")
