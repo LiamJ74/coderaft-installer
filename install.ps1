@@ -9,6 +9,152 @@
 # =============================================================================
 
 $ErrorActionPreference = 'Stop'
+
+# ── F-037 (2026-07-31): installer self-integrity check (SHA256) ─────────────
+# Goal: detect a script tampered with in transit or at rest between
+# publication and execution (e.g. a MITM proxy, a compromised CDN edge, or a
+# stale/corrupted cache rewriting the response to
+# `irm https://install.coderaft.io/win`) before a single command from this
+# file runs.
+#
+# Mechanism: recompute this script's own SHA256 — excluding the
+# $CoderaftExpectedSha256 line itself, to avoid the chicken-and-egg problem
+# of a file needing to embed a hash of its own content — and compare it
+# against the digest published at install.ps1.sha256, a sidecar file served
+# alongside this one but generated/updated independently (see
+# scripts/generate-install-checksums.sh, run at every release cut).
+# $CoderaftExpectedSha256 below is a secondary, embedded offline pin: a
+# frozen snapshot of the hash taken at the same time as the last
+# regeneration, used only as a fallback when the network fetch of the
+# published digest fails outright (fully offline environment, endpoint
+# down). Regenerate both together with
+# scripts/generate-install-checksums.sh whenever this file changes — never
+# edit either by hand.
+#
+# KNOWN LIMITATION (a structural PowerShell limit, not a bug in this
+# check): when this file is piped straight into Invoke-Expression —
+# `irm https://install.coderaft.io/win | iex`, this file's own documented
+# usage at the top of this header — the code executes as a string with no
+# backing script file, so $PSCommandPath / $MyInvocation.MyCommand.Path are
+# empty. A script cannot read "itself" back out once iex has already
+# parsed it from a piped string with no file behind it. Under that
+# invocation the check below degrades to a clear warning instead of
+# silently pretending to protect the user. It IS fully effective for the
+# safer download-then-run flow:
+#   irm https://install.coderaft.io/win -OutFile install.ps1
+#   .\install.ps1          # self-checks against install.ps1.sha256
+# See deploy/docs/installer-integrity-verification.md for the full
+# writeup, threat model, and the (separate, not-yet-scheduled) work needed
+# to make the public `install.coderaft.io` endpoint actually serve this
+# monorepo's install.ps1/install.ps1.sha256 at all — today it still
+# proxies the legacy `coderaft-installer` repo.
+$CoderaftExpectedSha256 = "48f5bf815bc4ee01a6ca9287e84c604fdc75866968d274892405ab04e6742b07"
+
+# CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
+# tested end-to-end against a throwaway local HTTP server instead of the
+# live production endpoint (see deploy/docs/installer-integrity-verification.md,
+# "Testing" section). Real installs never need to set it.
+$CoderaftInstallSha256Url = if ($env:CODERAFT_INSTALL_SHA256_URL) { $env:CODERAFT_INSTALL_SHA256_URL } else { 'https://install.coderaft.io/install.ps1.sha256' }
+
+function Get-CoderaftSelfHash {
+    param([Parameter(Mandatory)][string]$Path)
+    # Byte-level read + explicit CRLF->LF normalization (not Get-Content,
+    # whose line-ending/encoding auto-detection could silently diverge from
+    # the plain byte-oriented `sed`+`sha256sum` pipeline that
+    # scripts/generate-install-checksums.sh uses to hash install.sh — this
+    # function must stay in lockstep with THAT script's PowerShell branch).
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+    $normalized = $text -replace "`r`n", "`n"
+    $lines = $normalized -split "`n" | Where-Object { $_ -notmatch '^\$CoderaftExpectedSha256\s*=' }
+    $joined = [string]::Join("`n", $lines)
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hashBytes = $hasher.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($joined))
+    } finally {
+        $hasher.Dispose()
+    }
+    return ([BitConverter]::ToString($hashBytes) -replace '-', '').ToLower()
+}
+
+function Test-CoderaftSelfIntegrity {
+    if ($env:SKIP_SELF_VERIFY) {
+        Write-Host "  ⚠ SKIP_SELF_VERIFY set — installer integrity check bypassed (dev only)." -ForegroundColor Yellow
+        return $true
+    }
+
+    # $PSCommandPath only points to this script's real file when it was
+    # invoked as a file (.\install.ps1, powershell -File install.ps1). Under
+    # `irm | iex` there is no backing file. See the KNOWN LIMITATION note
+    # above.
+    $selfPath = $PSCommandPath
+    if (-not $selfPath -and $MyInvocation.MyCommand.Path) { $selfPath = $MyInvocation.MyCommand.Path }
+
+    if (-not $selfPath -or -not (Test-Path -LiteralPath $selfPath -PathType Leaf)) {
+        Write-Host ""
+        Write-Host "  ⚠ Installer integrity check skipped: this script has no backing file to" -ForegroundColor Yellow
+        Write-Host "    hash (running via 'irm | iex' — see deploy/docs/" -ForegroundColor Yellow
+        Write-Host "    installer-integrity-verification.md). For a verified install:" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "      irm https://install.coderaft.io/win -OutFile install.ps1" -ForegroundColor Yellow
+        Write-Host "      .\install.ps1" -ForegroundColor Yellow
+        Write-Host ""
+        return $true
+    }
+
+    $actual = $null
+    try {
+        $actual = Get-CoderaftSelfHash -Path $selfPath
+    } catch {
+        Write-Host "  ⚠ Installer integrity check skipped: could not hash this script ($($_.Exception.Message))." -ForegroundColor Yellow
+        return $true
+    }
+    if (-not $actual) {
+        Write-Host "  ⚠ Installer integrity check skipped: could not compute local hash." -ForegroundColor Yellow
+        return $true
+    }
+
+    $published = $null
+    try {
+        $published = (Invoke-RestMethod -Uri $CoderaftInstallSha256Url -TimeoutSec 10 -ErrorAction Stop).ToString().Trim()
+    } catch {
+        $published = $null
+    }
+
+    $expected = $published
+    $source = "install.ps1.sha256 (network)"
+    if (-not $expected) {
+        if ($CoderaftExpectedSha256) {
+            $expected = $CoderaftExpectedSha256
+            $source = "embedded offline pin"
+            Write-Host "  ⚠ Could not reach $CoderaftInstallSha256Url — falling back to the embedded offline pin." -ForegroundColor Yellow
+        } else {
+            Write-Host "  ⚠ Could not reach $CoderaftInstallSha256Url and no embedded pin is set — skipping integrity check." -ForegroundColor Yellow
+            return $true
+        }
+    }
+
+    if ($actual -ne $expected) {
+        Write-Host ""
+        Write-Host "  FATAL: installer integrity check failed" -ForegroundColor Red
+        Write-Host "    computed (local)      : $actual" -ForegroundColor Red
+        Write-Host "    expected ($source): $expected" -ForegroundColor Red
+        Write-Host ""
+        Write-Host "  This script's content does not match its published digest — it may" -ForegroundColor Red
+        Write-Host "  have been tampered with in transit or at rest. Aborting." -ForegroundColor Red
+        Write-Host '  Set $env:SKIP_SELF_VERIFY=1 to bypass (development only).' -ForegroundColor Red
+        Write-Host ""
+        return $false
+    }
+
+    Write-Host "  ✓ Installer integrity verified (SHA256 matches $source)" -ForegroundColor Green
+    return $true
+}
+
+# Not 'exit' — irm|iex runs this script in the caller's own scope, so exit
+# would close their whole shell instead of just ending this script.
+if (-not (Test-CoderaftSelfIntegrity)) { return }
+
 $InstallDir = if ($env:INSTALL_DIR) { $env:INSTALL_DIR } else { 'coderaft' }
 
 # B-CWD-SANITIZE (2026-07-16): `irm | iex` inherits the caller's CWD.
@@ -235,6 +381,32 @@ function Get-InstallConfigVar($Key) {
     return $null
 }
 
+# ── Backup rotation (security hardening, 2026-07-31) — PowerShell parity ────
+# Every self-heal path below does Copy-Item $X "$X.bak-<timestamp>" before
+# touching $X (acl.yaml; update.ps1 also does this for docker-compose.yml /
+# docker-compose.override.yml). On a deployment that runs unattended for
+# months/years across many install/update runs, these accumulate without
+# bound. Keep only the $Keep most recent (default 5) backups sharing
+# $BasePath's name (any `.bak-*` suffix/tag counts against the same budget);
+# delete anything older. Safe/idempotent: a no-op when there are $Keep or
+# fewer, or none at all.
+function Invoke-RotateBackups {
+    param(
+        [Parameter(Mandatory = $true)][string]$BasePath,
+        [int]$Keep = 5
+    )
+    $dir = Split-Path -Path $BasePath -Parent
+    if ([string]::IsNullOrEmpty($dir)) { $dir = "." }
+    $leaf = Split-Path -Path $BasePath -Leaf
+    $backups = Get-ChildItem -LiteralPath $dir -Filter "$leaf.bak-*" -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending
+    if ($backups -and $backups.Count -gt $Keep) {
+        $backups | Select-Object -Skip $Keep | ForEach-Object {
+            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 # Task #148 Phase 3 (2026-07-31, PowerShell parity): postgres migrates to
 # Docker's native `secrets:` + POSTGRES_PASSWORD_FILE (the official postgres
 # image already supports this) instead of a plaintext POSTGRES_PASSWORD= env
@@ -263,6 +435,29 @@ function Write-PostgresSecretFile($PgPassword) {
     } catch {
         Write-Host "  ⚠ Could not tighten ACL on secrets\postgres_password ($($_.Exception.Message.Trim()))." -ForegroundColor Yellow
         Write-Host "    Postgres will still start; inherited ACL from the parent directory applies." -ForegroundColor Yellow
+    }
+}
+
+# Task #219 (2026-07-31, PowerShell parity — was previously OUT of sync with
+# install.sh's write_redis_secret_file()/commit for this same task): redis
+# has no native `_FILE` env var convention like postgres's image, so the
+# password is read from this file via a `sh -c` command override in the
+# compose service instead (see the `redis:` service below). Same file-write
+# pattern as Write-PostgresSecretFile above.
+function Write-RedisSecretFile($RedisPassword) {
+    New-Item -ItemType Directory -Force -Path "secrets" | Out-Null
+    $secretPath = Join-Path (Get-Location) "secrets\redis_password"
+    [System.IO.File]::WriteAllText($secretPath, $RedisPassword, [System.Text.UTF8Encoding]::new($false))
+    try {
+        $acl = Get-Acl $secretPath
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
+            "Read", "Allow")
+        $acl.AddAccessRule($rule)
+        Set-Acl $secretPath $acl -ErrorAction Stop
+    } catch {
+        Write-Host "  ⚠ Could not tighten ACL on secrets\redis_password ($($_.Exception.Message.Trim()))." -ForegroundColor Yellow
+        Write-Host "    Redis will still start; inherited ACL from the parent directory applies." -ForegroundColor Yellow
     }
 }
 
@@ -312,6 +507,19 @@ if ((Test-Path '.env') -and (Select-String -Path '.env' -Pattern '^POSTGRES_PASS
             Write-Host "  ✓ secrets\postgres_password backfilled from existing .env (task #148)" -ForegroundColor Green
         }
     }
+    # Task #219 (2026-07-31, PowerShell parity): same backfill for redis —
+    # an existing install upgrading to this version needs secrets\redis_password
+    # to match the password redis was ALREADY started with, or the
+    # `sh -c 'redis-server --requirepass "$(cat /run/secrets/redis_password)"'`
+    # override below would start redis with a DIFFERENT password than every
+    # client's REDIS_URL (built from the .env value), locking everything out.
+    if (-not (Test-Path "secrets\redis_password")) {
+        $existingRedisPw = (Select-String -Path '.env' -Pattern '^REDIS_PASSWORD=(.+)$' -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if ($existingRedisPw) {
+            Write-RedisSecretFile $existingRedisPw.Matches.Groups[1].Value
+            Write-Host "  ✓ secrets\redis_password backfilled from existing .env (task #219)" -ForegroundColor Green
+        }
+    }
 } else {
     Write-Host "  Generating secrets..."
     $PgPasswordBootstrap = New-HexSecret 24
@@ -329,6 +537,11 @@ RAVENSCAN_CAPTURE_TOKEN=$(New-HexSecret 32)
     # postgres's `secrets:`/POSTGRES_PASSWORD_FILE — both must agree at the
     # container's very first initdb.
     Write-PostgresSecretFile $PgPasswordBootstrap
+    # Task #219 (2026-07-31, PowerShell parity): same idea for redis — must
+    # match the REDIS_PASSWORD line written into $Env just above.
+    if ($Env -match '(?m)^REDIS_PASSWORD=(.+)$') {
+        Write-RedisSecretFile $Matches[1]
+    }
     $ConfigEnv = @"
 # CodeRaft — install-time / public config (NOT a secret, NEVER SOPS-encrypted)
 # $(Get-Date -Format 'yyyy-MM-dd')
@@ -634,7 +847,7 @@ EOF
 openssl x509 -req -days 3650 -sha256 \
     -in vault.csr -CA client-ca.crt -CAkey client-ca.key -CAcreateserial \
     -out vault.crt -extfile /tmp/server.ext 2>/dev/null
-rm -f vault.csr
+rm -f vault.csr /tmp/server.ext
 # Per-product client certs
 for pair in "dashboard-api:dashboard-api.coderaft.local" \
             "entraguard:entraguard.coderaft.local" \
@@ -654,7 +867,7 @@ EOF
     openssl x509 -req -days 3650 -sha256 \
         -in "${name}-client.csr" -CA client-ca.crt -CAkey client-ca.key -CAcreateserial \
         -out "${name}-client.crt" -extfile /tmp/client.ext 2>/dev/null
-    rm -f "${name}-client.csr"
+    rm -f "${name}-client.csr" /tmp/client.ext
 done
 chmod 600 *.key 2>/dev/null || true
 # falconone-api / coderaft-cve-proxy run distroless nonroot (uid 65532) —
@@ -750,11 +963,11 @@ clients:
 
   - name: redfox
     cert_san: "redfox.coderaft.local"
-    permissions: ["read:redfox_*","read:license_key","read:platform/identity/oidc"]
+    permissions: ["read:redfox_*","read:license_key","read:platform/identity/oidc","read:platform/identity/graph-tools","read:redfox/connections/*","write:redfox/connections/*","delete:redfox/connections/*","read:redfox/k8s/*","write:redfox/k8s/*","delete:redfox/k8s/*"]
 
   - name: falconone
     cert_san: "falconone.coderaft.local"
-    permissions: ["read:license_key","read:falconone_*","read:platform/identity/oidc","sign:falconone_agent_cert","read:falconone/nvd_api_key","read:falconone/audit_hmac_key","write:falconone/audit_hmac_key","read:falconone/pki/agents-ca/cert","read:pki/falconone-agents-ca*","write:pki/falconone-agents-ca*"]
+    permissions: ["read:license_key","read:falconone_*","read:platform/identity/oidc","sign:falconone_agent_cert","read:falconone/nvd_api_key","read:falconone/audit_hmac_key","write:falconone/audit_hmac_key","read:falconone/pki/agents-ca/cert","read:pki/falconone-agents-ca*","write:pki/falconone-agents-ca*","read:falconone/scripts_ca*","write:falconone/scripts_ca*"]
 
   - name: cve-proxy
     cert_san: "cve-proxy.coderaft.local"
@@ -817,7 +1030,7 @@ EOF
     openssl x509 -req -days 3650 -sha256 \
         -in server.csr -CA agents-ca.crt -CAkey agents-ca.key -CAcreateserial \
         -out server.crt -extfile /tmp/server.ext 2>/dev/null
-    rm -f server.csr
+    rm -f server.csr /tmp/server.ext
 fi
 chmod 644 *.crt *.key 2>/dev/null || true
 '@
@@ -865,7 +1078,9 @@ function Invoke-FalconOneAclSelfHeal {
         "write:falconone/audit_hmac_key",
         "read:falconone/pki/agents-ca/cert",
         "read:pki/falconone-agents-ca*",
-        "write:pki/falconone-agents-ca*"
+        "write:pki/falconone-agents-ca*",
+        "read:falconone/scripts_ca*",
+        "write:falconone/scripts_ca*"
     )
 
     $lines = @(Get-Content -LiteralPath $AclPath)
@@ -878,6 +1093,7 @@ function Invoke-FalconOneAclSelfHeal {
 
     if ($blockStart -eq -1) {
         Copy-Item -LiteralPath $AclPath -Destination "${AclPath}.bak-${ts}"
+        Invoke-RotateBackups -BasePath $AclPath
         $newBlock = @'
 
   - name: falconone
@@ -893,6 +1109,8 @@ function Invoke-FalconOneAclSelfHeal {
       - "read:falconone/pki/agents-ca/cert"
       - "read:pki/falconone-agents-ca*"
       - "write:pki/falconone-agents-ca*"
+      - "read:falconone/scripts_ca*"
+      - "write:falconone/scripts_ca*"
 '@
         Add-Content -LiteralPath $AclPath -Value $newBlock
         Write-Host "  [install] Self-heal ACL: falconone permissions updated (+$($requiredPerms.Count) added, entry created)"
@@ -913,6 +1131,7 @@ function Invoke-FalconOneAclSelfHeal {
     }
 
     Copy-Item -LiteralPath $AclPath -Destination "${AclPath}.bak-${ts}"
+    Invoke-RotateBackups -BasePath $AclPath
 
     $permsLineIdx = -1
     for ($k = $blockStart; $k -lt $blockEnd; $k++) {
@@ -934,6 +1153,104 @@ function Invoke-FalconOneAclSelfHeal {
     Write-Host "  [install] Self-heal ACL: falconone permissions updated (+$($missing.Count) added)"
 }
 
+# ── ACL self-heal: redfox connections/k8s vault-backed credentials ──────────
+# Zero-Knowledge Credential Architecture Palier 1
+# (coderaft-platform/docs/redfox-zero-knowledge-scoping.md): target
+# connection credentials and k8s cluster auth data move from RedFox's own
+# Postgres into this vault, under redfox/connections/* and redfox/k8s/*.
+# Same additive-only, idempotent merge-into-existing-entry pattern as
+# Invoke-FalconOneAclSelfHeal above — any install already has a "redfox"
+# entry (it existed for platform/identity/oidc), so without this it would
+# never gain the new permissions.
+function Invoke-RedfoxAclSelfHeal {
+    param([Parameter(Mandatory = $true)][string]$AclPath)
+
+    if (-not (Test-Path $AclPath)) {
+        Write-Host "  [install] ACL self-heal: $AclPath not found — skipping (vault not provisioned yet)"
+        return
+    }
+
+    $requiredPerms = @(
+        "read:license_key",
+        "read:redfox_*",
+        "read:platform/identity/oidc",
+        "read:platform/identity/graph-tools",
+        "read:redfox/connections/*",
+        "write:redfox/connections/*",
+        "delete:redfox/connections/*",
+        "read:redfox/k8s/*",
+        "write:redfox/k8s/*",
+        "delete:redfox/k8s/*"
+    )
+
+    $lines = @(Get-Content -LiteralPath $AclPath)
+    $blockStart = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match '^\s*-\s*name:\s*redfox\s*$') { $blockStart = $i; break }
+    }
+
+    $ts = Get-Date -Format "yyyyMMddTHHmmssZ"
+
+    if ($blockStart -eq -1) {
+        Copy-Item -LiteralPath $AclPath -Destination "${AclPath}.bak-${ts}"
+        Invoke-RotateBackups -BasePath $AclPath
+        $newBlock = @'
+
+  - name: redfox
+    cert_san: "redfox.coderaft.local"
+    permissions:
+      - "read:license_key"
+      - "read:redfox_*"
+      - "read:platform/identity/oidc"
+      - "read:platform/identity/graph-tools"
+      - "read:redfox/connections/*"
+      - "write:redfox/connections/*"
+      - "delete:redfox/connections/*"
+      - "read:redfox/k8s/*"
+      - "write:redfox/k8s/*"
+      - "delete:redfox/k8s/*"
+'@
+        Add-Content -LiteralPath $AclPath -Value $newBlock
+        Write-Host "  [install] Self-heal ACL: redfox permissions updated (+$($requiredPerms.Count) added, entry created)"
+        return
+    }
+
+    $blockEnd = $lines.Count
+    for ($j = $blockStart + 1; $j -lt $lines.Count; $j++) {
+        if ($lines[$j] -match '^\s*-\s*name:\s*\S') { $blockEnd = $j; break }
+    }
+    $blockText = ($lines[$blockStart..($blockEnd - 1)]) -join "`n"
+
+    $missing = @($requiredPerms | Where-Object { $blockText -notmatch [regex]::Escape("`"$_`"") })
+
+    if ($missing.Count -eq 0) {
+        Write-Host "  [install] ACL redfox already up-to-date"
+        return
+    }
+
+    Copy-Item -LiteralPath $AclPath -Destination "${AclPath}.bak-${ts}"
+    Invoke-RotateBackups -BasePath $AclPath
+
+    $permsLineIdx = -1
+    for ($k = $blockStart; $k -lt $blockEnd; $k++) {
+        if ($lines[$k] -match '^\s*permissions:\s*\[.*\]\s*$') { $permsLineIdx = $k; break }
+    }
+
+    if ($permsLineIdx -ge 0) {
+        $additions = ($missing | ForEach-Object { "`"$_`"" }) -join ","
+        $lines[$permsLineIdx] = $lines[$permsLineIdx] -replace '\]\s*$', ",$additions]"
+        $lines | Set-Content -LiteralPath $AclPath -Encoding UTF8
+    } else {
+        $insertLines = @($missing | ForEach-Object { "      - `"$_`"" })
+        $before = if ($blockEnd -gt 0) { $lines[0..($blockEnd - 1)] } else { @() }
+        $after  = if ($blockEnd -le $lines.Count - 1) { $lines[$blockEnd..($lines.Count - 1)] } else { @() }
+        $merged = @($before + $insertLines + $after)
+        $merged | Set-Content -LiteralPath $AclPath -Encoding UTF8
+    }
+
+    Write-Host "  [install] Self-heal ACL: redfox permissions updated (+$($missing.Count) added)"
+}
+
 # ── ACL self-heal: cve-proxy entry (coderaft-cve-engine sidecar) ────────────
 # Same additive-only, idempotent pattern as Invoke-FalconOneAclSelfHeal above.
 function Invoke-CveProxyAclSelfHeal {
@@ -953,6 +1270,7 @@ function Invoke-CveProxyAclSelfHeal {
 
     $ts = Get-Date -Format "yyyyMMddTHHmmssZ"
     Copy-Item -LiteralPath $AclPath -Destination "${AclPath}.bak-${ts}"
+    Invoke-RotateBackups -BasePath $AclPath
     $newBlock = @'
 
   - name: cve-proxy
@@ -1006,7 +1324,7 @@ printf 'subjectAltName=DNS:%s\nbasicConstraints=CA:FALSE' '$San' > /tmp/client.e
 openssl x509 -req -days 3650 -sha256 \
     -in '$Name-client.csr' -CA client-ca.crt -CAkey client-ca.key -CAcreateserial \
     -out '$Name-client.crt' -extfile /tmp/client.ext 2>/dev/null
-rm -f '$Name-client.csr'
+rm -f '$Name-client.csr' /tmp/client.ext
 $chmodExtra
 "@
     $scriptFile = Join-Path $env:TEMP "coderaft-cert-selfheal-$(Get-Random).sh"
@@ -1040,6 +1358,12 @@ Invoke-VaultBootstrap
 Invoke-FalconOneTlsBootstrap -InstallDir (Get-Location).Path
 Invoke-FalconOneAclSelfHeal -AclPath (Join-Path (Get-Location).Path "vault-config\acl.yaml")
 
+# ── RedFox connections/k8s vault-backed credentials ACL self-heal ───────────
+# Zero-Knowledge Credential Architecture Palier 1 — see Invoke-RedfoxAclSelfHeal
+# above. redfox's client cert already exists (provisioned for
+# platform/identity/oidc), so no Invoke-VaultClientCertSelfHeal call is needed.
+Invoke-RedfoxAclSelfHeal -AclPath (Join-Path (Get-Location).Path "vault-config\acl.yaml")
+
 # ── cve-proxy vault client cert + ACL self-heal ──────────────────────────────
 # coderaft-cve-proxy is a shared platform sidecar (in front of the central
 # coderaft-cve-engine), not tied to any single product license.
@@ -1071,6 +1395,16 @@ Write-Host "  Writing docker-compose.yml..."
 $Compose = @'
 # CodeRaft Dashboard
 # Products are deployed by the dashboard after license activation.
+#
+# F-017 (seccomp) — PowerShell parity with install.sh: every service below
+# relies on Docker's IMPLICIT default seccomp profile, deliberately NOT
+# written as `security_opt: [seccomp=default]` — that literal string isn't a
+# Docker keyword, it's parsed as a PATH to a custom profile file and fails
+# with `opening seccomp profile (default) failed`. Re-confirmed live against
+# this Docker version (2026-07-31, same Mac used for install.sh's own
+# re-verification — Docker Desktop's daemon behaves identically regardless
+# of which install script targets it). Omitting `seccomp:` keeps the strong
+# default profile.
 
 services:
   # Caddy HTTPS reverse proxy.
@@ -1098,7 +1432,27 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
+    # F-015 (2026-07-31, PowerShell parity): install.ps1's caddy had NO
+    # healthcheck at all before this — was out of sync with install.sh.
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:80/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     security_opt: [no-new-privileges:true]
+    # Phase 2 hardening (2026-07-31) — PowerShell parity with install.sh:
+    # verified in a throwaway compose project (same Docker Desktop engine
+    # this Windows install targets) that caddy:2-alpine needs exactly
+    # NET_BIND_SERVICE back after cap_drop:ALL to keep binding :80/:443.
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    read_only: true
+    tmpfs: [/tmp]
+    mem_limit: 256m
+    memswap_limit: 256m
+    mem_reservation: 64m
+    cpus: 1
     restart: unless-stopped
 
   dashboard:
@@ -1112,8 +1466,12 @@ services:
     environment:
       - DATABASE_URL=postgres://coderaft:${POSTGRES_PASSWORD}@postgres:5432/coderaft
       - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
-      - DASHBOARD_SECRET=${DASHBOARD_SECRET}
       - LICENSE_SERVER_URL=https://license.coderaft.io
+    # Security hardening (2026-07-31): DASHBOARD_SECRET removed from this
+    # service's env — pure dead code here (this "dashboard" container is
+    # nginx serving a static Vite build, no app server, never reads env vars
+    # at runtime). See install.sh for the full rationale (identical compose,
+    # kept in sync).
     # B-DASHBOARD-NET (2026-06-23): the nginx inside this image proxies
     # /api/entraguard/, /api/ravenscan/, /api/redfox/ to the product
     # containers. Products live on coderaft-frontend (entraguard/ravenscan)
@@ -1122,6 +1480,25 @@ services:
     # entraguard-api is healthy. Observed live 2026-06-23 on Windows host.
     networks: [default, coderaft-frontend, coderaft-backend]
     security_opt: [no-new-privileges:true]
+    # Phase 2 hardening (2026-07-31) — PowerShell parity with install.sh:
+    # this image's nginx.conf sets `user nginx;`, needing CAP_CHOWN (fix up
+    # /var/cache/nginx/*_temp ownership) + CAP_SETUID/CAP_SETGID (drop
+    # workers to the nginx account) even after cap_drop:ALL. Verified on the
+    # macOS testing Mac against the identical image Windows hosts pull.
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID]
+    read_only: true
+    tmpfs: [/tmp, /var/cache/nginx, /var/run]
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:3000/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    mem_limit: 256m
+    memswap_limit: 256m
+    mem_reservation: 64m
+    cpus: 1
     restart: unless-stopped
 
   # F-003 (2026-06-21): ACL sidecar for the Docker socket. dashboard-api
@@ -1141,10 +1518,36 @@ services:
       VERSION: 1
       POST: 1
       # F-003 follow-up (2026-07-16): VOLUMES=1 required so `docker compose up`
-      # can read/create named volumes for the product services. Volume read
-      # doesn't grant RCE — the RCE risk of exposing docker.sock came from
-      # POST /containers/create with a `Binds:[/:/host]` (privileged mount)
-      # or POST /exec, both still blocked here. Safe to open.
+      # can read/create named volumes for the product services (confirmed
+      # 2026-07-31: removing it breaks `docker compose up` outright with
+      # "denied" on POST /volumes/create for postgres_data/redis_data/
+      # vault_data/dashboard_data/etc — stays required).
+      #
+      # CORRECTED (2026-07-31, was inaccurate): this comment used to claim a
+      # privileged `Binds:[/:/host]` mount via POST /containers/create was
+      # "still blocked" here. That's false — docker-socket-proxy authorizes
+      # purely by HTTP method + URL path (ACL categories like CONTAINERS/
+      # POST/VOLUMES), never by inspecting the request BODY. With POST=1 and
+      # CONTAINERS=1 already required for `docker compose up` to create any
+      # container at all, a POST /containers/create carrying
+      # `HostConfig.Binds:["/:/host"]` passes through identically to a normal
+      # container-create call.
+      #
+      # Residual risk: dashboard-api's `/host-compose` mount (see the
+      # dashboard-api service below) is a read-write bind of the whole
+      # install directory, and dashboard-api legitimately WRITES
+      # docker-compose.override.yml there (generateOverrideToDir()). An RCE
+      # in dashboard-api could therefore inject a malicious bind-mount into
+      # that override file and trigger `docker compose up` through this same
+      # proxy. This is not a hole THIS proxy introduces — it's inherent to
+      # dashboard-api authoring and executing compose plans for the
+      # platform. Fully closing it needs a compose-plan validator (parse +
+      # allow-list before ever calling `docker compose up`) that does not
+      # exist today; deliberately out of scope for this pass, tracked as a
+      # follow-up rather than silently accepted as safe. What IS mitigated:
+      # the broad `.:/host-compose` bind no longer redundantly exposes
+      # vault-keys/vault-tls/.coderaft-age.key to dashboard-api (see that
+      # service's tmpfs / /dev/null volume entries below).
       VOLUMES: 1
       # #Y1 fix (2026-07-22): DISTRIBUTION=1 required for `docker compose pull`
       # multi-arch. It calls GET /distribution/{name}/json to resolve the right
@@ -1160,11 +1563,24 @@ services:
       ALLOW_RESTARTS: 1
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      # F-014 (2026-07-31) — PowerShell parity with install.sh: NAMED VOLUME
+      # (not tmpfs) so docker-socket-proxy's baked-in haproxy.cfg.template
+      # survives being copied into it on first mount — a plain tmpfs is
+      # always empty and would wipe that template out from under the
+      # entrypoint's `sed`, confirmed on the macOS testing Mac against this
+      # exact image (`sed: ... .template: No such file or directory`).
+      - docker_proxy_haproxy_cfg:/usr/local/etc/haproxy
     networks:
       - docker-proxy-net
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
     cap_add: [CHOWN, SETGID, SETUID, NET_BIND_SERVICE]
+    read_only: true
+    tmpfs: [/tmp, /var/run]
+    mem_limit: 128m
+    memswap_limit: 128m
+    mem_reservation: 32m
+    cpus: 0.5
     restart: unless-stopped
 
   dashboard-api:
@@ -1212,7 +1628,9 @@ services:
       - LICENSE_SERVER_URL=https://license.coderaft.io
       - DATABASE_URL=postgres://coderaft:${POSTGRES_PASSWORD}@postgres:5432/coderaft
       - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
-      - DASHBOARD_SECRET=${DASHBOARD_SECRET}
+      # Security hardening (2026-07-31): DASHBOARD_SECRET removed — dead
+      # code here too (dashboard-api resolves it from Coderaft Vault
+      # directly, never process.env). See install.sh for full rationale.
       - CONTAINER_COMPOSE_DIR=/host-compose
       - HOST_PROJECT_DIR=${HOST_PROJECT_DIR}
       - COMPOSE_PROJECT_NAME=coderaft
@@ -1237,6 +1655,17 @@ services:
       - ./vault-tls/client-ca.crt:/vault-tls/client-ca.crt:ro
       - ./vault-tls/dashboard-api-client.crt:/vault-tls/dashboard-api-client.crt:ro
       - ./vault-tls/dashboard-api-client.key:/vault-tls/dashboard-api-client.key:ro
+      # Security hardening (2026-07-31) — PowerShell parity with install.sh:
+      # blank out the redundant vault-keys/vault-tls/.coderaft-age.key
+      # exposure inside the broad `.:/host-compose` bind (dashboard-api's own
+      # code never reads these THROUGH /host-compose — confirmed via grep of
+      # server.js — it uses the narrow RO mounts above instead). Docker
+      # Desktop on Windows runs the Linux daemon in a VM, so `/dev/null` bind
+      # + `tmpfs:` over a directory behave identically to Linux/macOS here —
+      # same mitigation verified experimentally for install.sh in an isolated
+      # throwaway compose project (2026-07-31); no Windows-specific caveat
+      # found, though not re-verified on an actual Windows host from this Mac.
+      - /dev/null:/host-compose/.coderaft-age.key
     # Task #148 Phase 3 (banking-grade runtime exposure reduction, PowerShell
     # parity with install.sh commit 04b2c14): the *working* .env (resolved
     # secret VALUES, passed to `docker compose --env-file`) is written here
@@ -1250,7 +1679,39 @@ services:
     # reached experimentally for install.sh, no Windows-specific caveat found.
     tmpfs:
       - /run/coderaft-env:size=1m,mode=0700,uid=0
+      - /host-compose/vault-keys:mode=0000,uid=0,size=1m
+      - /host-compose/vault-tls:mode=0000,uid=0,size=1m
+      # Phase 2 hardening (2026-07-31) — PowerShell parity with install.sh:
+      #   - /tmp: sized for the two small zip-staging paths only (capture-host
+      #     installer, GPO/Intune CA-push) — the restic disaster-recovery
+      #     restore scratch dir and its cache dir were BOTH redirected to the
+      #     disk-backed /data volume in dashboard-api/server.js and backup.js
+      #     (see those files for the F-011/F-014 comments), so this tmpfs
+      #     never needs to hold a multi-GB restore.
+      #   - /etc/coderaft: legacy local age-key self-heal path
+      #     (AGE_KEY_PATH) — confirmed on the macOS testing Mac this fails
+      #     with `ENOENT ... mkdir '/etc/coderaft'` under read_only without
+      #     this tmpfs, and was already ephemeral before this change anyway
+      #     (no volume ever mounted it).
+      - /tmp:size=512m
+      - /etc/coderaft
     security_opt: [no-new-privileges:true]
+    # F-011/F-014 (2026-07-31) — PowerShell parity with install.sh: verified
+    # on the macOS testing Mac (same image Windows pulls) that a full boot
+    # (real /data + /host-compose mounts, DASHBOARD_SECRET set) still reaches
+    # `listening on port 3001` and GET /healthz → 200 with ALL caps dropped.
+    cap_drop: [ALL]
+    read_only: true
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3001/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    mem_limit: 1g
+    memswap_limit: 1g
+    mem_reservation: 256m
+    cpus: 2
     restart: unless-stopped
 
   # ── coderaft-vault ──────────────────────────────────────────────────────────
@@ -1260,6 +1721,16 @@ services:
     image: ghcr.io/liamj74/coderaft-vault:latest
     # B8 fix: run as root so container can write /data SQLite and read 0600 .key files.
     # Security maintained via cap_drop:ALL + no-new-privileges.
+    #
+    # F-004 re-verified (2026-07-31) — PowerShell parity with install.sh: the
+    # Dockerfile's final stage already defaults to non-root
+    # (distroless/static-debian12:nonroot, USER nonroot:nonroot); this
+    # `user: "0:0"` compose override is what forces it back to root, and
+    # that's deliberate. `.\vault-keys`/`.\vault-tls` are host files whose
+    # Windows ACLs are set by THIS installer's own invoking user (not
+    # necessarily mappable to uid 65532 inside the Linux VM Docker Desktop
+    # runs) — same host-permission-vs-container-uid mismatch as on Linux/
+    # macOS, see install.sh for the full reasoning. Left unchanged.
     user: "0:0"
     networks:
       - coderaft-vault-net
@@ -1276,6 +1747,10 @@ services:
       start_period: 10s
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
+    mem_limit: 256m
+    memswap_limit: 256m
+    mem_reservation: 64m
+    cpus: 1
     restart: unless-stopped
 
   # ── coderaft-cve-proxy ───────────────────────────────────────────────────
@@ -1296,6 +1771,11 @@ services:
       - CODERAFT_VAULT_CA=/vault-tls/client-ca.crt
       - CODERAFT_VAULT_CLIENT_CERT=/vault-tls/cve-proxy-client.crt
       - CODERAFT_VAULT_CLIENT_KEY=/vault-tls/cve-proxy-client.key
+      # ACCEPTED RESIDUAL RISK (2026-07-31) — see install.sh for the full
+      # rationale: coderaft-cve-proxy's source isn't in this monorepo (no
+      # code we can extend) and it's a distroless static image (no shell to
+      # wrap either). Every other secret in this deployment was migrated to
+      # a Docker `secrets:` file; this one deliberately could not be.
       - XPRODUCT_INTERNAL_TOKEN=${XPRODUCT_INTERNAL_TOKEN}
     volumes:
       - ./vault-tls/client-ca.crt:/vault-tls/client-ca.crt:ro
@@ -1308,6 +1788,10 @@ services:
       retries: 3
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
+    mem_limit: 256m
+    memswap_limit: 256m
+    mem_reservation: 64m
+    cpus: 1
     restart: unless-stopped
 
   postgres:
@@ -1327,8 +1811,22 @@ services:
       POSTGRES_INITDB_ARGS: "--data-checksums"
     secrets:
       - postgres_password
+    # F-025 (2026-07-31) — PowerShell parity with install.sh: scram-sha-256
+    # only, restricted to the pinned coderaft-backend subnet
+    # (172.28.42.0/24 — see that network's `ipam:` block below; the two MUST
+    # stay in sync). Verified in a throwaway compose project on the macOS
+    # testing Mac (same Docker Desktop engine Windows hosts use): a peer on
+    # the pinned subnet connects fine, a peer on a different docker network
+    # gets a hard `pg_hba.conf rejects connection ... no encryption`.
+    command:
+      - postgres
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+      - -c
+      - password_encryption=scram-sha-256
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
       # init-db.sql is intentionally NOT bind-mounted — when the
       # dashboard-api spawns docker-compose from inside a Linux container
       # against a Windows host, the resolved Windows path contains a
@@ -1349,19 +1847,48 @@ services:
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+    mem_limit: 1g
+    memswap_limit: 1g
+    mem_reservation: 256m
+    cpus: 2
     restart: unless-stopped
 
   redis:
     image: redis:7-alpine
-    command: redis-server --requirepass ${REDIS_PASSWORD} --maxmemory 128mb
+    # Task #219 (2026-07-31, PowerShell parity — this whole service was OUT
+    # OF SYNC with install.sh before this pass: still the plaintext
+    # `--requirepass ${REDIS_PASSWORD}` form, visible in full via
+    # `docker inspect`'s Config.Cmd on Windows installs). Read the password
+    # from the mounted secrets file via a shell command override instead —
+    # `user: "999:1000"` pins the container to the image's own unprivileged
+    # `redis` account directly, since the stock entrypoint only auto-drops
+    # root to that user for its OWN default `redis-server ...` CMD path and
+    # skips that step for any other command (this `sh -c` override included),
+    # which would otherwise silently run as root.
+    user: "999:1000"
+    command: ["sh", "-c", "redis-server --requirepass \"$(cat /run/secrets/redis_password)\" --maxmemory 128mb"]
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$(cat /run/secrets/redis_password)\" ping"]
       interval: 5s
       timeout: 5s
       retries: 5
+    secrets:
+      - redis_password
     # B-PRODUCT-DB-NET: same reason as postgres above — product workers also
     # connect to redis://redis:6379 and must resolve the hostname.
     networks: [coderaft-backend]
+    # F-011/F-014 (2026-07-31) — PowerShell parity with install.sh: verified
+    # PING/SET/BGSAVE all still work with ALL caps dropped + read_only root
+    # + no extra tmpfs — redis:7-alpine's own Dockerfile declares
+    # `VOLUME /data`, so Docker always gives it a writable volume regardless
+    # of the read_only root fs (what BGSAVE's periodic RDB snapshot uses).
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    read_only: true
+    mem_limit: 256m
+    memswap_limit: 256m
+    mem_reservation: 64m
+    cpus: 1
     restart: unless-stopped
 
 networks:
@@ -1376,7 +1903,17 @@ networks:
   # redis, neo4j) and the dynamically-deployed products. Declared here so
   # the install.ps1 / install.sh templates can put data services on it
   # without dashboard-api having to compose them.
-  coderaft-backend: {}
+  # F-025 (2026-07-31) — PowerShell parity with install.sh: subnet PINNED
+  # (not left to Docker's auto-allocation) so postgres/pg_hba.conf below can
+  # hard-code the exact CIDR it trusts. MUST match install.sh's pinned value
+  # exactly — both installers can target the SAME running stack over its
+  # lifetime (e.g. an operator switching hosts), and a mismatched subnet
+  # here would either lock every product out of Postgres or silently accept
+  # a wider range than intended.
+  coderaft-backend:
+    ipam:
+      config:
+        - subnet: 172.28.42.0/24
   # B-DASHBOARD-NET: frontend network where the dashboard nginx and the
   # product HTTP listeners (entraguard-api, ravenscan, redfox-api) meet.
   # The dashboard joins it so its proxy can dial /api/<product>/* targets.
@@ -1388,6 +1925,10 @@ volumes:
   caddy_data:
   caddy_config:
   vault_data:
+  # F-014 (2026-07-31) — PowerShell parity with install.sh: named volume
+  # (not tmpfs) so docker-socket-proxy's baked-in haproxy.cfg.template
+  # survives under read_only:true — see that service's `volumes:` comment.
+  docker_proxy_haproxy_cfg:
 
 # Task #148 Phase 3 (PowerShell parity with install.sh commit 04b2c14):
 # postgres's password, Docker-native file-based secret. Must be a real path
@@ -1399,8 +1940,48 @@ volumes:
 secrets:
   postgres_password:
     file: ./secrets/postgres_password
+  # Task #219 (2026-07-31) — PowerShell parity with install.sh: same idea,
+  # redis. This entry was MISSING entirely before this pass (install.ps1's
+  # redis service still used the plaintext `${REDIS_PASSWORD}` form) — see
+  # Write-RedisSecretFile above and the redis service's `secrets:`/`user:`/
+  # `command:` above.
+  redis_password:
+    file: ./secrets/redis_password
 '@
 [System.IO.File]::WriteAllText("$(Get-Location)\docker-compose.yml", $Compose, [System.Text.UTF8Encoding]::new($false))
+
+# ── postgres\pg_hba.conf (F-025, 2026-07-31) — PowerShell parity with install.sh
+# scram-sha-256-only auth, restricted to the pinned coderaft-backend subnet
+# (172.28.42.0/24 — MUST match the `coderaft-backend` network's `ipam:`
+# block in $Compose above; the two are hard-coded independently, same as
+# install.sh, since there is no templating step between them here either).
+# Idempotent — only written if missing, so an operator's manual edits
+# survive update.ps1 re-runs.
+New-Item -ItemType Directory -Force -Path "postgres" | Out-Null
+if (-not (Test-Path "postgres\pg_hba.conf")) {
+    $PgHba = @'
+# Coderaft — managed by deploy/install.ps1 (F-025). scram-sha-256 only.
+# TYPE    DATABASE  USER  ADDRESS           METHOD
+
+# Unix socket (inside the postgres container itself, e.g. an operator
+# `docker compose exec postgres psql`).
+local     all       all                     scram-sha-256
+
+# coderaft-backend Docker network only — every consumer (dashboard-api,
+# entraguard-api/worker/beat, ravenscan, redfox-api/gateway, falconone-*)
+# joins this network; nothing outside it can reach postgres:5432 at all
+# (no host port is published), so this is defense-in-depth on top of that
+# network-level isolation, not the only control.
+host      all       all   172.28.42.0/24    scram-sha-256
+
+# Default deny — anything that isn't the exact subnet above (e.g. a stray
+# container mistakenly joined to more than one network) is rejected here,
+# not silently allowed by falling through to a permissive default.
+host      all       all   0.0.0.0/0         reject
+host      all       all   ::/0              reject
+'@
+    [System.IO.File]::WriteAllText("$(Get-Location)\postgres\pg_hba.conf", $PgHba, [System.Text.UTF8Encoding]::new($false))
+}
 
 # ── Caddyfile (env-templated TLS: internal CA / wildcard / ACME) ─────────────
 # TLS mode is driven by env placeholders resolved at Caddy start:
@@ -1420,8 +2001,70 @@ $Caddyfile = @'
     }
 }
 
+# F-007 (2026-07-31): baseline security headers for every site block.
+#
+# F-036 (2026-07-31) evaluated and closed WITHOUT a code change to the CSP
+# below — investigated live in a throwaway compose (caddy:2-alpine is
+# actually v2.11.4; verified against caddyserver/caddy's tplcontext.go), not
+# just the indicative snippet in REMEDIATION-PROMPT-2026-06-20.md:
+#   - Caddy has NO built-in nonce template function (checked the real
+#     http.handlers.templates function list: include/readFile/import/
+#     httpInclude/stripHTML/markdown/env/placeholder/fileExists/httpError/
+#     humanize/maybe/pathEscape — no `nonce`). A dynamic per-request nonce
+#     would need a custom xcaddy build with a third-party plugin — real
+#     ongoing maintenance cost for what `dashboard` is: a pure static Vite
+#     SPA served by nginx (no per-request HTML generation at all — see the
+#     comment on the `dashboard` service below), so there's no natural place
+#     to even mint/thread a nonce server-side.
+#   - Even if we had nonces, they only cover <script>/<style> ELEMENTS —
+#     never a `style=""` ATTRIBUTE. That's the actual gap here: bundled
+#     @xterm/xterm (RedFox SSH/RDP terminal sessions) calls
+#     `element.setAttribute("style", ...)` for cell/selection highlighting,
+#     confirmed present in the shipped bundle (grep dist/assets/*.js for
+#     `_addStyle`/`setAttribute("style"`). Per the CSP spec (confirmed via
+#     MDN), that call is blocked by style-src unless 'unsafe-inline' is
+#     present — no nonce or hash can except a dynamically-set attribute.
+#     Dropping 'unsafe-inline' from style-src would silently break every
+#     RedFox terminal session. style-src is left as-is.
+#   - script-src already has NO 'unsafe-inline' (shipped tonight in F-007)
+#     and needed no change — but verifying it live (see "Vérification" in
+#     the F-036 task) surfaced a real regression: apps/shell/index.html had
+#     an inline <script> (dark/light theme pre-paint init) with no
+#     nonce/hash, so Chrome was silently blocking it
+#     ("script-src 'self'" refuses inline execution) — the pre-paint theme
+#     class was never applied. Fixed by externalizing it to
+#     apps/shell/public/theme-init.js (same-origin external file, no CSP
+#     exception needed). Confirmed fixed: document.documentElement.className
+#     was empty before, "light"/"dark" after, in the same throwaway compose.
+#   - Separately discovered (NOT fixed here, flagged for its own ticket):
+#     FalconOne Remote Assist's protobufjs Root (`hbb.RendezvousMessage` /
+#     `hbb.NatType`, the RustDesk-compatible wire protocol, #139) builds its
+#     message constructors via runtime `new Function(...)` codegen at module
+#     load — this throws
+#     "EvalError: ... 'unsafe-eval' is not an allowed source" under the
+#     current script-src, every page load, independent of any user action.
+#     This looks like a live break of Remote Assist signal/relay encoding
+#     introduced by tonight's F-007 CSP. Needs either protobufjs static
+#     codegen (`pbjs --target static-module`, no runtime eval) or a scoped
+#     fix — NOT an "add unsafe-eval" fix, that would undo the hardening.
+(coderaft_security) {
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Frame-Options "DENY"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+        Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'"
+        Cross-Origin-Opener-Policy "same-origin"
+        Cross-Origin-Resource-Policy "same-origin"
+        -Server
+        -X-Powered-By
+    }
+}
+
 # Platform sites. TLS mode injected from .env by the Setup Wizard.
 {$CODERAFT_TLS_SITES:coderaft.local, *.coderaft.local} {
+    import coderaft_security
     tls {$CADDY_TLS_MODE_ARGS:internal}
     reverse_proxy dashboard:3000 {
         header_up X-Forwarded-Proto https
@@ -1436,6 +2079,7 @@ http://{$CODERAFT_HOSTNAME:coderaft.local}, http://*.{$CODERAFT_HOSTNAME:coderaf
 
 # Fallback: anything else (IP access, localhost) stays plain HTTP.
 :80 {
+    import coderaft_security
     reverse_proxy dashboard:3000
 }
 '@

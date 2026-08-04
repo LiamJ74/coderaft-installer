@@ -288,6 +288,28 @@ strip_from_main_env() {
     fi
 }
 
+# ── Backup rotation (security hardening, 2026-07-31) ─────────────────────────
+# Every self-heal path in this script does `cp X X.bak-<timestamp>` (or
+# `.bak-<tag>-<timestamp>`, or — for the corrupted-override recovery path —
+# `.broken-<timestamp>`) before touching X: acl.yaml, docker-compose.yml,
+# docker-compose.override.yml. On a deployment that runs unattended for
+# months/years across many update.sh runs, these accumulate without bound.
+# Keep only the $2 most recent (default 5) backups matching $3 (glob suffix,
+# default "bak-*") under $1's basename; delete anything older. Safe/
+# idempotent: a no-op when there are $2 or fewer. Defined this early (before
+# upsert_install_config's first self-heal callers below) so it's available to
+# both the top-level self-heal blocks further down this script and the ACL
+# self-heal functions defined later.
+_rotate_backups() {
+    local base_path="$1" keep="${2:-5}" glob_suffix="${3:-bak-*}"
+    local dir base
+    dir="$(dirname "$base_path")"
+    base="$(basename "$base_path")"
+    ls -t "${dir}/${base}.${glob_suffix}" 2>/dev/null | tail -n "+$((keep + 1))" | while IFS= read -r f; do
+        rm -f -- "$f"
+    done
+}
+
 # ── Self-heal CODERAFT_HOST_OS in install-config.env (B25) ────────────────
 # Les installs antérieures préservaient .env sans ajouter CODERAFT_HOST_OS.
 # Dashboard-api lit cette valeur pour le mode capture (native vs sidecar).
@@ -331,6 +353,7 @@ strip_from_main_env "CODERAFT_HOST_ARCH"
 COMPOSE_PATH="${INSTALL_DIR}/docker-compose.yml"
 if [ -f "$COMPOSE_PATH" ] && grep -qF 'coderaft-vault: { condition: service_healthy }' "$COMPOSE_PATH"; then
     cp "$COMPOSE_PATH" "$COMPOSE_PATH.bak-$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+    _rotate_backups "$COMPOSE_PATH"
     sed -i.tmp 's|coderaft-vault: { condition: service_healthy }|coderaft-vault: { condition: service_started }|' "$COMPOSE_PATH"
     rm -f "$COMPOSE_PATH.tmp"
     echo "  ✓ Self-heal docker-compose.yml — coderaft-vault: service_healthy → service_started"
@@ -343,6 +366,7 @@ fi
 if [ -f "$COMPOSE_PATH" ] && ! grep -qF 'NODE_OPTIONS=--dns-result-order=ipv4first' "$COMPOSE_PATH"; then
     if grep -qF '      - LICENSE_SERVER_URL=https://license.coderaft.io' "$COMPOSE_PATH"; then
         cp "$COMPOSE_PATH" "$COMPOSE_PATH.bak-b15-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+        _rotate_backups "$COMPOSE_PATH"
         # Inject NODE_OPTIONS line BEFORE every LICENSE_SERVER_URL line.
         sed -i.tmp 's|      - LICENSE_SERVER_URL=https://license.coderaft.io|      - NODE_OPTIONS=--dns-result-order=ipv4first\
       - LICENSE_SERVER_URL=https://license.coderaft.io|g' "$COMPOSE_PATH"
@@ -359,6 +383,7 @@ fi
 if [ -f "$COMPOSE_PATH" ] && ! grep -qE '^[[:space:]]*coderaft-cve-proxy:[[:space:]]*$' "$COMPOSE_PATH" \
    && grep -qE '^[[:space:]]*postgres:[[:space:]]*$' "$COMPOSE_PATH"; then
     cp "$COMPOSE_PATH" "$COMPOSE_PATH.bak-cveproxy-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    _rotate_backups "$COMPOSE_PATH"
     _cveproxy_block=$(cat <<'CVEPROXYBLOCK'
   # ── coderaft-cve-proxy ───────────────────────────────────────────────────
   # Internal sidecar in front of the shared coderaft-cve-engine
@@ -378,6 +403,11 @@ if [ -f "$COMPOSE_PATH" ] && ! grep -qE '^[[:space:]]*coderaft-cve-proxy:[[:spac
       - CODERAFT_VAULT_CA=/vault-tls/client-ca.crt
       - CODERAFT_VAULT_CLIENT_CERT=/vault-tls/cve-proxy-client.crt
       - CODERAFT_VAULT_CLIENT_KEY=/vault-tls/cve-proxy-client.key
+      # ACCEPTED RESIDUAL RISK (security hardening 2026-07-31) — see
+      # install.sh for the full rationale: coderaft-cve-proxy's source isn't
+      # in this monorepo and it's a distroless static image (no shell), so
+      # unlike every other secret in this deployment (migrated to a Docker
+      # `secrets:` file), this one deliberately could not be.
       - XPRODUCT_INTERNAL_TOKEN=${XPRODUCT_INTERNAL_TOKEN}
     volumes:
       - ./vault-tls/client-ca.crt:/vault-tls/client-ca.crt:ro
@@ -412,6 +442,7 @@ fi
 if [ -f "$COMPOSE_PATH" ] && ! grep -qF '/run/coderaft-env' "$COMPOSE_PATH" \
    && grep -qF './vault-tls/dashboard-api-client.key:/vault-tls/dashboard-api-client.key:ro' "$COMPOSE_PATH"; then
     cp "$COMPOSE_PATH" "$COMPOSE_PATH.bak-tmpfsenv-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    _rotate_backups "$COMPOSE_PATH"
     sed -i.tmp 's|      - ./vault-tls/dashboard-api-client.key:/vault-tls/dashboard-api-client.key:ro|      - ./vault-tls/dashboard-api-client.key:/vault-tls/dashboard-api-client.key:ro\
     tmpfs:\
       - /run/coderaft-env:size=1m,mode=0700,uid=0|' "$COMPOSE_PATH"
@@ -434,6 +465,7 @@ fi
 if [ -f "$COMPOSE_PATH" ] && grep -qF 'POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}' "$COMPOSE_PATH" \
    && ! grep -qF 'POSTGRES_PASSWORD_FILE' "$COMPOSE_PATH"; then
     cp "$COMPOSE_PATH" "$COMPOSE_PATH.bak-pgsecret-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    _rotate_backups "$COMPOSE_PATH"
 
     mkdir -p "${INSTALL_DIR}/secrets"
     chmod 700 "${INSTALL_DIR}/secrets"
@@ -487,6 +519,7 @@ fi
 if [ -f "$COMPOSE_PATH" ] && grep -qF 'command: redis-server --requirepass ${REDIS_PASSWORD} --maxmemory 128mb' "$COMPOSE_PATH" \
    && ! grep -qF '/run/secrets/redis_password' "$COMPOSE_PATH"; then
     cp "$COMPOSE_PATH" "$COMPOSE_PATH.bak-redissecret-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    _rotate_backups "$COMPOSE_PATH"
 
     mkdir -p "${INSTALL_DIR}/secrets"
     chmod 700 "${INSTALL_DIR}/secrets"
@@ -560,6 +593,7 @@ fi
 OVERRIDE_PATH="${INSTALL_DIR}/docker-compose.override.yml"
 if [ -f "$OVERRIDE_PATH" ] && grep -qE '"7687:7687"|- 7687:7687' "$OVERRIDE_PATH"; then
     cp "$OVERRIDE_PATH" "$OVERRIDE_PATH.bak-$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+    _rotate_backups "$OVERRIDE_PATH"
     sed -i.tmp 's|"7687:7687"|"127.0.0.1:${NEO4J_BOLT_PORT:-7687}:7687"|g; s|- 7687:7687|- "127.0.0.1:${NEO4J_BOLT_PORT:-7687}:7687"|g' "$OVERRIDE_PATH"
     rm -f "$OVERRIDE_PATH.tmp"
     echo "  ✓ Self-heal docker-compose.override.yml — neo4j 127.0.0.1 only + paramétrable"
@@ -598,6 +632,7 @@ if ! docker compose "${COMPOSE_ENV_ARGS[@]}" ps >/dev/null 2>&1; then
     echo "  ⚠ docker-compose.override.yml appears corrupted — auto-recovery..."
     if [ -f "docker-compose.override.yml" ]; then
         cp docker-compose.override.yml "docker-compose.override.yml.broken-$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+        _rotate_backups "docker-compose.override.yml" 5 "broken-*"
         rm -f docker-compose.override.yml
         echo "    ✓ override backed up + removed"
     fi
@@ -702,7 +737,7 @@ if [ "$NEED_REGEN" = "1" ]; then
     openssl x509 -req -days 3650 -sha256 \
         -in server.csr -CA agents-ca.crt -CAkey agents-ca.key -CAcreateserial \
         -out server.crt -extfile /tmp/server.ext 2>/dev/null
-    rm -f server.csr
+    rm -f server.csr /tmp/server.ext
 fi
 chmod 644 *.crt *.key 2>/dev/null || true
 FOSCRIPT
@@ -742,6 +777,8 @@ _falconone_acl_selfheal() {
         "read:falconone/pki/agents-ca/cert"
         "read:pki/falconone-agents-ca*"
         "write:pki/falconone-agents-ca*"
+        "read:falconone/scripts_ca*"
+        "write:falconone/scripts_ca*"
     )
 
     local ts
@@ -749,6 +786,7 @@ _falconone_acl_selfheal() {
 
     if ! grep -qE '^[[:space:]]*-[[:space:]]*name:[[:space:]]*falconone[[:space:]]*$' "$acl_path"; then
         cp "$acl_path" "${acl_path}.bak-${ts}"
+        _rotate_backups "$acl_path"
         cat >> "$acl_path" <<'FALCONONEACL'
 
   - name: falconone
@@ -764,6 +802,8 @@ _falconone_acl_selfheal() {
       - "read:falconone/pki/agents-ca/cert"
       - "read:pki/falconone-agents-ca*"
       - "write:pki/falconone-agents-ca*"
+      - "read:falconone/scripts_ca*"
+      - "write:falconone/scripts_ca*"
 FALCONONEACL
         echo "  [install] Self-heal ACL: falconone permissions updated (+${#required_perms[@]} added, entry created)"
         return 0
@@ -793,6 +833,7 @@ FALCONONEACL
     fi
 
     cp "$acl_path" "${acl_path}.bak-${ts}"
+    _rotate_backups "$acl_path"
 
     if grep -qE '^[[:space:]]*permissions:[[:space:]]*\[.*\][[:space:]]*$' <<< "$block"; then
         local additions=""
@@ -816,6 +857,110 @@ FALCONONEACL
     echo "  [install] Self-heal ACL: falconone permissions updated (+${#missing[@]} added)"
 }
 
+# ── ACL self-heal: redfox connections/k8s vault-backed credentials ──────────
+# Zero-Knowledge Credential Architecture Palier 1
+# (coderaft-platform/docs/redfox-zero-knowledge-scoping.md): target
+# connection credentials and k8s cluster auth data move from RedFox's own
+# Postgres into this vault, under redfox/connections/* and redfox/k8s/*.
+# Same additive-only, idempotent merge-into-existing-entry pattern as
+# _falconone_acl_selfheal above — any install already has a "redfox" entry
+# (it existed for platform/identity/oidc), so without this it would never
+# gain the new permissions.
+_redfox_acl_selfheal() {
+    local acl_path="$1"
+
+    if [ ! -f "$acl_path" ]; then
+        echo "  [install] ACL self-heal: $acl_path not found — skipping (vault not provisioned yet)"
+        return 0
+    fi
+
+    local required_perms=(
+        "read:license_key"
+        "read:redfox_*"
+        "read:platform/identity/oidc"
+        "read:platform/identity/graph-tools"
+        "read:redfox/connections/*"
+        "write:redfox/connections/*"
+        "delete:redfox/connections/*"
+        "read:redfox/k8s/*"
+        "write:redfox/k8s/*"
+        "delete:redfox/k8s/*"
+    )
+
+    local ts
+    ts="$(date -u +"%Y%m%dT%H%M%SZ")"
+
+    if ! grep -qE '^[[:space:]]*-[[:space:]]*name:[[:space:]]*redfox[[:space:]]*$' "$acl_path"; then
+        cp "$acl_path" "${acl_path}.bak-${ts}"
+        _rotate_backups "$acl_path"
+        cat >> "$acl_path" <<'REDFOXACL'
+
+  - name: redfox
+    cert_san: "redfox.coderaft.local"
+    permissions:
+      - "read:license_key"
+      - "read:redfox_*"
+      - "read:platform/identity/oidc"
+      - "read:platform/identity/graph-tools"
+      - "read:redfox/connections/*"
+      - "write:redfox/connections/*"
+      - "delete:redfox/connections/*"
+      - "read:redfox/k8s/*"
+      - "write:redfox/k8s/*"
+      - "delete:redfox/k8s/*"
+REDFOXACL
+        echo "  [install] Self-heal ACL: redfox permissions updated (+${#required_perms[@]} added, entry created)"
+        return 0
+    fi
+
+    local start_line end_line
+    start_line=$(grep -nE '^[[:space:]]*-[[:space:]]*name:[[:space:]]*redfox[[:space:]]*$' "$acl_path" | head -1 | cut -d: -f1)
+    end_line=$(awk -v s="$start_line" 'NR>s && /^[[:space:]]*-[[:space:]]*name:/{print NR; exit}' "$acl_path")
+    if [ -z "$end_line" ]; then
+        end_line=$(( $(wc -l < "$acl_path") + 1 ))
+    fi
+
+    local block
+    block=$(sed -n "${start_line},$((end_line - 1))p" "$acl_path")
+
+    local missing=()
+    local p
+    for p in "${required_perms[@]}"; do
+        if ! grep -qF "\"${p}\"" <<< "$block"; then
+            missing+=("$p")
+        fi
+    done
+
+    if [ "${#missing[@]}" -eq 0 ]; then
+        echo "  [install] ACL redfox already up-to-date"
+        return 0
+    fi
+
+    cp "$acl_path" "${acl_path}.bak-${ts}"
+    _rotate_backups "$acl_path"
+
+    if grep -qE '^[[:space:]]*permissions:[[:space:]]*\[.*\][[:space:]]*$' <<< "$block"; then
+        local additions=""
+        for p in "${missing[@]}"; do additions="${additions},\"${p}\""; done
+        awk -v s="$start_line" -v e="$end_line" -v add="$additions" '
+            NR>=s && NR<e && /^[[:space:]]*permissions:[[:space:]]*\[.*\][[:space:]]*$/ {
+                sub(/\][[:space:]]*$/, add "]")
+            }
+            { print }
+        ' "$acl_path" > "${acl_path}.tmp" && mv "${acl_path}.tmp" "$acl_path"
+    else
+        local addition_block=""
+        for p in "${missing[@]}"; do addition_block="${addition_block}      - \"${p}\""$'\n'; done
+        local insert_line=$(( end_line - 1 ))
+        awk -v ins="$insert_line" -v add="$addition_block" '
+            { print }
+            NR==ins { printf "%s", add }
+        ' "$acl_path" > "${acl_path}.tmp" && mv "${acl_path}.tmp" "$acl_path"
+    fi
+
+    echo "  [install] Self-heal ACL: redfox permissions updated (+${#missing[@]} added)"
+}
+
 # ── ACL self-heal: cve-proxy entry (coderaft-cve-engine sidecar) ────────────
 # Same additive-only, idempotent pattern as _falconone_acl_selfheal above.
 _cveproxy_acl_selfheal() {
@@ -834,6 +979,7 @@ _cveproxy_acl_selfheal() {
     local ts
     ts="$(date -u +"%Y%m%dT%H%M%SZ")"
     cp "$acl_path" "${acl_path}.bak-${ts}"
+    _rotate_backups "$acl_path"
     cat >> "$acl_path" <<'CVEPROXYACL'
 
   - name: cve-proxy
@@ -864,9 +1010,22 @@ CVEPROXYACL
 # API. This closes that gap so update.sh does it itself instead of requiring
 # a manual live patch — additive-only (only ever touches the ONE named
 # client's entry, via the same admin endpoint's existing safety checks),
-# idempotent (no-ops once the live vault already has the entry), and
-# non-fatal if the vault is absent/sealed/unreachable (the acl.yaml seed
-# above still covers a genuine fresh install).
+# idempotent (no-ops once the live vault already has every required
+# permission), and non-fatal if the vault is absent/sealed/unreachable (the
+# acl.yaml seed above still covers a genuine fresh install).
+#
+# MERGE, NOT JUST CREATE (fixed alongside the redfox Zero-Knowledge
+# Credential Architecture Palier 1 self-heal below): the original version of
+# this function treated "the client name already exists on the live vault"
+# as fully done and returned early — correct the first time a NEW client
+# (falconone, cve-proxy) was self-healed onto an existing vault, but wrong
+# for adding NEW permissions to an ALREADY-provisioned client, e.g. redfox
+# (which has had a live "redfox" entry since platform/identity/oidc shipped,
+# long before redfox/connections/* existed) or falconone's own #226
+# scripts_ca* grant. Now it fetches the entry's current live permissions and
+# PUTs the union with the required set — a true no-op if nothing is missing,
+# a merge (never a destructive overwrite of unrelated permissions) if
+# something is.
 _vault_acl_live_selfheal() {
     local name="$1" cert_san="$2"
     shift 2
@@ -904,18 +1063,44 @@ _vault_acl_live_selfheal() {
 
     local current
     current=$(_vault_curl_live GET /v1/admin/acl)
+
+    # Isolate this client's own object out of {"clients":[{...},{...}]} —
+    # the response is single-line JSON (json.Encoder does not indent), so a
+    # non-greedy "stop at the first }" match is safe and sufficient; no jq
+    # dependency is assumed to be present on the target host.
+    local entry_json=""
     if echo "$current" | grep -q "\"name\":\"${name}\""; then
-        return 0
+        entry_json=$(echo "$current" | grep -oE "\{\"name\":\"${name}\"[^}]*\}")
     fi
 
     local perms_json="" p
-    for p in "${perms[@]}"; do perms_json="${perms_json},\"${p}\""; done
-    perms_json="[${perms_json#,}]"
+    if [ -n "$entry_json" ]; then
+        local existing_perms merged
+        existing_perms=$(echo "$entry_json" | grep -oE '"permissions":\[[^]]*\]' | sed -E 's/"permissions":\[(.*)\]/\1/')
+        merged="$existing_perms"
+        for p in "${perms[@]}"; do
+            if ! grep -qF "\"${p}\"" <<< "$existing_perms"; then
+                merged="${merged},\"${p}\""
+            fi
+        done
+        if [ "$merged" = "$existing_perms" ]; then
+            echo "  [update] Vault ACL live self-heal: ${name} already up-to-date on the running vault"
+            return 0
+        fi
+        perms_json="[${merged#,}]"
+    else
+        for p in "${perms[@]}"; do perms_json="${perms_json},\"${p}\""; done
+        perms_json="[${perms_json#,}]"
+    fi
 
     local resp
     resp=$(_vault_curl_live PUT "/v1/admin/acl/${name}" "{\"cert_san\":\"${cert_san}\",\"permissions\":${perms_json}}")
     if echo "$resp" | grep -q '"ok":true'; then
-        echo "  [update] Vault ACL live self-heal: ${name} granted on the RUNNING vault (acl.yaml alone would not have reached it)"
+        if [ -n "$entry_json" ]; then
+            echo "  [update] Vault ACL live self-heal: ${name} permissions merged on the RUNNING vault (acl.yaml alone would not have reached it)"
+        else
+            echo "  [update] Vault ACL live self-heal: ${name} granted on the RUNNING vault (acl.yaml alone would not have reached it)"
+        fi
     else
         echo "  [update] Vault ACL live self-heal: PUT /v1/admin/acl/${name} failed — will retry on next update: ${resp}" >&2
     fi
@@ -965,7 +1150,7 @@ _vault_client_cert_selfheal() {
                 openssl x509 -req -days 3650 -sha256 \
                     -in '${name}-client.csr' -CA client-ca.crt -CAkey client-ca.key -CAcreateserial \
                     -out '${name}-client.crt' -extfile /tmp/client.ext 2>/dev/null
-                rm -f '${name}-client.csr'
+                rm -f '${name}-client.csr' /tmp/client.ext
                 chmod 600 '${name}-client.key' '${name}-client.crt'
             " 2>&1
     fi
@@ -1489,13 +1674,13 @@ printf "subjectAltName=DNS:coderaft-vault,DNS:localhost,IP:127.0.0.1\nbasicConst
 openssl x509 -req -days 3650 -sha256 \
     -in vault.csr -CA client-ca.crt -CAkey client-ca.key -CAcreateserial \
     -out vault.crt -extfile /tmp/server.ext 2>/dev/null
-rm -f vault.csr
+rm -f vault.csr /tmp/server.ext
 for pair in "dashboard-api:dashboard-api.coderaft.local" "entraguard:entraguard.coderaft.local" "ravenscan:ravenscan.coderaft.local" "redfox:redfox.coderaft.local" "falconone:falconone.coderaft.local" "cve-proxy:cve-proxy.coderaft.local"; do
     n="${pair%%:*}"; s="${pair##*:}"
     openssl req -newkey rsa:2048 -nodes -sha256 -keyout "${n}-client.key" -out "${n}-client.csr" -subj "/CN=${s}" 2>/dev/null
     printf "subjectAltName=DNS:%s\nbasicConstraints=CA:FALSE" "$s" > /tmp/client.ext
     openssl x509 -req -days 3650 -sha256 -in "${n}-client.csr" -CA client-ca.crt -CAkey client-ca.key -CAcreateserial -out "${n}-client.crt" -extfile /tmp/client.ext 2>/dev/null
-    rm -f "${n}-client.csr"
+    rm -f "${n}-client.csr" /tmp/client.ext
 done
 chmod 600 *.key 2>/dev/null || true
 # falconone-api / coderaft-cve-proxy nonroot fix — see rationale above.
@@ -1554,10 +1739,10 @@ clients:
     permissions: ["read:ravenscan_*","read:neo4j_*","read:license_key","read:platform/identity/oidc"]
   - name: redfox
     cert_san: "redfox.coderaft.local"
-    permissions: ["read:redfox_*","read:license_key","read:platform/identity/oidc"]
+    permissions: ["read:redfox_*","read:license_key","read:platform/identity/oidc","read:platform/identity/graph-tools","read:redfox/connections/*","write:redfox/connections/*","delete:redfox/connections/*","read:redfox/k8s/*","write:redfox/k8s/*","delete:redfox/k8s/*"]
   - name: falconone
     cert_san: "falconone.coderaft.local"
-    permissions: ["read:license_key","read:falconone_*","read:platform/identity/oidc","sign:falconone_agent_cert","read:falconone/nvd_api_key","read:falconone/audit_hmac_key","write:falconone/audit_hmac_key","read:falconone/pki/agents-ca/cert","read:pki/falconone-agents-ca*","write:pki/falconone-agents-ca*"]
+    permissions: ["read:license_key","read:falconone_*","read:platform/identity/oidc","sign:falconone_agent_cert","read:falconone/nvd_api_key","read:falconone/audit_hmac_key","write:falconone/audit_hmac_key","read:falconone/pki/agents-ca/cert","read:pki/falconone-agents-ca*","write:pki/falconone-agents-ca*","read:falconone/scripts_ca*","write:falconone/scripts_ca*"]
   - name: cve-proxy
     cert_san: "cve-proxy.coderaft.local"
     permissions: ["read:cve-proxy/*", "write:cve-proxy/*"]
@@ -1577,7 +1762,19 @@ _vault_acl_live_selfheal "falconone" "falconone.coderaft.local" \
     "sign:falconone_agent_cert" "read:falconone/nvd_api_key" \
     "read:falconone/audit_hmac_key" "write:falconone/audit_hmac_key" \
     "read:falconone/pki/agents-ca/cert" "read:pki/falconone-agents-ca*" \
-    "write:pki/falconone-agents-ca*"
+    "write:pki/falconone-agents-ca*" "read:falconone/scripts_ca*" \
+    "write:falconone/scripts_ca*"
+
+# ── RedFox connections/k8s vault-backed credentials ACL self-heal ───────────
+# Zero-Knowledge Credential Architecture Palier 1 — see _redfox_acl_selfheal
+# above. redfox's client cert already exists (provisioned for
+# platform/identity/oidc), so no _vault_client_cert_selfheal call is needed.
+_redfox_acl_selfheal "${INSTALL_DIR}/vault-config/acl.yaml"
+_vault_acl_live_selfheal "redfox" "redfox.coderaft.local" \
+    "read:license_key" "read:redfox_*" "read:platform/identity/oidc" \
+    "read:platform/identity/graph-tools" "read:redfox/connections/*" \
+    "write:redfox/connections/*" "delete:redfox/connections/*" \
+    "read:redfox/k8s/*" "write:redfox/k8s/*" "delete:redfox/k8s/*"
 
 # ── cve-proxy vault client cert + ACL self-heal ──────────────────────────────
 # coderaft-cve-proxy is a shared platform sidecar, not tied to any single

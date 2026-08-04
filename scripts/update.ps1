@@ -69,6 +69,33 @@ function Get-InstallConfigVar($Key) {
     if ($m) { return $m.Matches.Groups[1].Value }
     return $null
 }
+
+# ── Backup rotation (security hardening, 2026-07-31) ────────────────────────
+# Every self-heal path below does Copy-Item $X "$X.bak-<tag>-<timestamp>"
+# before touching $X — acl.yaml, docker-compose.yml, docker-compose.override.yml
+# (plus one "docker-compose.override.yml.broken-<timestamp>" corruption
+# backup with a different separator). On a deployment that runs unattended
+# for months/years across many update.ps1 runs, these accumulate without
+# bound. Keep only the $Keep most recent (default 5) matching $GlobSuffix
+# under $BasePath's name; delete anything older. Safe/idempotent: a no-op
+# when there are $Keep or fewer, or none at all.
+function Invoke-RotateBackups {
+    param(
+        [Parameter(Mandatory = $true)][string]$BasePath,
+        [int]$Keep = 5,
+        [string]$GlobSuffix = "bak-*"
+    )
+    $dir = Split-Path -Path $BasePath -Parent
+    if ([string]::IsNullOrEmpty($dir)) { $dir = "." }
+    $leaf = Split-Path -Path $BasePath -Leaf
+    $backups = Get-ChildItem -LiteralPath $dir -Filter "$leaf.$GlobSuffix" -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending
+    if ($backups -and $backups.Count -gt $Keep) {
+        $backups | Select-Object -Skip $Keep | ForEach-Object {
+            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
 function Remove-FromMainEnv($Key) {
     $envPath = Join-Path $INSTALL_DIR ".env"
     if (Test-Path $envPath) {
@@ -393,6 +420,7 @@ if (Test-Path $composePath) {
     if ($composeText.Contains($oldDep)) {
         $bak = "$composePath.bak-" + (Get-Date -Format "yyyyMMdd_HHmmss")
         try { Copy-Item -LiteralPath $composePath -Destination $bak -Force -ErrorAction SilentlyContinue } catch {}
+        Invoke-RotateBackups -BasePath $composePath
         $composeText = $composeText.Replace($oldDep, $newDep)
         [System.IO.File]::WriteAllText($composePath, $composeText, [System.Text.UTF8Encoding]::new($false))
         Write-Host "  ✓ Self-heal docker-compose.yml — coderaft-vault: service_healthy → service_started"
@@ -422,6 +450,7 @@ if (Test-Path $composePathB15) {
         $marker = '      - LICENSE_SERVER_URL=https://license.coderaft.io'
         if ($composeTextB15.Contains($marker)) {
             try { Copy-Item -LiteralPath $composePathB15 -Destination $bakB15 -Force -ErrorAction SilentlyContinue } catch {}
+            Invoke-RotateBackups -BasePath $composePathB15
             $replacement = '      - NODE_OPTIONS=--dns-result-order=ipv4first' + "`n" + $marker
             $idx = $composeTextB15.IndexOf($marker)
             $composeTextB15 = $composeTextB15.Substring(0, $idx) + $replacement + $composeTextB15.Substring($idx + $marker.Length)
@@ -439,6 +468,7 @@ if (Test-Path $composePathB15) {
             $m = [regex]::Match($composeTextB15, $pattern)
             if ($m.Success) {
                 try { Copy-Item -LiteralPath $composePathB15 -Destination $bakB15 -Force -ErrorAction SilentlyContinue } catch {}
+                Invoke-RotateBackups -BasePath $composePathB15
                 $envIndent = $m.Groups[1].Value + $m.Groups[2].Value
                 $insertion = $envIndent + '  - NODE_OPTIONS=--dns-result-order=ipv4first' + "`n"
                 $endOfEnvLine = $m.Index + $m.Length
@@ -524,6 +554,7 @@ if (Test-Path $composePathB15) {
         if ($sysAdded) {
             $bakIP6 = "$composePathB15.bak-ipv6-" + (Get-Date -Format "yyyyMMddHHmmss")
             try { Copy-Item -LiteralPath $composePathB15 -Destination $bakIP6 -Force -ErrorAction SilentlyContinue } catch {}
+            Invoke-RotateBackups -BasePath $composePathB15
             [System.IO.File]::WriteAllLines($composePathB15, $out, [System.Text.UTF8Encoding]::new($false))
             Write-Host "  ✓ Self-heal docker-compose.yml — sysctls IPv6 kill ajouté à dashboard-api"
         }
@@ -547,6 +578,7 @@ if (Test-Path $ComposePathTmpfs) {
     if (($ComposeTextTmpfs -notmatch [regex]::Escape('/run/coderaft-env')) -and $ComposeTextTmpfs.Contains($TmpfsMarker)) {
         $BakTmpfs = "$ComposePathTmpfs.bak-tmpfsenv-" + (Get-Date -Format "yyyyMMddHHmmss")
         try { Copy-Item -LiteralPath $ComposePathTmpfs -Destination $BakTmpfs -Force -ErrorAction SilentlyContinue } catch {}
+        Invoke-RotateBackups -BasePath $ComposePathTmpfs
         $TmpfsReplacement = $TmpfsMarker + "`n    tmpfs:`n      - /run/coderaft-env:size=1m,mode=0700,uid=0"
         $idxTmpfs = $ComposeTextTmpfs.IndexOf($TmpfsMarker)
         $ComposeTextTmpfs = $ComposeTextTmpfs.Substring(0, $idxTmpfs) + $TmpfsReplacement + $ComposeTextTmpfs.Substring($idxTmpfs + $TmpfsMarker.Length)
@@ -574,6 +606,7 @@ if (Test-Path $ComposePathPgSecret) {
     if ($ComposeTextPgSecret.Contains($PgPwMarker) -and ($ComposeTextPgSecret -notmatch [regex]::Escape('POSTGRES_PASSWORD_FILE'))) {
         $BakPgSecret = "$ComposePathPgSecret.bak-pgsecret-" + (Get-Date -Format "yyyyMMddHHmmss")
         try { Copy-Item -LiteralPath $ComposePathPgSecret -Destination $BakPgSecret -Force -ErrorAction SilentlyContinue } catch {}
+        Invoke-RotateBackups -BasePath $ComposePathPgSecret
 
         $SecretsDirPg = Join-Path $INSTALL_DIR "secrets"
         New-Item -ItemType Directory -Force -Path $SecretsDirPg | Out-Null
@@ -629,6 +662,7 @@ if (Test-Path $overridePath) {
     if ($overrideText -match '"7687:7687"|- 7687:7687') {
         $bak2 = "$overridePath.bak-" + (Get-Date -Format "yyyyMMdd_HHmmss")
         try { Copy-Item -LiteralPath $overridePath -Destination $bak2 -Force -ErrorAction SilentlyContinue } catch {}
+        Invoke-RotateBackups -BasePath $overridePath
         $overrideText = $overrideText -replace '"7687:7687"', '"127.0.0.1:${NEO4J_BOLT_PORT:-7687}:7687"'
         $overrideText = $overrideText -replace '- 7687:7687', '- "127.0.0.1:${NEO4J_BOLT_PORT:-7687}:7687"'
         [System.IO.File]::WriteAllText($overridePath, $overrideText, [System.Text.UTF8Encoding]::new($false))
@@ -654,6 +688,7 @@ if (Test-Path $composePathCveProxy) {
     if (-not $hasCveProxy -and $postgresLineIdx -ge 0) {
         $bakCveProxy = "$composePathCveProxy.bak-cveproxy-" + (Get-Date -Format "yyyyMMddHHmmss")
         try { Copy-Item -LiteralPath $composePathCveProxy -Destination $bakCveProxy -Force -ErrorAction SilentlyContinue } catch {}
+        Invoke-RotateBackups -BasePath $composePathCveProxy
         $cveProxyBlock = @(
             "  # ── coderaft-cve-proxy ───────────────────────────────────────────────────"
             "  # Internal sidecar in front of the shared coderaft-cve-engine"
@@ -673,6 +708,12 @@ if (Test-Path $composePathCveProxy) {
             "      - CODERAFT_VAULT_CA=/vault-tls/client-ca.crt"
             "      - CODERAFT_VAULT_CLIENT_CERT=/vault-tls/cve-proxy-client.crt"
             "      - CODERAFT_VAULT_CLIENT_KEY=/vault-tls/cve-proxy-client.key"
+            "      # ACCEPTED RESIDUAL RISK (security hardening 2026-07-31) — see"
+            "      # install.sh for the full rationale: coderaft-cve-proxy's source"
+            "      # isn't in this monorepo and it's a distroless static image (no"
+            "      # shell), so unlike every other secret in this deployment"
+            "      # (migrated to a Docker secrets: file), this one deliberately"
+            "      # could not be."
             "      - XPRODUCT_INTERNAL_TOKEN=`${XPRODUCT_INTERNAL_TOKEN}"
             "    volumes:"
             "      - ./vault-tls/client-ca.crt:/vault-tls/client-ca.crt:ro"
@@ -742,6 +783,7 @@ if (-not $composeOK) {
     if (Test-Path "docker-compose.override.yml") {
         $brokenBak = "docker-compose.override.yml.broken-" + (Get-Date -Format "yyyyMMdd_HHmmss")
         try { Copy-Item "docker-compose.override.yml" $brokenBak -ErrorAction SilentlyContinue } catch { }
+        Invoke-RotateBackups -BasePath "docker-compose.override.yml" -GlobSuffix "broken-*"
         try { Remove-Item "docker-compose.override.yml" -ErrorAction SilentlyContinue } catch { }
         Write-Host "    ✓ override backed up + removed"
     }
@@ -862,7 +904,7 @@ EOF
     openssl x509 -req -days 3650 -sha256 \
         -in server.csr -CA agents-ca.crt -CAkey agents-ca.key -CAcreateserial \
         -out server.crt -extfile /tmp/server.ext
-    rm -f server.csr
+    rm -f server.csr /tmp/server.ext
 fi
 chmod 644 *.crt *.key 2>/dev/null || true
 # Final sanity check: fail loudly (non-zero exit) rather than let an empty
@@ -919,7 +961,9 @@ function Invoke-FalconOneAclSelfHeal {
         "write:falconone/audit_hmac_key",
         "read:falconone/pki/agents-ca/cert",
         "read:pki/falconone-agents-ca*",
-        "write:pki/falconone-agents-ca*"
+        "write:pki/falconone-agents-ca*",
+        "read:falconone/scripts_ca*",
+        "write:falconone/scripts_ca*"
     )
 
     $lines = @(Get-Content -LiteralPath $AclPath)
@@ -947,6 +991,8 @@ function Invoke-FalconOneAclSelfHeal {
       - "read:falconone/pki/agents-ca/cert"
       - "read:pki/falconone-agents-ca*"
       - "write:pki/falconone-agents-ca*"
+      - "read:falconone/scripts_ca*"
+      - "write:falconone/scripts_ca*"
 '@
         Add-Content -LiteralPath $AclPath -Value $newBlock
         Write-Host "  [install] Self-heal ACL: falconone permissions updated (+$($requiredPerms.Count) added, entry created)"
@@ -986,6 +1032,102 @@ function Invoke-FalconOneAclSelfHeal {
     }
 
     Write-Host "  [install] Self-heal ACL: falconone permissions updated (+$($missing.Count) added)"
+}
+
+# ── ACL self-heal: redfox connections/k8s vault-backed credentials ──────────
+# Zero-Knowledge Credential Architecture Palier 1
+# (coderaft-platform/docs/redfox-zero-knowledge-scoping.md): target
+# connection credentials and k8s cluster auth data move from RedFox's own
+# Postgres into this vault, under redfox/connections/* and redfox/k8s/*.
+# Same additive-only, idempotent merge-into-existing-entry pattern as
+# Invoke-FalconOneAclSelfHeal above — any install already has a "redfox"
+# entry (it existed for platform/identity/oidc), so without this it would
+# never gain the new permissions.
+function Invoke-RedfoxAclSelfHeal {
+    param([Parameter(Mandatory = $true)][string]$AclPath)
+
+    if (-not (Test-Path $AclPath)) {
+        Write-Host "  [update] ACL self-heal: $AclPath not found — skipping (vault not provisioned yet)"
+        return
+    }
+
+    $requiredPerms = @(
+        "read:license_key",
+        "read:redfox_*",
+        "read:platform/identity/oidc",
+        "read:platform/identity/graph-tools",
+        "read:redfox/connections/*",
+        "write:redfox/connections/*",
+        "delete:redfox/connections/*",
+        "read:redfox/k8s/*",
+        "write:redfox/k8s/*",
+        "delete:redfox/k8s/*"
+    )
+
+    $lines = @(Get-Content -LiteralPath $AclPath)
+    $blockStart = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match '^\s*-\s*name:\s*redfox\s*$') { $blockStart = $i; break }
+    }
+
+    $ts = Get-Date -Format "yyyyMMddTHHmmssZ"
+
+    if ($blockStart -eq -1) {
+        Copy-Item -LiteralPath $AclPath -Destination "${AclPath}.bak-${ts}"
+        $newBlock = @'
+
+  - name: redfox
+    cert_san: "redfox.coderaft.local"
+    permissions:
+      - "read:license_key"
+      - "read:redfox_*"
+      - "read:platform/identity/oidc"
+      - "read:platform/identity/graph-tools"
+      - "read:redfox/connections/*"
+      - "write:redfox/connections/*"
+      - "delete:redfox/connections/*"
+      - "read:redfox/k8s/*"
+      - "write:redfox/k8s/*"
+      - "delete:redfox/k8s/*"
+'@
+        Add-Content -LiteralPath $AclPath -Value $newBlock
+        Write-Host "  [update] Self-heal ACL: redfox permissions updated (+$($requiredPerms.Count) added, entry created)"
+        return
+    }
+
+    $blockEnd = $lines.Count
+    for ($j = $blockStart + 1; $j -lt $lines.Count; $j++) {
+        if ($lines[$j] -match '^\s*-\s*name:\s*\S') { $blockEnd = $j; break }
+    }
+    $blockText = ($lines[$blockStart..($blockEnd - 1)]) -join "`n"
+
+    $missing = @($requiredPerms | Where-Object { $blockText -notmatch [regex]::Escape("`"$_`"") })
+
+    if ($missing.Count -eq 0) {
+        Write-Host "  [update] ACL redfox already up-to-date"
+        return
+    }
+
+    Copy-Item -LiteralPath $AclPath -Destination "${AclPath}.bak-${ts}"
+
+    $permsLineIdx = -1
+    for ($k = $blockStart; $k -lt $blockEnd; $k++) {
+        if ($lines[$k] -match '^\s*permissions:\s*\[.*\]\s*$') { $permsLineIdx = $k; break }
+    }
+
+    if ($permsLineIdx -ge 0) {
+        $additions = ($missing | ForEach-Object { "`"$_`"" }) -join ","
+        $lines[$permsLineIdx] = $lines[$permsLineIdx] -replace '\]\s*$', ",$additions]"
+        $lines | Set-Content -LiteralPath $AclPath -Encoding UTF8
+    } else {
+        $insertLines = @($missing | ForEach-Object { "      - `"$_`"" })
+        $before = if ($blockEnd -gt 0) { $lines[0..($blockEnd - 1)] } else { @() }
+        $after  = if ($blockEnd -le $lines.Count - 1) { $lines[$blockEnd..($lines.Count - 1)] } else { @() }
+        $merged = @($before + $insertLines + $after)
+        $merged | Set-Content -LiteralPath $AclPath -Encoding UTF8
+    }
+
+    Write-Host "  [update] Self-heal ACL: redfox permissions updated (+$($missing.Count) added)"
 }
 
 # ── ACL self-heal: cve-proxy entry (coderaft-cve-engine sidecar) ────────────
@@ -1038,9 +1180,22 @@ function Invoke-CveProxyAclSelfHeal {
 # API. This closes that gap so update.ps1 does it itself instead of
 # requiring a manual live patch — additive-only (only ever touches the ONE
 # named client's entry, via the same admin endpoint's existing safety
-# checks), idempotent (no-ops once the live vault already has the entry),
-# and non-fatal if the vault is absent/sealed/unreachable (the acl.yaml seed
-# above still covers a genuine fresh install).
+# checks), idempotent (no-ops once the live vault already has every
+# required permission), and non-fatal if the vault is absent/sealed/
+# unreachable (the acl.yaml seed above still covers a genuine fresh install).
+#
+# MERGE, NOT JUST CREATE (fixed alongside the redfox Zero-Knowledge
+# Credential Architecture Palier 1 self-heal above, mirroring the identical
+# fix in the bash update.sh sibling): the original version of this function
+# treated "the client name already exists on the live vault" as fully done
+# and returned early — correct the first time a NEW client (falconone,
+# cve-proxy) was self-healed onto an existing vault, but wrong for adding
+# NEW permissions to an ALREADY-provisioned client, e.g. redfox (which has
+# had a live "redfox" entry since platform/identity/oidc shipped, long
+# before redfox/connections/* existed) or falconone's own #226 scripts_ca*
+# grant. Now it fetches the entry's current live permissions and PUTs the
+# union with the required set — a true no-op if nothing is missing, a merge
+# (never a destructive overwrite of unrelated permissions) if something is.
 function Invoke-VaultAclLiveSelfHeal {
     param(
         [Parameter(Mandatory = $true)][string]$InstallDir,
@@ -1117,13 +1272,43 @@ function Invoke-VaultAclLiveSelfHeal {
     }
 
     $current = _AclLiveCurl -Method "GET" -Path "/v1/admin/acl"
-    if ($current -match [regex]::Escape("`"name`":`"$Name`"")) { return }
 
-    $permsJson = "[" + (($Permissions | ForEach-Object { "`"$_`"" }) -join ",") + "]"
+    # Isolate this client's own object out of {"clients":[{...},{...}]} — the
+    # response is single-line JSON (json.Encoder does not indent), so a
+    # non-greedy "stop at the first }" match is safe. No jq/ConvertFrom-Json
+    # dependency assumed — same regex approach as the bash sibling.
+    $entryMatch = [regex]::Match($current, "\{`"name`":`"$([regex]::Escape($Name))`"[^}]*\}")
+    $existingPerms = $null
+    if ($entryMatch.Success) {
+        $permsMatch = [regex]::Match($entryMatch.Value, '"permissions":\[([^\]]*)\]')
+        if ($permsMatch.Success) { $existingPerms = $permsMatch.Groups[1].Value }
+    }
+
+    $permsJson = $null
+    if ($null -ne $existingPerms) {
+        $merged = $existingPerms
+        foreach ($p in $Permissions) {
+            if ($merged -notmatch [regex]::Escape("`"$p`"")) {
+                $merged = "$merged,`"$p`""
+            }
+        }
+        if ($merged -eq $existingPerms) {
+            Write-Host "  [update] Vault ACL live self-heal: $Name already up-to-date on the running vault"
+            return
+        }
+        $permsJson = "[" + $merged.TrimStart(',') + "]"
+    } else {
+        $permsJson = "[" + (($Permissions | ForEach-Object { "`"$_`"" }) -join ",") + "]"
+    }
+
     $body = "{`"cert_san`":`"$San`",`"permissions`":$permsJson}"
     $resp = _AclLiveCurl -Method "PUT" -Path "/v1/admin/acl/$Name" -JsonBody $body
     if ($resp -match '"ok":true') {
-        Write-Host "  [update] Vault ACL live self-heal: $Name granted on the RUNNING vault (acl.yaml alone would not have reached it)"
+        if ($null -ne $existingPerms) {
+            Write-Host "  [update] Vault ACL live self-heal: $Name permissions merged on the RUNNING vault (acl.yaml alone would not have reached it)"
+        } else {
+            Write-Host "  [update] Vault ACL live self-heal: $Name granted on the RUNNING vault (acl.yaml alone would not have reached it)"
+        }
     } else {
         Write-Host "  [update] Vault ACL live self-heal: PUT /v1/admin/acl/$Name failed — will retry on next update: $resp"
     }
@@ -1167,7 +1352,7 @@ printf 'subjectAltName=DNS:%s\nbasicConstraints=CA:FALSE' '$San' > /tmp/client.e
 openssl x509 -req -days 3650 -sha256 \
     -in '$Name-client.csr' -CA client-ca.crt -CAkey client-ca.key -CAcreateserial \
     -out '$Name-client.crt' -extfile /tmp/client.ext 2>/dev/null
-rm -f '$Name-client.csr'
+rm -f '$Name-client.csr' /tmp/client.ext
 $chmodExtra
 "@
     $scriptFile = Join-Path $env:TEMP "coderaft-cert-selfheal-$(Get-Random).sh"
@@ -1528,7 +1713,7 @@ EOF
 openssl x509 -req -days 3650 -sha256 \
     -in vault.csr -CA client-ca.crt -CAkey client-ca.key -CAcreateserial \
     -out vault.crt -extfile /tmp/server.ext 2>/dev/null
-rm -f vault.csr
+rm -f vault.csr /tmp/server.ext
 # Per-product client certs
 for pair in "dashboard-api:dashboard-api.coderaft.local" \
             "entraguard:entraguard.coderaft.local" \
@@ -1548,7 +1733,7 @@ EOF
     openssl x509 -req -days 3650 -sha256 \
         -in "${name}-client.csr" -CA client-ca.crt -CAkey client-ca.key -CAcreateserial \
         -out "${name}-client.crt" -extfile /tmp/client.ext 2>/dev/null
-    rm -f "${name}-client.csr"
+    rm -f "${name}-client.csr" /tmp/client.ext
 done
 chmod 600 *.key 2>/dev/null || true
 # falconone-api / coderaft-cve-proxy run distroless nonroot (uid 65532) —
@@ -1630,10 +1815,10 @@ clients:
     permissions: ["read:ravenscan_*","read:neo4j_*","read:license_key","read:platform/identity/oidc"]
   - name: redfox
     cert_san: "redfox.coderaft.local"
-    permissions: ["read:redfox_*","read:license_key","read:platform/identity/oidc"]
+    permissions: ["read:redfox_*","read:license_key","read:platform/identity/oidc","read:platform/identity/graph-tools","read:redfox/connections/*","write:redfox/connections/*","delete:redfox/connections/*","read:redfox/k8s/*","write:redfox/k8s/*","delete:redfox/k8s/*"]
   - name: falconone
     cert_san: "falconone.coderaft.local"
-    permissions: ["read:license_key","read:falconone_*","read:platform/identity/oidc","sign:falconone_agent_cert","read:falconone/nvd_api_key","read:falconone/audit_hmac_key","write:falconone/audit_hmac_key","read:falconone/pki/agents-ca/cert","read:pki/falconone-agents-ca*","write:pki/falconone-agents-ca*"]
+    permissions: ["read:license_key","read:falconone_*","read:platform/identity/oidc","sign:falconone_agent_cert","read:falconone/nvd_api_key","read:falconone/audit_hmac_key","write:falconone/audit_hmac_key","read:falconone/pki/agents-ca/cert","read:pki/falconone-agents-ca*","write:pki/falconone-agents-ca*","read:falconone/scripts_ca*","write:falconone/scripts_ca*"]
   - name: cve-proxy
     cert_san: "cve-proxy.coderaft.local"
     permissions: ["read:cve-proxy/*", "write:cve-proxy/*"]
@@ -2072,7 +2257,20 @@ Invoke-VaultAclLiveSelfHeal -InstallDir $INSTALL_DIR -Name "falconone" -San "fal
     "sign:falconone_agent_cert", "read:falconone/nvd_api_key",
     "read:falconone/audit_hmac_key", "write:falconone/audit_hmac_key",
     "read:falconone/pki/agents-ca/cert", "read:pki/falconone-agents-ca*",
-    "write:pki/falconone-agents-ca*"
+    "write:pki/falconone-agents-ca*", "read:falconone/scripts_ca*",
+    "write:falconone/scripts_ca*"
+)
+
+# ── RedFox connections/k8s vault-backed credentials ACL self-heal ───────────
+# Zero-Knowledge Credential Architecture Palier 1 — see Invoke-RedfoxAclSelfHeal
+# above. redfox's client cert already exists (provisioned for
+# platform/identity/oidc), so no Invoke-VaultClientCertSelfHeal call is needed.
+Invoke-RedfoxAclSelfHeal -AclPath (Join-Path $INSTALL_DIR "vault-config\acl.yaml")
+Invoke-VaultAclLiveSelfHeal -InstallDir $INSTALL_DIR -Name "redfox" -San "redfox.coderaft.local" -Permissions @(
+    "read:license_key", "read:redfox_*", "read:platform/identity/oidc",
+    "read:platform/identity/graph-tools", "read:redfox/connections/*",
+    "write:redfox/connections/*", "delete:redfox/connections/*",
+    "read:redfox/k8s/*", "write:redfox/k8s/*", "delete:redfox/k8s/*"
 )
 
 # ── cve-proxy vault client cert + ACL self-heal ──────────────────────────────
@@ -2119,6 +2317,17 @@ if ((Test-Path $envEnc) -and (Test-Path $envPlain)) {
             New-Item -ItemType Directory -Force -Path $bakDir | Out-Null
             $bakFile = Join-Path $bakDir ("env-pre-finalize-" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".bak")
             Copy-Item $envPlain $bakFile -ErrorAction SilentlyContinue
+            # Security hardening (2026-07-31): the message below has always
+            # claimed these plaintext-.env backups (real secret VALUES, not
+            # just config) are "kept 24h" — but no code anywhere ever actually
+            # deleted them; found auditing residual-file cleanup across the
+            # installer. Enforce the claim for real: purge anything older
+            # than 24h in this directory, best-effort, never blocking finalize.
+            try {
+                Get-ChildItem -LiteralPath $bakDir -Filter "env-pre-finalize-*.bak" -File -ErrorAction SilentlyContinue |
+                    Where-Object { $_.LastWriteTime -lt (Get-Date).AddHours(-24) } |
+                    Remove-Item -Force -ErrorAction SilentlyContinue
+            } catch {}
             $plainNorm   = (Get-Content $envPlain | Where-Object { $_ -notmatch '^\s*(#|$)' } | Sort-Object) -join "`n"
             $decryptNorm = ($decrypted | Where-Object { $_ -notmatch '^\s*(#|$)' } | Sort-Object) -join "`n"
             if ($plainNorm -eq $decryptNorm) {

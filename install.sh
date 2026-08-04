@@ -11,6 +11,127 @@
 
 set -e
 
+# ── F-037 (2026-07-31): installer self-integrity check (SHA256) ─────────────
+# Goal: detect a script tampered with in transit or at rest between
+# publication and execution (e.g. a MITM proxy, a compromised CDN edge, or a
+# stale/corrupted cache rewriting the response to
+# `curl https://install.coderaft.io/install.sh`) before a single command
+# from this file runs.
+#
+# Mechanism: recompute this script's own SHA256 — excluding the
+# EXPECTED_SHA256 line itself, to avoid the chicken-and-egg problem of a
+# file needing to embed a hash of its own content — and compare it against
+# the digest published at install.sh.sha256, a sidecar file served
+# alongside this one but generated/updated independently (see
+# scripts/generate-install-checksums.sh, run at every release cut).
+# EXPECTED_SHA256 below is a secondary, embedded offline pin: a frozen
+# snapshot of the hash taken at the same time as the last regeneration,
+# used only as a fallback when the network fetch of the published digest
+# fails outright (fully offline environment, endpoint down). Regenerate
+# both together with scripts/generate-install-checksums.sh whenever this
+# file changes — never edit either by hand.
+#
+# KNOWN LIMITATION (a structural bash limit, not a bug in this check): when
+# this file is piped straight into an interpreter —
+# `curl -fsSL https://install.coderaft.io/install.sh | bash`, this file's
+# own documented usage at the top of this header — "$0" is literally the
+# string "bash", not a path to this script's bytes, and stdin has already
+# been consumed by bash parsing the script by the time this code runs. A
+# script cannot read "itself" back out of a pipe once its interpreter has
+# started consuming it. Under that invocation (and under process
+# substitution, e.g. `bash <(curl ...)`) the check below degrades to a
+# clear warning instead of silently pretending to protect the user. It IS
+# fully effective for the safer download-then-run flow:
+#   curl -fsSL https://install.coderaft.io/install.sh -o install.sh
+#   bash install.sh          # self-checks against install.sh.sha256
+# See deploy/docs/installer-integrity-verification.md for the full
+# writeup, threat model, and the (separate, not-yet-scheduled) work needed
+# to make the public `install.coderaft.io` endpoint actually serve this
+# monorepo's install.sh/install.sh.sha256 at all — today it still proxies
+# the legacy `coderaft-installer` repo.
+EXPECTED_SHA256="60ffe818918f40fb60bc971bbb34848e5fba6f8140603cf3e80fbaaf990edc19"
+
+# CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
+# tested end-to-end against a throwaway local HTTP server instead of the
+# live production endpoint (see deploy/docs/installer-integrity-verification.md,
+# "Testing" section). Real installs never need to set it.
+CODERAFT_INSTALL_SHA256_URL="${CODERAFT_INSTALL_SHA256_URL:-https://install.coderaft.io/install.sh.sha256}"
+
+_coderaft_sha256_stdin() {
+    if command -v sha256sum &>/dev/null; then
+        sha256sum | awk '{print $1}'
+    elif command -v shasum &>/dev/null; then
+        shasum -a 256 | awk '{print $1}'
+    elif command -v openssl &>/dev/null; then
+        openssl dgst -sha256 | awk '{print $NF}'
+    else
+        return 1
+    fi
+}
+
+_coderaft_self_verify() {
+    if [ -n "${SKIP_SELF_VERIFY:-}" ]; then
+        echo "  ⚠ SKIP_SELF_VERIFY set — installer integrity check bypassed (dev only)." >&2
+        return 0
+    fi
+
+    # "$0" only points to this script's real bytes when it was invoked as a
+    # file (bash install.sh / sh install.sh / ./install.sh). Under a raw
+    # pipe or process substitution it is "bash"/"sh"/a drained fd — not a
+    # regular, re-readable file. See the KNOWN LIMITATION note above.
+    if [ ! -f "$0" ] || [ ! -r "$0" ]; then
+        echo "" >&2
+        echo "  ⚠ Installer integrity check skipped: this script has no readable file" >&2
+        echo "    path to hash (running from a pipe — see deploy/docs/" >&2
+        echo "    installer-integrity-verification.md). For a verified install:" >&2
+        echo "" >&2
+        echo "      curl -fsSL https://install.coderaft.io/install.sh -o install.sh" >&2
+        echo "      bash install.sh" >&2
+        echo "" >&2
+        return 0
+    fi
+
+    local actual
+    actual="$(sed '/^EXPECTED_SHA256=/d' "$0" | _coderaft_sha256_stdin)" || actual=""
+    if [ -z "$actual" ]; then
+        echo "  ⚠ Installer integrity check skipped: no sha256sum/shasum/openssl available (or hashing failed) to check this script." >&2
+        return 0
+    fi
+
+    local published=""
+    published="$(curl -fsSL --max-time 10 "$CODERAFT_INSTALL_SHA256_URL" 2>/dev/null | tr -d '[:space:]')" || published=""
+
+    local expected="$published"
+    local source="install.sh.sha256 (network)"
+    if [ -z "$expected" ]; then
+        if [ -n "$EXPECTED_SHA256" ]; then
+            expected="$EXPECTED_SHA256"
+            source="embedded offline pin"
+            echo "  ⚠ Could not reach ${CODERAFT_INSTALL_SHA256_URL} — falling back to the embedded offline pin." >&2
+        else
+            echo "  ⚠ Could not reach ${CODERAFT_INSTALL_SHA256_URL} and no embedded pin is set — skipping integrity check." >&2
+            return 0
+        fi
+    fi
+
+    if [ "$actual" != "$expected" ]; then
+        echo "" >&2
+        echo "  FATAL: installer integrity check failed" >&2
+        echo "    computed (local) : ${actual}" >&2
+        echo "    expected (${source}): ${expected}" >&2
+        echo "" >&2
+        echo "  This script's content does not match its published digest — it may" >&2
+        echo "  have been tampered with in transit or at rest. Aborting." >&2
+        echo "  Set SKIP_SELF_VERIFY=1 to bypass (development only)." >&2
+        echo "" >&2
+        exit 1
+    fi
+
+    echo "  ✓ Installer integrity verified (SHA256 matches ${source})"
+}
+
+_coderaft_self_verify
+
 INSTALL_DIR="${INSTALL_DIR:-./coderaft}"
 
 echo ""
@@ -602,7 +723,7 @@ EOF
 openssl x509 -req -days 3650 -sha256 \
     -in vault.csr -CA client-ca.crt -CAkey client-ca.key -CAcreateserial \
     -out vault.crt -extfile /tmp/server.ext 2>/dev/null
-rm -f vault.csr
+rm -f vault.csr /tmp/server.ext
 for pair in "dashboard-api:dashboard-api.coderaft.local" \
             "entraguard:entraguard.coderaft.local" \
             "ravenscan:ravenscan.coderaft.local" \
@@ -621,7 +742,7 @@ EOF
     openssl x509 -req -days 3650 -sha256 \
         -in "${name}-client.csr" -CA client-ca.crt -CAkey client-ca.key -CAcreateserial \
         -out "${name}-client.crt" -extfile /tmp/client.ext 2>/dev/null
-    rm -f "${name}-client.csr"
+    rm -f "${name}-client.csr" /tmp/client.ext
 done
 chmod 600 *.key 2>/dev/null || true
 # falconone-api / coderaft-cve-proxy nonroot fix (distroless uid 65532).
@@ -681,11 +802,11 @@ clients:
 
   - name: redfox
     cert_san: "redfox.coderaft.local"
-    permissions: ["read:redfox_*","read:license_key","read:platform/identity/oidc"]
+    permissions: ["read:redfox_*","read:license_key","read:platform/identity/oidc","read:platform/identity/graph-tools","read:redfox/connections/*","write:redfox/connections/*","delete:redfox/connections/*","read:redfox/k8s/*","write:redfox/k8s/*","delete:redfox/k8s/*"]
 
   - name: falconone
     cert_san: "falconone.coderaft.local"
-    permissions: ["read:license_key","read:falconone_*","read:platform/identity/oidc","sign:falconone_agent_cert","read:falconone/nvd_api_key","read:falconone/audit_hmac_key","write:falconone/audit_hmac_key","read:falconone/pki/agents-ca/cert","read:pki/falconone-agents-ca*","write:pki/falconone-agents-ca*"]
+    permissions: ["read:license_key","read:falconone_*","read:platform/identity/oidc","sign:falconone_agent_cert","read:falconone/nvd_api_key","read:falconone/audit_hmac_key","write:falconone/audit_hmac_key","read:falconone/pki/agents-ca/cert","read:pki/falconone-agents-ca*","write:pki/falconone-agents-ca*","read:falconone/scripts_ca*","write:falconone/scripts_ca*"]
 
   - name: cve-proxy
     cert_san: "cve-proxy.coderaft.local"
@@ -801,7 +922,7 @@ if [ "$NEED_REGEN" = "1" ]; then
     openssl x509 -req -days 3650 -sha256 \
         -in server.csr -CA agents-ca.crt -CAkey agents-ca.key -CAcreateserial \
         -out server.crt -extfile /tmp/server.ext 2>/dev/null
-    rm -f server.csr
+    rm -f server.csr /tmp/server.ext
 fi
 chmod 644 *.crt *.key 2>/dev/null || true
 FOSCRIPT
@@ -810,6 +931,23 @@ FOSCRIPT
         rm -f "$fo_script_file"
     fi
     echo "  ✓ FalconOne agents PKI written (SAN: ${fo_sans})"
+}
+
+# ── Backup rotation (security hardening, 2026-07-31) ─────────────────────────
+# Every self-heal path below does `cp X X.bak-<timestamp>` before touching X
+# (acl.yaml, and in update.sh also docker-compose.yml/override.yml). On a
+# deployment that runs unattended for months/years across many install/update
+# runs, these accumulate without bound. Keep only the $2 most recent (default
+# 5) backups sharing $1's basename; delete anything older. Safe/idempotent:
+# a no-op when there are $2 or fewer.
+_rotate_backups() {
+    local base_path="$1" keep="${2:-5}"
+    local dir base
+    dir="$(dirname "$base_path")"
+    base="$(basename "$base_path")"
+    ls -t "${dir}/${base}".bak-* 2>/dev/null | tail -n "+$((keep + 1))" | while IFS= read -r f; do
+        rm -f -- "$f"
+    done
 }
 
 # ── ACL self-heal: falconone entry/permissions (#172) ────────────────────────
@@ -842,6 +980,8 @@ _falconone_acl_selfheal() {
         "read:falconone/pki/agents-ca/cert"
         "read:pki/falconone-agents-ca*"
         "write:pki/falconone-agents-ca*"
+        "read:falconone/scripts_ca*"
+        "write:falconone/scripts_ca*"
     )
 
     local ts
@@ -849,6 +989,7 @@ _falconone_acl_selfheal() {
 
     if ! grep -qE '^[[:space:]]*-[[:space:]]*name:[[:space:]]*falconone[[:space:]]*$' "$acl_path"; then
         cp "$acl_path" "${acl_path}.bak-${ts}"
+        _rotate_backups "$acl_path"
         cat >> "$acl_path" <<'FALCONONEACL'
 
   - name: falconone
@@ -864,6 +1005,8 @@ _falconone_acl_selfheal() {
       - "read:falconone/pki/agents-ca/cert"
       - "read:pki/falconone-agents-ca*"
       - "write:pki/falconone-agents-ca*"
+      - "read:falconone/scripts_ca*"
+      - "write:falconone/scripts_ca*"
 FALCONONEACL
         echo "  [install] Self-heal ACL: falconone permissions updated (+${#required_perms[@]} added, entry created)"
         return 0
@@ -893,6 +1036,7 @@ FALCONONEACL
     fi
 
     cp "$acl_path" "${acl_path}.bak-${ts}"
+    _rotate_backups "$acl_path"
 
     if grep -qE '^[[:space:]]*permissions:[[:space:]]*\[.*\][[:space:]]*$' <<< "$block"; then
         local additions=""
@@ -916,6 +1060,110 @@ FALCONONEACL
     echo "  [install] Self-heal ACL: falconone permissions updated (+${#missing[@]} added)"
 }
 
+# ── ACL self-heal: redfox connections/k8s vault-backed credentials ──────────
+# Zero-Knowledge Credential Architecture Palier 1
+# (coderaft-platform/docs/redfox-zero-knowledge-scoping.md): target
+# connection credentials and k8s cluster auth data move from RedFox's own
+# Postgres into this vault, under redfox/connections/* and redfox/k8s/*.
+# Same additive-only, idempotent merge-into-existing-entry pattern as
+# _falconone_acl_selfheal above — any install provisioned before this ships
+# already has a "redfox" entry (it existed for platform/identity/oidc), so
+# without this it would never gain the new permissions.
+_redfox_acl_selfheal() {
+    local acl_path="$1"
+
+    if [ ! -f "$acl_path" ]; then
+        echo "  [install] ACL self-heal: $acl_path not found — skipping (vault not provisioned yet)"
+        return 0
+    fi
+
+    local required_perms=(
+        "read:license_key"
+        "read:redfox_*"
+        "read:platform/identity/oidc"
+        "read:platform/identity/graph-tools"
+        "read:redfox/connections/*"
+        "write:redfox/connections/*"
+        "delete:redfox/connections/*"
+        "read:redfox/k8s/*"
+        "write:redfox/k8s/*"
+        "delete:redfox/k8s/*"
+    )
+
+    local ts
+    ts="$(date -u +"%Y%m%dT%H%M%SZ")"
+
+    if ! grep -qE '^[[:space:]]*-[[:space:]]*name:[[:space:]]*redfox[[:space:]]*$' "$acl_path"; then
+        cp "$acl_path" "${acl_path}.bak-${ts}"
+        _rotate_backups "$acl_path"
+        cat >> "$acl_path" <<'REDFOXACL'
+
+  - name: redfox
+    cert_san: "redfox.coderaft.local"
+    permissions:
+      - "read:license_key"
+      - "read:redfox_*"
+      - "read:platform/identity/oidc"
+      - "read:platform/identity/graph-tools"
+      - "read:redfox/connections/*"
+      - "write:redfox/connections/*"
+      - "delete:redfox/connections/*"
+      - "read:redfox/k8s/*"
+      - "write:redfox/k8s/*"
+      - "delete:redfox/k8s/*"
+REDFOXACL
+        echo "  [install] Self-heal ACL: redfox permissions updated (+${#required_perms[@]} added, entry created)"
+        return 0
+    fi
+
+    local start_line end_line
+    start_line=$(grep -nE '^[[:space:]]*-[[:space:]]*name:[[:space:]]*redfox[[:space:]]*$' "$acl_path" | head -1 | cut -d: -f1)
+    end_line=$(awk -v s="$start_line" 'NR>s && /^[[:space:]]*-[[:space:]]*name:/{print NR; exit}' "$acl_path")
+    if [ -z "$end_line" ]; then
+        end_line=$(( $(wc -l < "$acl_path") + 1 ))
+    fi
+
+    local block
+    block=$(sed -n "${start_line},$((end_line - 1))p" "$acl_path")
+
+    local missing=()
+    local p
+    for p in "${required_perms[@]}"; do
+        if ! grep -qF "\"${p}\"" <<< "$block"; then
+            missing+=("$p")
+        fi
+    done
+
+    if [ "${#missing[@]}" -eq 0 ]; then
+        echo "  [install] ACL redfox already up-to-date"
+        return 0
+    fi
+
+    cp "$acl_path" "${acl_path}.bak-${ts}"
+    _rotate_backups "$acl_path"
+
+    if grep -qE '^[[:space:]]*permissions:[[:space:]]*\[.*\][[:space:]]*$' <<< "$block"; then
+        local additions=""
+        for p in "${missing[@]}"; do additions="${additions},\"${p}\""; done
+        awk -v s="$start_line" -v e="$end_line" -v add="$additions" '
+            NR>=s && NR<e && /^[[:space:]]*permissions:[[:space:]]*\[.*\][[:space:]]*$/ {
+                sub(/\][[:space:]]*$/, add "]")
+            }
+            { print }
+        ' "$acl_path" > "${acl_path}.tmp" && mv "${acl_path}.tmp" "$acl_path"
+    else
+        local addition_block=""
+        for p in "${missing[@]}"; do addition_block="${addition_block}      - \"${p}\""$'\n'; done
+        local insert_line=$(( end_line - 1 ))
+        awk -v ins="$insert_line" -v add="$addition_block" '
+            { print }
+            NR==ins { printf "%s", add }
+        ' "$acl_path" > "${acl_path}.tmp" && mv "${acl_path}.tmp" "$acl_path"
+    fi
+
+    echo "  [install] Self-heal ACL: redfox permissions updated (+${#missing[@]} added)"
+}
+
 # ── ACL self-heal: cve-proxy entry (coderaft-cve-engine sidecar) ────────────
 # Same additive-only, idempotent pattern as _falconone_acl_selfheal above —
 # any install provisioned before this ships never gets the cve-proxy entry
@@ -936,6 +1184,7 @@ _cveproxy_acl_selfheal() {
     local ts
     ts="$(date -u +"%Y%m%dT%H%M%SZ")"
     cp "$acl_path" "${acl_path}.bak-${ts}"
+    _rotate_backups "$acl_path"
     cat >> "$acl_path" <<'CVEPROXYACL'
 
   - name: cve-proxy
@@ -984,7 +1233,7 @@ _vault_client_cert_selfheal() {
                 openssl x509 -req -days 3650 -sha256 \
                     -in '${name}-client.csr' -CA client-ca.crt -CAkey client-ca.key -CAcreateserial \
                     -out '${name}-client.crt' -extfile /tmp/client.ext 2>/dev/null
-                rm -f '${name}-client.csr'
+                rm -f '${name}-client.csr' /tmp/client.ext
                 if [ '${name}' = 'falconone' ] || [ '${name}' = 'cve-proxy' ]; then
                     chmod 644 '${name}-client.key' '${name}-client.crt'
                 else
@@ -1003,6 +1252,13 @@ vault_bootstrap
 # permissions healed.
 _falconone_tls_bootstrap "$PWD"
 _falconone_acl_selfheal "vault-config/acl.yaml"
+
+# ── RedFox connections/k8s vault-backed credentials ACL self-heal ───────────
+# Zero-Knowledge Credential Architecture Palier 1 — see _redfox_acl_selfheal
+# above. redfox's client cert already exists (provisioned for
+# platform/identity/oidc), so no _vault_client_cert_selfheal call is needed
+# here — only the ACL entry needs the new permissions.
+_redfox_acl_selfheal "vault-config/acl.yaml"
 
 # ── cve-proxy vault client cert + ACL self-heal ──────────────────────────────
 # coderaft-cve-proxy is a shared platform sidecar (in front of the central
@@ -1035,6 +1291,23 @@ echo "  Writing docker-compose.yml..."
 cat > docker-compose.yml << 'COMPOSE'
 # CodeRaft Dashboard
 # Products are deployed by the dashboard after license activation.
+#
+# F-017 (seccomp, re-verified 2026-07-31): every service below relies on
+# Docker's IMPLICIT default seccomp profile — deliberately NOT written as
+# `security_opt: [seccomp=default]`. That literal string is NOT a Docker
+# keyword; the daemon parses whatever follows `seccomp=` as a PATH to a
+# custom profile JSON file, so `seccomp=default` fails outright with
+# `opening seccomp profile (default) failed: open default: no such file or
+# directory` (re-confirmed live against this exact Docker version,
+# 2026-07-31 — a prior session hit and reverted the same mistake, this
+# re-check just confirms it's still true rather than trusting the old
+# note). Omitting `seccomp:` from `security_opt:` entirely is the correct
+# way to keep the default profile; it is already a strong default (blocks
+# ~44 dangerous syscalls including `mount`/`unshare`/`clone3` variants) and
+# no service here has demonstrated a need to loosen or further restrict it —
+# the one exception (`ravenscan-capture`, raw packet capture) explicitly
+# opts OUT via `seccomp:unconfined` for documented libpcap syscall needs,
+# see that service below.
 
 services:
   # Caddy HTTPS reverse proxy.
@@ -1074,6 +1347,27 @@ services:
       retries: 3
       start_period: 10s
     security_opt: [no-new-privileges:true]
+    # Phase 2 hardening (2026-07-31): verified live in a throwaway compose
+    # project — caddy:2-alpine's default image runs as root and needs
+    # exactly ONE capability back after `cap_drop: [ALL]` to keep binding
+    # :80/:443 (both <1024): NET_BIND_SERVICE. No CHOWN/SETUID/SETGID needed
+    # (unlike the `dashboard` nginx service below) — caddy doesn't fork a
+    # privilege-dropped worker pool the way nginx's `user nginx;` directive
+    # does. Confirmed a full boot + `curl` 200 still works with this exact
+    # cap set.
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    # `/data`/`/config` stay the existing named volumes above (cert/state
+    # persistence — do NOT tmpfs them, see the big comment atop this service
+    # about CA trust). `/tmp` is the only additional writable path caddy
+    # needs under a read_only root; verified live (autosave.json still wrote
+    # to /data, no other FS errors in the log).
+    read_only: true
+    tmpfs: [/tmp]
+    mem_limit: 256m
+    memswap_limit: 256m
+    mem_reservation: 64m
+    cpus: 1
     restart: unless-stopped
 
   dashboard:
@@ -1089,13 +1383,48 @@ services:
     environment:
       - DATABASE_URL=postgres://coderaft:${POSTGRES_PASSWORD}@postgres:5432/coderaft
       - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
-      - DASHBOARD_SECRET=${DASHBOARD_SECRET}
       - LICENSE_SERVER_URL=https://license.coderaft.io
+    # Security hardening (2026-07-31): DASHBOARD_SECRET removed from this
+    # service's env — it was PURE DEAD CODE here. This "dashboard" container
+    # is nginx serving a static Vite build (see repo root Dockerfile:
+    # node build → nginx:1.27-alpine, no app server, no envsubst templating
+    # of nginx.conf), it never reads any env var at runtime. Confirmed no
+    # `process.env.DASHBOARD_SECRET` reference anywhere reachable from this
+    # image before removing — dashboard-api (below) is the one that actually
+    # resolves DASHBOARD_SECRET, and it does so from Coderaft Vault directly
+    # (lib/session-auth.js), never from this env var either. Removing a
+    # plaintext secret an image doesn't consume closes a `docker inspect`
+    # exposure window at zero functional cost.
     # B-DASHBOARD-NET (2026-06-23): nginx inside this image proxies
     # /api/entraguard/, /api/ravenscan/, /api/redfox/ to the product
     # containers on coderaft-frontend / coderaft-backend.
     networks: [default, coderaft-frontend, coderaft-backend]
     security_opt: [no-new-privileges:true]
+    # Phase 2 hardening (2026-07-31): verified live in a throwaway compose
+    # project. This image's baked-in nginx.conf sets `user nginx;` — the
+    # master process starts as root (this image sets no `USER`) and needs
+    # CAP_CHOWN (to fix up `/var/cache/nginx/*_temp` ownership) + CAP_SETUID/
+    # CAP_SETGID (to drop the worker processes to the `nginx` account) before
+    # it can serve anything; confirmed `cap_drop: [ALL]` alone fails startup
+    # with `chown("/var/cache/nginx/client_temp", 101) failed (1: Operation
+    # not permitted)`, and adding exactly these 3 caps back fixes it (curl
+    # 200 afterwards). No NET_BIND_SERVICE needed — this image only listens
+    # on :3000 internally (confirmed via its own conf.d/coderaft.conf), never
+    # a privileged port.
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID]
+    read_only: true
+    tmpfs: [/tmp, /var/cache/nginx, /var/run]
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:3000/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    mem_limit: 256m
+    memswap_limit: 256m
+    mem_reservation: 64m
+    cpus: 1
     restart: unless-stopped
 
   # F-003 (2026-06-21): ACL sidecar for the Docker socket. dashboard-api
@@ -1114,10 +1443,48 @@ services:
       VERSION: 1
       POST: 1
       # F-003 follow-up (2026-07-16): VOLUMES=1 required so `docker compose up`
-      # can read/create named volumes for the product services. Volume read
-      # doesn't grant RCE — the RCE risk came from POST /containers/create
-      # with a `Binds:[/:/host]` (privileged mount) or POST /exec, both
-      # still blocked here.
+      # can read/create named volumes for the product services (confirmed
+      # 2026-07-31: removing VOLUMES=1 in a throwaway compose project makes
+      # `docker compose up` fail outright with "denied" on POST
+      # /volumes/create for every named volume — postgres_data, redis_data,
+      # vault_data, dashboard_data, etc. — so this stays required).
+      #
+      # CORRECTED (2026-07-31, was inaccurate): the comment that used to sit
+      # here claimed a privileged `Binds:[/:/host]` mount via POST
+      # /containers/create was "still blocked" by this proxy. That is FALSE —
+      # docker-socket-proxy (tecnativa/docker-socket-proxy) authorizes purely
+      # by HTTP method + URL path (its ACL categories are things like
+      # CONTAINERS/POST/VOLUMES), never by inspecting the JSON BODY of the
+      # request. With POST=1 and CONTAINERS=1 already set (required for
+      # `docker compose up` to create ANY container), a POST
+      # /containers/create carrying `HostConfig.Binds:["/:/host"]` sails
+      # through this proxy exactly like a normal container-create call — the
+      # bind-mount privilege escalation is a property of what's IN the
+      # request, which this proxy does not look at.
+      #
+      # Residual risk this creates: dashboard-api's OWN `/host-compose` mount
+      # (see the dashboard-api service below) is a READ-WRITE bind of this
+      # entire install directory, and dashboard-api legitimately WRITES
+      # docker-compose.override.yml there itself (generateOverrideToDir(),
+      # to add/remove product containers per license). If dashboard-api were
+      # ever compromised (RCE in the Node process), the attacker already has
+      # everything needed to add a malicious `Binds:["/:/host"]` (or worse)
+      # to that override file and then trigger `docker compose up` through
+      # this exact proxy — which would honor it, since POST/CONTAINERS/
+      # VOLUMES are already granted for the legitimate deploy/update/rollback
+      # flows. This is NOT a new hole introduced by this proxy; it is an
+      # inherent consequence of dashboard-api being the thing that actually
+      # authors and executes compose plans for this platform — closing it
+      # completely would require a full compose-plan validator (parse the
+      # generated YAML, allow-list volume sources/binds before ever handing
+      # it to `docker compose up`) that does not exist today and is
+      # deliberately OUT OF SCOPE for this pass (real engineering effort, not
+      # a config tweak — tracked as a follow-up, not silently accepted as
+      # "fine"). What IS mitigated below: the broad `.:/host-compose` bind no
+      # longer redundantly exposes vault-keys/vault-tls/.coderaft-age.key
+      # (see the dashboard-api service's `tmpfs:` entries) — shrinking what
+      # an RCE in dashboard-api can reach, without touching the
+      # deploy/update/rollback-critical override-file write path itself.
       VOLUMES: 1
       # F-003 follow-up 2 (2026-07-22): `docker compose pull` on a multi-arch
       # image (mandatory for every Coderaft product image) queries
@@ -1138,11 +1505,32 @@ services:
       ALLOW_RESTARTS: 1
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      # F-014 (2026-07-31): a prior session's note ("read_only:true shadows
+      # haproxy template") had given up on read_only for this service — its
+      # docker-entrypoint.sh templates /usr/local/etc/haproxy/haproxy.cfg
+      # from the ACL env vars above at every boot, `sed`-ing it from a
+      # `haproxy.cfg.template` file baked into the SAME directory. A plain
+      # `tmpfs:` mount there (always empty, unlike a named volume) wipes that
+      # template out from under it — confirmed live: `sed: ... .template: No
+      # such file or directory`. A NAMED VOLUME instead of tmpfs fixes it:
+      # Docker copies the image's existing directory contents (including the
+      # template) into an empty named volume on first mount, so the template
+      # survives and the entrypoint can still write haproxy.cfg alongside it.
+      # Verified live end-to-end: proxy started clean, and a real
+      # `GET /version` through it returned 200 with genuine Docker Engine
+      # version info.
+      - docker_proxy_haproxy_cfg:/usr/local/etc/haproxy
     networks:
       - docker-proxy-net
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
     cap_add: [CHOWN, SETGID, SETUID, NET_BIND_SERVICE]
+    read_only: true
+    tmpfs: [/tmp, /var/run]
+    mem_limit: 128m
+    memswap_limit: 128m
+    mem_reservation: 32m
+    cpus: 0.5
     restart: unless-stopped
 
   dashboard-api:
@@ -1187,7 +1575,17 @@ services:
       - LICENSE_SERVER_URL=https://license.coderaft.io
       - DATABASE_URL=postgres://coderaft:${POSTGRES_PASSWORD}@postgres:5432/coderaft
       - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
-      - DASHBOARD_SECRET=${DASHBOARD_SECRET}
+      # Security hardening (2026-07-31): DASHBOARD_SECRET removed — dead code
+      # here too. dashboard-api's own process resolves it directly from
+      # Coderaft Vault (lib/session-auth.js's resolveDashboardSecret(), with a
+      # local-disk cache fallback), never from process.env.DASHBOARD_SECRET —
+      # confirmed via a full grep of dashboard-api/ for real (non-comment)
+      # reads before removing. The OTHER products (WolfGuard/Ravenscan/
+      # RedFox/FalconOne) that verify JWTs signed with this same secret get
+      # it from a Docker `secrets:` file now (dashboard-api's own compose
+      # generation, generateOverrideToDir() — see #<security-hardening
+      # 2026-07-31> for the full migration of the 7 remaining plaintext
+      # secrets to files).
       - CONTAINER_COMPOSE_DIR=/host-compose
       - HOST_PROJECT_DIR=${HOST_PROJECT_DIR}
       - COMPOSE_PROJECT_NAME=coderaft
@@ -1214,6 +1612,29 @@ services:
       - ./vault-tls/client-ca.crt:/vault-tls/client-ca.crt:ro
       - ./vault-tls/dashboard-api-client.crt:/vault-tls/dashboard-api-client.crt:ro
       - ./vault-tls/dashboard-api-client.key:/vault-tls/dashboard-api-client.key:ro
+      # Security hardening (2026-07-31, docker-socket-proxy comment fix
+      # follow-up): the broad `.:/host-compose` bind above gives dashboard-api
+      # RW access to the ENTIRE install directory, redundantly including
+      # vault-keys/ (unseal material), vault-tls/ (mTLS private keys) and
+      # .coderaft-age.key (SOPS decryption key) — none of which
+      # dashboard-api's own code ever reads via CONTAINER_COMPOSE_DIR/
+      # /host-compose (confirmed via a full grep of server.js: it only
+      # touches docker-compose*.yml, install-config.env, .env.enc, secrets/,
+      # nginx-tls.conf, certbot/ under that path — it reads the real secrets
+      # via the narrow, purpose-specific RO mounts above instead). Blanking
+      # these three paths inside THIS container's view shrinks what an RCE
+      # in dashboard-api can reach, at zero functional cost. Bind-mounting
+      # /dev/null over a FILE works to blank it (reads as empty); tmpfs only
+      # works over DIRECTORIES (verified: tmpfs on a file path fails outright
+      # with "not a directory" — that's why .coderaft-age.key uses the
+      # /dev/null bind below instead of a tmpfs entry). Verified
+      # experimentally 2026-07-31 in an isolated throwaway compose project:
+      # `ls /host-compose` still lists everything (docker-compose.yml,
+      # secrets/, harmless files) with normal RW, `ls /host-compose/vault-keys`
+      # and `/vault-tls` come back empty, `cat /host-compose/.coderaft-age.key`
+      # returns nothing — while deploy/restart/rollback/backup (which only
+      # ever touch the OTHER paths under /host-compose) are unaffected.
+      - /dev/null:/host-compose/.coderaft-age.key
     # Task #148 (banking-grade runtime exposure reduction, 2026-07-31): the
     # *working* .env (resolved secret VALUES, passed to `docker compose
     # --env-file`) is written here instead of the persistent bind-mounted
@@ -1227,7 +1648,61 @@ services:
     # project (see #148 report).
     tmpfs:
       - /run/coderaft-env:size=1m,mode=0700,uid=0
+      # Shadow vault-keys/vault-tls inside the broad /host-compose bind — see
+      # the long comment on the volumes: block above.
+      - /host-compose/vault-keys:mode=0000,uid=0,size=1m
+      - /host-compose/vault-tls:mode=0000,uid=0,size=1m
+      # Phase 2 hardening (2026-07-31), added alongside `read_only: true`
+      # below:
+      #   - /tmp: dashboard-api's own server.js stages 3 things here via
+      #     os.tmpdir() — the Ravenscan capture-host installer zip and the
+      #     GPO/Intune CA-push zip (both small, a few MB) and, more
+      #     importantly, the restic DISASTER-RECOVERY RESTORE scratch dir
+      #     (`backup.js`'s `restore()`), which could be multi-gigabyte for a
+      #     full platform restore. Rather than size a RAM-backed tmpfs to
+      #     cover a worst-case multi-GB restore (risking host OOM under
+      #     memory pressure instead of a clean ENOSPC), the two restore call
+      #     sites (POST /api/dashboard/backup/restore-platform and
+      #     /api/dashboard/backup/restore in server.js) were changed to
+      #     target a scratch dir under the disk-backed `/data` volume
+      #     instead of falling through to backup.js's own `/tmp` default —
+      #     so this tmpfs only ever needs to hold the two small zips.
+      #     512M is generous headroom for those.
+      #   - /etc/coderaft: a SEPARATE, legacy local age-key generation path
+      #     (AGE_KEY_PATH, unrelated to the vault-tls mTLS certs above)
+      #     that self-heals with `mkdir -p /etc/coderaft && age-keygen` on
+      #     boot if missing — confirmed live this fails with `ENOENT: no such
+      #     file or directory, mkdir '/etc/coderaft'` under read_only without
+      #     this tmpfs (and confirmed it succeeds fine once added). This key
+      #     was already effectively ephemeral before this change too — no
+      #     volume mounts /etc/coderaft today, so every container recreation
+      #     already regenerated it from scratch even pre-read_only.
+      #   - restic's own metadata cache (`RESTIC_CACHE_DIR`, backup.js) was
+      #     ALSO redirected to `/data/.restic-cache` (disk-backed, not tmpfs)
+      #     for the same reason as the restore scratch dir above — verified
+      #     live that restic hard-fails ("unable to open cache: mkdir
+      #     /root/.cache: read-only file system") without this, since this
+      #     container runs as root with HOME=/root.
+      - /tmp:size=512m
+      - /etc/coderaft
     security_opt: [no-new-privileges:true]
+    # F-011/F-014 (2026-07-31): verified live — a full boot (real /data +
+    # /host-compose mounts, DASHBOARD_SECRET set) reached `listening on port
+    # 3001` and GET /healthz → 200 unchanged with ALL caps dropped. No
+    # cap_add needed (this image runs as root by design — Docker socket/CLI
+    # access — but doesn't do any setuid/chown dance at its own startup).
+    cap_drop: [ALL]
+    read_only: true
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3001/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    mem_limit: 1g
+    memswap_limit: 1g
+    mem_reservation: 256m
+    cpus: 2
     restart: unless-stopped
 
   # ── coderaft-vault ──────────────────────────────────────────────────────────
@@ -1241,6 +1716,31 @@ services:
     # Effective security stays equivalent to nonroot because we drop ALL
     # capabilities AND set no-new-privileges. This is a standard hardening
     # pattern (root-with-no-caps), not a security regression.
+    #
+    # F-004 re-verified (2026-07-31, Phase 2 hardening pass): core/vault/
+    # Dockerfile's final stage IS already `gcr.io/distroless/static-debian12:
+    # nonroot` with `USER nonroot:nonroot` (uid/gid 65532) — the image itself
+    # defaults to non-root. This `user: "0:0"` override at the compose layer
+    # is what actually forces it back to root at runtime, and that's
+    # deliberate, not an oversight: `./vault-keys` (the age master key,
+    # chmod 400) and `./vault-tls` (server/client certs+keys, chmod 600) are
+    # HOST bind-mounts created by install.sh under whatever UID/permissions
+    # invoked it (not necessarily root, not necessarily uid 65532 either) —
+    # Docker bind-mounts pass host UID/GID through literally, with no
+    # remapping unless userns-remap is enabled (F-038, separately deferred —
+    # see STATUS.md, itself a stack-wide daemon change). Re-chowning those
+    # host files to 65532 would need CAP_CHOWN on the INSTALLING user, which
+    # a non-root `curl | bash` install does not have (chown to an arbitrary
+    # UID is root-only on Linux) — so it can't be done generically across
+    # every deployment shape this installer supports. Loosening the host
+    # file permissions instead (group/world-readable) to let a non-root
+    # container UID read them would weaken the actual host-level protection
+    # of the vault's own master key, which is a worse trade than the current
+    # one. This is the SAME conclusion two prior sessions reached for the
+    # (now-migrated-away) legacy coderaft-vault repo — re-confirmed here
+    # against the monorepo's actual Dockerfile + install.sh, not just
+    # inherited from old notes. Left unchanged; `cap_drop: [ALL]` below is
+    # the compensating control.
     user: "0:0"
     networks:
       - coderaft-vault-net
@@ -1257,6 +1757,10 @@ services:
       start_period: 10s
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
+    mem_limit: 256m
+    memswap_limit: 256m
+    mem_reservation: 64m
+    cpus: 1
     restart: unless-stopped
 
   # ── coderaft-cve-proxy ───────────────────────────────────────────────────
@@ -1279,6 +1783,28 @@ services:
       - CODERAFT_VAULT_CA=/vault-tls/client-ca.crt
       - CODERAFT_VAULT_CLIENT_CERT=/vault-tls/cve-proxy-client.crt
       - CODERAFT_VAULT_CLIENT_KEY=/vault-tls/cve-proxy-client.key
+      # ACCEPTED RESIDUAL RISK (security hardening pass, 2026-07-31): every
+      # OTHER consumer of XPRODUCT_INTERNAL_TOKEN/DASHBOARD_SECRET/etc. in
+      # this deployment was migrated to a Docker-native `secrets:` file (see
+      # dashboard-api/server.js's generateOverrideToDir() + the shell
+      # entrypoint.sh loaders / Go envOrFile() helpers in each product repo).
+      # coderaft-cve-proxy could NOT be migrated the same way:
+      #   1. Its source lives in a separate, currently-unmigrated repo not
+      #      available in this monorepo — no code we can add native
+      #      `_FILE`/`_PATH` support to.
+      #   2. It already already reads this token straight off the vault at
+      #      boot for its OWN bearer key ("holds the ONE bearer key for this
+      #      deployment", per the comment above) — extending that same
+      #      vault-mTLS read to XPRODUCT_INTERNAL_TOKEN instead of an env var
+      #      is the RIGHT fix, but requires a code change in that other repo.
+      #   3. It is a distroless static image (confirmed: `docker run
+      #      --entrypoint sh ghcr.io/liamj74/coderaft-cve-proxy:latest` fails
+      #      with "sh: executable file not found") — no shell-wrapper
+      #      workaround is possible either.
+      # Until cve-proxy's own repo adds vault-native or file-based reading of
+      # this token, it stays a plaintext `environment:` value (visible via
+      # `docker inspect`) — a real, deliberate, documented gap, not an
+      # oversight.
       - XPRODUCT_INTERNAL_TOKEN=${XPRODUCT_INTERNAL_TOKEN}
     volumes:
       - ./vault-tls/client-ca.crt:/vault-tls/client-ca.crt:ro
@@ -1291,6 +1817,10 @@ services:
       retries: 3
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
+    mem_limit: 256m
+    memswap_limit: 256m
+    mem_reservation: 64m
+    cpus: 1
     restart: unless-stopped
 
   postgres:
@@ -1308,8 +1838,24 @@ services:
       POSTGRES_INITDB_ARGS: "--data-checksums"
     secrets:
       - postgres_password
+    # F-025 (2026-07-31): restrict auth to scram-sha-256 only, and reject any
+    # connection from outside the pinned coderaft-backend subnet
+    # (172.28.42.0/24 — see the `coderaft-backend` network's `ipam:` config
+    # below) at the pg_hba layer itself, not just Docker network isolation.
+    # Verified live in a throwaway compose project: a peer container ON the
+    # pinned subnet connects fine over scram-sha-256; a peer on a SEPARATE
+    # docker network gets a hard `pg_hba.conf rejects connection ... no
+    # encryption` — confirms the reject rule actually fires, not just that
+    # the allow rule works.
+    command:
+      - postgres
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+      - -c
+      - password_encryption=scram-sha-256
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
       # init-db.sql is intentionally NOT bind-mounted — when the
       # dashboard-api spawns docker-compose from inside a Linux container
       # against a Windows host, the resolved Windows path contains a
@@ -1330,6 +1876,10 @@ services:
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+    mem_limit: 1g
+    memswap_limit: 1g
+    mem_reservation: 256m
+    cpus: 2
     restart: unless-stopped
 
   redis:
@@ -1358,6 +1908,20 @@ services:
     # B-PRODUCT-DB-NET: same reason as postgres — product workers also
     # connect to redis://redis:6379 and must resolve the hostname.
     networks: [coderaft-backend]
+    # F-011/F-014 (2026-07-31): verified live — PING/SET/BGSAVE all still
+    # work with ALL caps dropped + read_only root + no extra tmpfs. redis:
+    # 7-alpine's own Dockerfile declares `VOLUME /data` — Docker always gives
+    # it a writable volume (anonymous here, since no explicit `/data` bind is
+    # declared) regardless of the read_only root fs, which is what BGSAVE's
+    # periodic RDB snapshot writes into; confirmed a manual `BGSAVE` still
+    # says "Background saving started"/"DB saved on disk" under this config.
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    read_only: true
+    mem_limit: 256m
+    memswap_limit: 256m
+    mem_reservation: 64m
+    cpus: 1
     restart: unless-stopped
 
 networks:
@@ -1370,7 +1934,20 @@ networks:
     internal: true
   # B-PRODUCT-DB-NET: backend network shared by data services (postgres,
   # redis, neo4j) and the dynamically-deployed products.
-  coderaft-backend: {}
+  # F-025 (2026-07-31): subnet PINNED (not left to Docker's auto-allocation)
+  # so postgres/pg_hba.conf below can hard-code the exact CIDR it trusts —
+  # otherwise a stack teardown+recreate could get a different auto-assigned
+  # subnet from Docker's pool and silently lock every product out of
+  # Postgres. Chosen to avoid the common Docker default-pool range
+  # (172.17-172.20.0.0/16, where `docker0`/other local stacks often already
+  # sit — see the RAVENSCAN_HOST_PORT comment above re: spineart-traefik
+  # collisions) and to not collide with this repo's OTHER already-used
+  # ranges (coderaft-vault-net/docker-proxy-net/coderaft-frontend/default —
+  # see update.sh / dashboard-api for any of those pinned similarly).
+  coderaft-backend:
+    ipam:
+      config:
+        - subnet: 172.28.42.0/24
   # B-DASHBOARD-NET: frontend network where the dashboard nginx and the
   # product HTTP listeners (entraguard-api, ravenscan, redfox-api) meet.
   coderaft-frontend: {}
@@ -1381,6 +1958,10 @@ volumes:
   caddy_data:
   caddy_config:
   vault_data:
+  # F-014 (2026-07-31): named volume (not tmpfs) so the docker-socket-proxy
+  # image's baked-in haproxy.cfg.template survives under read_only:true —
+  # see the docker-proxy service's `volumes:` comment above.
+  docker_proxy_haproxy_cfg:
 
 # Task #148 (2026-07-31): postgres's password, Docker-native file-based
 # secret. Must be a real path resolvable by the Docker DAEMON itself (unlike
@@ -1396,6 +1977,45 @@ secrets:
   redis_password:
     file: ./secrets/redis_password
 COMPOSE
+
+# ── postgres/pg_hba.conf (F-025, 2026-07-31) ─────────────────────────────────
+# scram-sha-256-only auth, restricted to the pinned coderaft-backend subnet
+# (172.28.42.0/24 — see the `coderaft-backend` network's `ipam:` block in the
+# docker-compose.yml heredoc above; the two MUST stay in sync, which is why
+# both are hard-coded to the same literal here rather than one being derived
+# from the other — this installer has no templating step between the two
+# files). Verified in a throwaway compose project: a peer container on the
+# pinned subnet connects fine; a peer on a different docker network gets a
+# hard `pg_hba.conf rejects connection ... no encryption`.
+#
+# Idempotent — like vault_bootstrap()/Caddyfile below, only written if
+# missing, so an operator's manual edits (e.g. adding a read replica's
+# `hostssl replication ... cert` line) survive `update.sh` re-runs.
+mkdir -p postgres
+if [ ! -f postgres/pg_hba.conf ]; then
+    cat > postgres/pg_hba.conf << 'PGHBA'
+# Coderaft — managed by deploy/install.sh (F-025). scram-sha-256 only.
+# TYPE    DATABASE  USER  ADDRESS           METHOD
+
+# Unix socket (inside the postgres container itself, e.g. an operator
+# `docker compose exec postgres psql`).
+local     all       all                     scram-sha-256
+
+# coderaft-backend Docker network only — every consumer (dashboard-api,
+# entraguard-api/worker/beat, ravenscan, redfox-api/gateway, falconone-*)
+# joins this network; nothing outside it can reach postgres:5432 at all
+# (no host port is published), so this is defense-in-depth on top of that
+# network-level isolation, not the only control.
+host      all       all   172.28.42.0/24    scram-sha-256
+
+# Default deny — anything that isn't the exact subnet above (e.g. a stray
+# container mistakenly joined to more than one network) is rejected here,
+# not silently allowed by falling through to a permissive default.
+host      all       all   0.0.0.0/0         reject
+host      all       all   ::/0              reject
+PGHBA
+    chmod 644 postgres/pg_hba.conf
+fi
 
 # ── Caddyfile (env-templated TLS: internal CA / wildcard / ACME) ─────────────
 # The TLS mode is driven by env placeholders resolved at Caddy start:
@@ -1425,12 +2045,74 @@ if [ ! -f Caddyfile ]; then
     }
 }
 
+# F-007 (2026-07-31): baseline security headers for every site block.
+#
+# F-036 (2026-07-31) evaluated and closed WITHOUT a code change to the CSP
+# below — investigated live in a throwaway compose (caddy:2-alpine is
+# actually v2.11.4; verified against caddyserver/caddy's tplcontext.go), not
+# just the indicative snippet in REMEDIATION-PROMPT-2026-06-20.md:
+#   - Caddy has NO built-in nonce template function (checked the real
+#     http.handlers.templates function list: include/readFile/import/
+#     httpInclude/stripHTML/markdown/env/placeholder/fileExists/httpError/
+#     humanize/maybe/pathEscape — no `nonce`). A dynamic per-request nonce
+#     would need a custom xcaddy build with a third-party plugin — real
+#     ongoing maintenance cost for what `dashboard` is: a pure static Vite
+#     SPA served by nginx (no per-request HTML generation at all — see the
+#     comment on the `dashboard` service below), so there's no natural place
+#     to even mint/thread a nonce server-side.
+#   - Even if we had nonces, they only cover <script>/<style> ELEMENTS —
+#     never a `style=""` ATTRIBUTE. That's the actual gap here: bundled
+#     @xterm/xterm (RedFox SSH/RDP terminal sessions) calls
+#     `element.setAttribute("style", ...)` for cell/selection highlighting,
+#     confirmed present in the shipped bundle (grep dist/assets/*.js for
+#     `_addStyle`/`setAttribute("style"`). Per the CSP spec (confirmed via
+#     MDN), that call is blocked by style-src unless 'unsafe-inline' is
+#     present — no nonce or hash can except a dynamically-set attribute.
+#     Dropping 'unsafe-inline' from style-src would silently break every
+#     RedFox terminal session. style-src is left as-is.
+#   - script-src already has NO 'unsafe-inline' (shipped tonight in F-007)
+#     and needed no change — but verifying it live (see "Vérification" in
+#     the F-036 task) surfaced a real regression: apps/shell/index.html had
+#     an inline <script> (dark/light theme pre-paint init) with no
+#     nonce/hash, so Chrome was silently blocking it
+#     ("script-src 'self'" refuses inline execution) — the pre-paint theme
+#     class was never applied. Fixed by externalizing it to
+#     apps/shell/public/theme-init.js (same-origin external file, no CSP
+#     exception needed). Confirmed fixed: document.documentElement.className
+#     was empty before, "light"/"dark" after, in the same throwaway compose.
+#   - Separately discovered (NOT fixed here, flagged for its own ticket):
+#     FalconOne Remote Assist's protobufjs Root (`hbb.RendezvousMessage` /
+#     `hbb.NatType`, the RustDesk-compatible wire protocol, #139) builds its
+#     message constructors via runtime `new Function(...)` codegen at module
+#     load — this throws
+#     "EvalError: ... 'unsafe-eval' is not an allowed source" under the
+#     current script-src, every page load, independent of any user action.
+#     This looks like a live break of Remote Assist signal/relay encoding
+#     introduced by tonight's F-007 CSP. Needs either protobufjs static
+#     codegen (`pbjs --target static-module`, no runtime eval) or a scoped
+#     fix — NOT an "add unsafe-eval" fix, that would undo the hardening.
+(coderaft_security) {
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Frame-Options "DENY"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+        Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'"
+        Cross-Origin-Opener-Policy "same-origin"
+        Cross-Origin-Resource-Policy "same-origin"
+        -Server
+        -X-Powered-By
+    }
+}
+
 # Platform sites. TLS mode injected from .env by the Setup Wizard:
 #   internal (default) — Caddy self-signed CA (root.crt downloadable from
 #                        the dashboard: Setup → TLS → Download CA / GPO pack)
 #   wildcard           — tls /certs/wildcard.crt /certs/wildcard.key
 #   acme               — tls <email> (Let's Encrypt, public deployments)
 {$CODERAFT_TLS_SITES:coderaft.local, *.coderaft.local} {
+    import coderaft_security
     tls {$CADDY_TLS_MODE_ARGS:internal}
     reverse_proxy dashboard:3000 {
         header_up X-Forwarded-Proto https
@@ -1447,6 +2129,7 @@ http://{$CODERAFT_HOSTNAME:coderaft.local}, http://*.{$CODERAFT_HOSTNAME:coderaf
 # proxies to the dashboard. This keeps `http://localhost:3000` working
 # transparently and avoids breaking existing flows.
 :80 {
+    import coderaft_security
     reverse_proxy dashboard:3000
 }
 CADDY
