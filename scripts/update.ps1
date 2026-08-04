@@ -1326,7 +1326,24 @@ function Invoke-VaultClientCertSelfHeal {
 
     $tlsDir = Join-Path $InstallDir "vault-tls"
     $certPath = Join-Path $tlsDir "$Name-client.crt"
-    if (Test-Path $certPath) { return }
+    $keyPath = Join-Path $tlsDir "$Name-client.key"
+    # BUG FIX (2026-08-04, found live): plain Test-Path matches directories
+    # too. If dashboard-api's bind mount for this cert ever ran once with the
+    # file missing, Docker silently creates an EMPTY DIRECTORY at that host
+    # path instead of erroring — Test-Path then reports "exists" forever,
+    # this self-heal never regenerates the real cert, and falconone-api
+    # fatals with "load client cert: read .../falconone-client.crt: is a
+    # directory" on every boot. -PathType Leaf requires a real file; if a
+    # stale directory is squatting on either path, remove it first so the
+    # generation step below can actually create the file.
+    if ((Test-Path $certPath) -and -not (Test-Path $certPath -PathType Leaf)) {
+        Write-Host "  [update] Cert self-heal: $certPath is a directory (stale empty bind-mount artifact), not a cert — removing so it can be regenerated"
+        Remove-Item -LiteralPath $certPath -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if ((Test-Path $keyPath) -and -not (Test-Path $keyPath -PathType Leaf)) {
+        Remove-Item -LiteralPath $keyPath -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if (Test-Path $certPath -PathType Leaf) { return }
 
     $caKey = Join-Path $tlsDir "client-ca.key"
     $caCrt = Join-Path $tlsDir "client-ca.crt"
@@ -2283,64 +2300,57 @@ Invoke-VaultAclLiveSelfHeal -InstallDir $INSTALL_DIR -Name "cve-proxy" -San "cve
     "read:cve-proxy/*", "write:cve-proxy/*"
 )
 
-# ── Banking-grade plaintext purge (auto) ──────────────────────────────────
-# When .env.enc exists, the plaintext .env MUST be purged. The oneliner
-# does the finalize itself: verifies decryption matches plaintext, keeps a
-# 24h .bak, then deletes plaintext. Falls back to a warning otherwise.
+# ── Banking-grade plaintext .env handling ─────────────────────────────────
+# B-PLAINTEXT-PURGE (2026-08-04, porting update.sh's 2026-06-14 fix — never
+# applied here): this block used to DELETE the plaintext .env once .env.enc
+# was confirmed to match. Looks "banking-grade" but breaks the platform:
+# $ComposeArgs (defined near the top of this script) has NO --env-file at
+# all — docker compose pull/up below rely ENTIRELY on Docker Compose's own
+# default auto-load of a plaintext .env in the current directory, which
+# does NOT understand .env.enc. Purging it here left POSTGRES_PASSWORD /
+# REDIS_PASSWORD / DASHBOARD_SECRET / HOST_PROJECT_DIR empty for the deploy
+# steps further down — redis's `--requirepass ${REDIS_PASSWORD} --maxmemory
+# 128mb` collapsed into a single malformed `--requirepass --maxmemory
+# 128mb` directive and refused to start, taking every dependent service
+# down with it. Confirmed live on Liam's Windows deployment 2026-08-04;
+# update.sh hit and fixed the IDENTICAL bug on 2026-06-14 but update.ps1
+# never got the same fix. The real "no plaintext at rest" goal needs an
+# init container or a vault-backed secrets driver (planned in #16 audit
+# bancaire). Until that ships, .env stays on disk — ACL-restricted to the
+# current user where possible — and .env.enc remains the authoritative
+# audit-trail copy.
 Write-Host ""
 Write-Host "  Banking-grade secret check..."
 $envPlain = Join-Path $INSTALL_DIR ".env"
 $envEnc   = Join-Path $INSTALL_DIR ".env.enc"
-if ((Test-Path $envEnc) -and (Test-Path $envPlain)) {
-    $ageKey = if ($env:SOPS_AGE_KEY_FILE) { $env:SOPS_AGE_KEY_FILE } else { Join-Path $INSTALL_DIR ".coderaft-age.key" }
-    if (-not (Test-Path $ageKey) -and (Test-Path "C:\ProgramData\coderaft\age.key")) {
-        $ageKey = "C:\ProgramData\coderaft\age.key"
-    }
-    $sopsCmd = Get-Command sops -ErrorAction SilentlyContinue
-    $sops = if ($sopsCmd) { $sopsCmd.Path } else { $null }
-    if (-not (Test-Path $ageKey)) {
-        Write-Host "  [!] .env + .env.enc coexist but age key not found at $ageKey" -ForegroundColor Yellow
-        Write-Host "      Plaintext .env left in place; investigate before next run." -ForegroundColor Yellow
-    } elseif (-not $sops) {
-        Write-Host "  [i] sops missing on host — update.ps1 skips the automatic finalize." -ForegroundColor Yellow
-        Write-Host "      Choose one method to purge the plaintext .env:" -ForegroundColor Yellow
-        Write-Host "        A) Dashboard  →  Settings → Migrate secrets  (runs inside dashboard-api)" -ForegroundColor Yellow
-        Write-Host "        B) CLI        →  & ([scriptblock]::Create((irm https://install.coderaft.io/migrate.ps1))) -Finalize" -ForegroundColor Yellow
-        Write-Host "                          (auto-downloads sops.exe + age-keygen.exe)" -ForegroundColor Yellow
-    } else {
-        $env:SOPS_AGE_KEY_FILE = $ageKey
-        $decrypted = & $sops --decrypt --input-type dotenv --output-type dotenv $envEnc 2>$null
-        if (-not $decrypted) {
-            Write-Host "  [!] sops decrypt of .env.enc returned empty — leaving plaintext" -ForegroundColor Yellow
-        } else {
-            $bakDir = Join-Path $INSTALL_DIR "dashboard_data"
-            New-Item -ItemType Directory -Force -Path $bakDir | Out-Null
-            $bakFile = Join-Path $bakDir ("env-pre-finalize-" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".bak")
+if (Test-Path $envPlain) {
+    try {
+        $envAcl = Get-Acl $envPlain
+        $envAcl.SetAccessRuleProtection($true, $false)
+        $envRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
+            "FullControl", "Allow")
+        $envAcl.ResetAccessRule($envRule)
+        Set-Acl $envPlain $envAcl -ErrorAction Stop
+    } catch {}
+    if (Test-Path $envEnc) {
+        # Belt-and-braces: keep a daily snapshot of the plaintext so an
+        # operator-side mistake can be reverted within 7 days (mirrors
+        # update.sh's env-snapshot-<date>.bak retention).
+        $bakDir = Join-Path $INSTALL_DIR "dashboard_data"
+        New-Item -ItemType Directory -Force -Path $bakDir | Out-Null
+        $bakFile = Join-Path $bakDir ("env-snapshot-" + (Get-Date -Format "yyyyMMdd") + ".bak")
+        if (-not (Test-Path $bakFile)) {
             Copy-Item $envPlain $bakFile -ErrorAction SilentlyContinue
-            # Security hardening (2026-07-31): the message below has always
-            # claimed these plaintext-.env backups (real secret VALUES, not
-            # just config) are "kept 24h" — but no code anywhere ever actually
-            # deleted them; found auditing residual-file cleanup across the
-            # installer. Enforce the claim for real: purge anything older
-            # than 24h in this directory, best-effort, never blocking finalize.
-            try {
-                Get-ChildItem -LiteralPath $bakDir -Filter "env-pre-finalize-*.bak" -File -ErrorAction SilentlyContinue |
-                    Where-Object { $_.LastWriteTime -lt (Get-Date).AddHours(-24) } |
-                    Remove-Item -Force -ErrorAction SilentlyContinue
-            } catch {}
-            $plainNorm   = (Get-Content $envPlain | Where-Object { $_ -notmatch '^\s*(#|$)' } | Sort-Object) -join "`n"
-            $decryptNorm = ($decrypted | Where-Object { $_ -notmatch '^\s*(#|$)' } | Sort-Object) -join "`n"
-            if ($plainNorm -eq $decryptNorm) {
-                Remove-Item $envPlain -Force
-                Write-Host "  ✓ plaintext .env purged (backup: $bakFile, kept 24h)"
-            } else {
-                Write-Host "  [!] .env and .env.enc differ — refusing to purge plaintext." -ForegroundColor Yellow
-                Write-Host "      Choose one method to reconcile + purge:" -ForegroundColor Yellow
-                Write-Host "        A) Dashboard  →  Settings → Migrate secrets" -ForegroundColor Yellow
-                Write-Host "        B) CLI        →  iex (irm https://install.coderaft.io/migrate.ps1)" -ForegroundColor Yellow
-                Write-Host "      Backup written to $bakFile" -ForegroundColor Yellow
-            }
         }
+        try {
+            Get-ChildItem -LiteralPath $bakDir -Filter "env-snapshot-*.bak" -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } |
+                Remove-Item -Force -ErrorAction SilentlyContinue
+        } catch {}
+        Write-Host "  ✓ .env protected (ACL-restricted) + .env.enc audit copy + daily snapshot in $bakDir"
+    } else {
+        Write-Host "  ✓ .env protected (ACL-restricted)"
     }
 }
 
@@ -2642,6 +2652,50 @@ foreach ($img in $ComposeImages) {
             }
         }
         $LASTEXITCODE = 0
+    }
+}
+
+# ── Ensure .env is present + fresh before ANY docker compose call below ───
+# BUG (found live 2026-08-04, Liam's Windows deployment): `$ComposeArgs`
+# above is just @("compose") — no --env-file — so `docker compose pull`/
+# `up` rely ENTIRELY on Docker Compose's own default auto-load of a plain
+# `.env` file in the current directory. But the "Banking-grade plaintext
+# purge" block earlier in this script (and dashboard-api's own task #148
+# hardening, which deletes its host-visible copy once its internal tmpfs
+# copy is authoritative) can both legitimately have already REMOVED that
+# file by the time we get here — the purge block's own job is exactly to
+# delete it once .env.enc is confirmed authoritative. Result: every
+# `${POSTGRES_PASSWORD}`/`${REDIS_PASSWORD}`/etc. reference below silently
+# resolves to an empty string, and redis's `--requirepass ${REDIS_PASSWORD}
+# --maxmemory 128mb` collapses into `--requirepass --maxmemory 128mb` —
+# redis reads that as ONE malformed directive and refuses to start
+# ("wrong number of arguments"). Confirmed live: this had never surfaced
+# before because dashboard-api's own crash-loop (missing vault-secret-
+# resolve.js in its Dockerfile, fixed 2026-08-04) meant .env.enc was never
+# reliably refreshed either, so the purge block's `if (Test-Path $envEnc)`
+# guard rarely fired. Fix: always regenerate a fresh, correct .env from
+# .env.enc right before the commands that need it — never trust that a
+# plaintext copy still happens to be lying around from an earlier step.
+$envPlainPreDeploy = Join-Path $INSTALL_DIR ".env"
+$envEncPreDeploy   = Join-Path $INSTALL_DIR ".env.enc"
+if (Test-Path $envEncPreDeploy) {
+    $ageKeyPreDeploy = if ($env:SOPS_AGE_KEY_FILE) { $env:SOPS_AGE_KEY_FILE } else { Join-Path $INSTALL_DIR ".coderaft-age.key" }
+    if (-not (Test-Path $ageKeyPreDeploy) -and (Test-Path "C:\ProgramData\coderaft\age.key")) {
+        $ageKeyPreDeploy = "C:\ProgramData\coderaft\age.key"
+    }
+    $sopsPreDeployCmd = Get-Command sops -ErrorAction SilentlyContinue
+    if ((Test-Path $ageKeyPreDeploy) -and $sopsPreDeployCmd) {
+        $env:SOPS_AGE_KEY_FILE = $ageKeyPreDeploy
+        $decryptedPreDeploy = & $sopsPreDeployCmd.Path --decrypt --input-type dotenv --output-type dotenv $envEncPreDeploy 2>$null
+        if ($decryptedPreDeploy) {
+            [System.IO.File]::WriteAllText($envPlainPreDeploy, (($decryptedPreDeploy -join "`n") + "`n"), [System.Text.UTF8Encoding]::new($false))
+            Write-Host "  ✓ .env refreshed from .env.enc (ensures docker compose sees real secrets)"
+        } elseif (-not (Test-Path $envPlainPreDeploy)) {
+            Write-Host "  [!] sops decrypt of .env.enc returned empty and no .env exists — docker compose calls below will likely fail." -ForegroundColor Yellow
+        }
+    } elseif (-not (Test-Path $envPlainPreDeploy)) {
+        Write-Host "  [!] .env is missing and .env.enc cannot be decrypted here (sops or age key unavailable) — docker compose calls below will likely fail." -ForegroundColor Yellow
+        Write-Host "      Install sops (https://github.com/getsops/sops) or restore $ageKeyPreDeploy" -ForegroundColor Yellow
     }
 }
 
