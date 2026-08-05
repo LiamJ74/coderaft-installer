@@ -57,18 +57,108 @@ $INSTALL_CONFIG_PATH = Join-Path $INSTALL_DIR "install-config.env"
 if (-not (Test-Path $INSTALL_CONFIG_PATH)) {
     [System.IO.File]::WriteAllText($INSTALL_CONFIG_PATH, "", [System.Text.UTF8Encoding]::new($false))
 }
+# BUG FIX (2026-08-05, found live on Liam's Windows test machine — CODERAFT_HOST_OS
+# read back as "windowscoderaft_host_arch=amd64host_project_dir=c:\..." repeated
+# 4x with zero separators): `$text -split "..." | Where-Object {...}` UNWRAPS to a
+# plain scalar string (not a 1-element array) whenever exactly ONE line survives the
+# filter — a well-known PowerShell pipeline-collapsing gotcha. The next line,
+# `$lines += "$Key=$Value"`, is then STRING CONCATENATION (not array-append) because
+# its LHS is a string, silently gluing the new pair onto the previous line with no
+# newline. This reproduced 100% with real pwsh (multi-run simulation, see commit) —
+# it fires the very first time two keys are set back-to-back while the file holds
+# exactly one line (e.g. CODERAFT_HOST_OS then CODERAFT_HOST_ARCH in the self-heal
+# block below), and then self-reinforces: once a key's own "^KEY=" line-start marker
+# is buried mid-line, Get-InstallConfigVar can no longer find it, so its self-heal
+# re-fires and re-appends on every subsequent update.ps1 run. Wrapping the
+# Where-Object result in `@(...)` forces it to always be a real array (0, 1, or many
+# elements), so `+=` is always array-append. Get-InstallConfigVar is hardened the
+# same way (take the first match only) in case a file is already corrupted with
+# duplicate lines for the same key.
 function Set-InstallConfigVar($Key, $Value) {
     $text = [System.IO.File]::ReadAllText($script:INSTALL_CONFIG_PATH, [System.Text.UTF8Encoding]::new($false))
-    $lines = $text -split "`r?`n" | Where-Object { $_ -notmatch "^$Key=" -and $_ -ne "" }
+    $lines = @($text -split "`r?`n" | Where-Object { $_ -notmatch "^$Key=" -and $_ -ne "" })
     $lines += "$Key=$Value"
     [System.IO.File]::WriteAllText($script:INSTALL_CONFIG_PATH, (($lines -join "`n") + "`n"), [System.Text.UTF8Encoding]::new($false))
 }
 function Get-InstallConfigVar($Key) {
     if (-not (Test-Path $script:INSTALL_CONFIG_PATH)) { return $null }
-    $m = Select-String -Path $script:INSTALL_CONFIG_PATH -Pattern "^$Key=(.+)$"
-    if ($m) { return $m.Matches.Groups[1].Value }
+    $m = @(Select-String -Path $script:INSTALL_CONFIG_PATH -Pattern "^$Key=(.+)$")
+    if ($m.Count -ge 1) { return $m[0].Matches.Groups[1].Value }
     return $null
 }
+
+# ── Self-heal: repair an ALREADY-corrupted install-config.env ──────────────
+# (2026-08-05) Fixes the file in place for installs that hit the bug described
+# above before this fix shipped (confirmed live on Liam's machine). Detects any
+# physical line containing 2+ of our known "KEY=" markers (the corruption
+# signature — legitimate lines only ever contain one) and splits it back into
+# one clean line per key, keeping the LAST value seen for each key (in case a
+# value like HOST_PROJECT_DIR genuinely changed across the corrupted appends).
+# Runs once, right here, before ANY other Get-/Set-InstallConfigVar call.
+function Repair-InstallConfigCorruption {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path $Path)) { return }
+    # Extend this list if install-config.env ever grows more keys.
+    $knownKeys = @("HOST_PROJECT_DIR", "CODERAFT_HOST_OS", "CODERAFT_HOST_ARCH")
+    $text = [System.IO.File]::ReadAllText($Path, [System.Text.UTF8Encoding]::new($false))
+    if (-not $text) { return }
+    $rawLines = @($text -split "`r?`n" | Where-Object { $_ -ne "" })
+    $markerPattern = "(?:" + (($knownKeys | ForEach-Object { [regex]::Escape($_) }) -join "|") + ")="
+    $corruptedFound = $false
+    $clean = [ordered]@{}
+    foreach ($line in $rawLines) {
+        $markerMatches = @([regex]::Matches($line, $markerPattern))
+        if ($markerMatches.Count -le 1) {
+            $eq = $line.IndexOf('=')
+            if ($eq -gt 0) { $clean[$line.Substring(0, $eq)] = $line.Substring($eq + 1) }
+            continue
+        }
+        $corruptedFound = $true
+        for ($i = 0; $i -lt $markerMatches.Count; $i++) {
+            $start = $markerMatches[$i].Index
+            $end = if ($i + 1 -lt $markerMatches.Count) { $markerMatches[$i + 1].Index } else { $line.Length }
+            $segment = $line.Substring($start, $end - $start)
+            $eq = $segment.IndexOf('=')
+            if ($eq -gt 0) { $clean[$segment.Substring(0, $eq)] = $segment.Substring($eq + 1) }
+        }
+    }
+    if (-not $corruptedFound) { return }
+    $ts = Get-Date -Format "yyyyMMddTHHmmssZ"
+    Copy-Item -LiteralPath $Path -Destination "$Path.bak-corrupt-$ts" -ErrorAction SilentlyContinue
+    $newLines = @($clean.Keys | ForEach-Object { "$_=$($clean[$_])" })
+    [System.IO.File]::WriteAllText($Path, (($newLines -join "`n") + "`n"), [System.Text.UTF8Encoding]::new($false))
+    Write-Host "  ⚠ install-config.env was corrupted (concatenated values from a known PowerShell array/string bug, now fixed) — repaired automatically." -ForegroundColor Yellow
+    Write-Host "    Backup of the corrupted file: $Path.bak-corrupt-$ts"
+}
+Repair-InstallConfigCorruption -Path $INSTALL_CONFIG_PATH
+
+# ── Detail log file (2026-08-05) ────────────────────────────────────────────
+# Liam's feedback on a live run: the console printed developer-grade internal
+# detail on every single update — per-product ACL self-heal internals, PKI SAN
+# strings, vault-ACL live-reconciliation results — that a real customer has no
+# use for ("le client n'a pas besoin de voir ça mais dans un fichier logs oui").
+# All of that now goes to this file via Write-DetailLog instead of Write-Host;
+# the console keeps ONE concise line per phase. The log path is printed once
+# at the end of the run so an operator (or Liam, debugging remotely) can find
+# the detail. Kept under the install dir (not $env:TEMP) so it survives and is
+# easy to locate; only the last 10 runs are kept.
+$LOG_DIR = Join-Path $INSTALL_DIR "logs"
+try { New-Item -ItemType Directory -Force -Path $LOG_DIR -ErrorAction Stop | Out-Null } catch { $LOG_DIR = $env:TEMP }
+$UPDATE_LOG = Join-Path $LOG_DIR ("update-" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".log")
+try {
+    [System.IO.File]::WriteAllText($UPDATE_LOG, "[$(Get-Date -Format o)] update.ps1 started`n", [System.Text.UTF8Encoding]::new($false))
+} catch { }
+function Write-DetailLog {
+    param([Parameter(ValueFromPipeline = $true)][string]$Message)
+    process {
+        try { Add-Content -LiteralPath $script:UPDATE_LOG -Value "[$(Get-Date -Format o)] $Message" -Encoding utf8 -ErrorAction SilentlyContinue } catch { }
+    }
+}
+try {
+    Get-ChildItem -LiteralPath $LOG_DIR -Filter "update-*.log" -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -Skip 10 |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+} catch { }
 
 # ── Backup rotation (security hardening, 2026-07-31) ────────────────────────
 # Every self-heal path below does Copy-Item $X "$X.bak-<tag>-<timestamp>"
@@ -927,7 +1017,7 @@ chmod 644 *.crt *.key 2>/dev/null || true
     # Bug fix (2026-07-27): this used to print success unconditionally,
     # regardless of whether the container/script actually succeeded.
     if ($foProc -and $foProc.ExitCode -eq 0) {
-        Write-Host "  ✓ FalconOne agents PKI written (SAN: $foSanString)"
+        Write-DetailLog "FalconOne agents PKI written (SAN: $foSanString)"
     } else {
         Write-Host "  ✗ FalconOne agents PKI bootstrap FAILED (exit code $($foProc.ExitCode)) — falconone-api will fatal-crash at boot (empty/missing cert in $foTlsDir). Re-run the update, or manually delete $foTlsDir and re-run to force a clean regeneration." -ForegroundColor Red
     }
@@ -947,7 +1037,7 @@ function Invoke-FalconOneAclSelfHeal {
     param([Parameter(Mandatory = $true)][string]$AclPath)
 
     if (-not (Test-Path $AclPath)) {
-        Write-Host "  [install] ACL self-heal: $AclPath not found — skipping (vault not provisioned yet)"
+        Write-DetailLog "[install] ACL self-heal: $AclPath not found — skipping (vault not provisioned yet)"
         return
     }
 
@@ -995,7 +1085,7 @@ function Invoke-FalconOneAclSelfHeal {
       - "write:falconone/scripts_ca*"
 '@
         Add-Content -LiteralPath $AclPath -Value $newBlock
-        Write-Host "  [install] Self-heal ACL: falconone permissions updated (+$($requiredPerms.Count) added, entry created)"
+        Write-DetailLog "[install] Self-heal ACL: falconone permissions updated (+$($requiredPerms.Count) added, entry created)"
         return
     }
 
@@ -1008,7 +1098,7 @@ function Invoke-FalconOneAclSelfHeal {
     $missing = @($requiredPerms | Where-Object { $blockText -notmatch [regex]::Escape("`"$_`"") })
 
     if ($missing.Count -eq 0) {
-        Write-Host "  [install] ACL falconone already up-to-date"
+        Write-DetailLog "[install] ACL falconone already up-to-date"
         return
     }
 
@@ -1031,7 +1121,7 @@ function Invoke-FalconOneAclSelfHeal {
         $merged | Set-Content -LiteralPath $AclPath -Encoding UTF8
     }
 
-    Write-Host "  [install] Self-heal ACL: falconone permissions updated (+$($missing.Count) added)"
+    Write-DetailLog "[install] Self-heal ACL: falconone permissions updated (+$($missing.Count) added)"
 }
 
 # ── ACL self-heal: redfox connections/k8s vault-backed credentials ──────────
@@ -1047,7 +1137,7 @@ function Invoke-RedfoxAclSelfHeal {
     param([Parameter(Mandatory = $true)][string]$AclPath)
 
     if (-not (Test-Path $AclPath)) {
-        Write-Host "  [update] ACL self-heal: $AclPath not found — skipping (vault not provisioned yet)"
+        Write-DetailLog "[update] ACL self-heal: $AclPath not found — skipping (vault not provisioned yet)"
         return
     }
 
@@ -1091,7 +1181,7 @@ function Invoke-RedfoxAclSelfHeal {
       - "delete:redfox/k8s/*"
 '@
         Add-Content -LiteralPath $AclPath -Value $newBlock
-        Write-Host "  [update] Self-heal ACL: redfox permissions updated (+$($requiredPerms.Count) added, entry created)"
+        Write-DetailLog "[update] Self-heal ACL: redfox permissions updated (+$($requiredPerms.Count) added, entry created)"
         return
     }
 
@@ -1104,7 +1194,7 @@ function Invoke-RedfoxAclSelfHeal {
     $missing = @($requiredPerms | Where-Object { $blockText -notmatch [regex]::Escape("`"$_`"") })
 
     if ($missing.Count -eq 0) {
-        Write-Host "  [update] ACL redfox already up-to-date"
+        Write-DetailLog "[update] ACL redfox already up-to-date"
         return
     }
 
@@ -1127,7 +1217,7 @@ function Invoke-RedfoxAclSelfHeal {
         $merged | Set-Content -LiteralPath $AclPath -Encoding UTF8
     }
 
-    Write-Host "  [update] Self-heal ACL: redfox permissions updated (+$($missing.Count) added)"
+    Write-DetailLog "[update] Self-heal ACL: redfox permissions updated (+$($missing.Count) added)"
 }
 
 # ── ACL self-heal: cve-proxy entry (coderaft-cve-engine sidecar) ────────────
@@ -1136,14 +1226,14 @@ function Invoke-CveProxyAclSelfHeal {
     param([Parameter(Mandatory = $true)][string]$AclPath)
 
     if (-not (Test-Path $AclPath)) {
-        Write-Host "  [update] ACL self-heal: $AclPath not found — skipping (vault not provisioned yet)"
+        Write-DetailLog "[update] ACL self-heal: $AclPath not found — skipping (vault not provisioned yet)"
         return
     }
 
     $lines = @(Get-Content -LiteralPath $AclPath)
     $already = $lines | Where-Object { $_ -match '^\s*-\s*name:\s*cve-proxy\s*$' }
     if ($already) {
-        Write-Host "  [update] ACL cve-proxy already present"
+        Write-DetailLog "[update] ACL cve-proxy already present"
         return
     }
 
@@ -1158,7 +1248,7 @@ function Invoke-CveProxyAclSelfHeal {
       - "write:cve-proxy/*"
 '@
     Add-Content -LiteralPath $AclPath -Value $newBlock
-    Write-Host "  [update] Self-heal ACL: cve-proxy entry created"
+    Write-DetailLog "[update] Self-heal ACL: cve-proxy entry created"
 }
 
 # ── Live vault ACL reconciliation (post-bootstrap installs) ─────────────────
@@ -1267,7 +1357,7 @@ function Invoke-VaultAclLiveSelfHeal {
 
     $health = _AclLiveCurl -Method "GET" -Path "/v1/health"
     if ($health -notmatch '"sealed":false') {
-        Write-Host "  [update] Vault ACL live self-heal ($Name): vault sealed/unreachable — skipped, will apply on the vault's next real bootstrap"
+        Write-DetailLog "[update] Vault ACL live self-heal ($Name): vault sealed/unreachable — skipped, will apply on the vault's next real bootstrap"
         return
     }
 
@@ -1293,7 +1383,7 @@ function Invoke-VaultAclLiveSelfHeal {
             }
         }
         if ($merged -eq $existingPerms) {
-            Write-Host "  [update] Vault ACL live self-heal: $Name already up-to-date on the running vault"
+            Write-DetailLog "[update] Vault ACL live self-heal: $Name already up-to-date on the running vault"
             return
         }
         $permsJson = "[" + $merged.TrimStart(',') + "]"
@@ -1305,12 +1395,12 @@ function Invoke-VaultAclLiveSelfHeal {
     $resp = _AclLiveCurl -Method "PUT" -Path "/v1/admin/acl/$Name" -JsonBody $body
     if ($resp -match '"ok":true') {
         if ($null -ne $existingPerms) {
-            Write-Host "  [update] Vault ACL live self-heal: $Name permissions merged on the RUNNING vault (acl.yaml alone would not have reached it)"
+            Write-DetailLog "[update] Vault ACL live self-heal: $Name permissions merged on the RUNNING vault (acl.yaml alone would not have reached it)"
         } else {
-            Write-Host "  [update] Vault ACL live self-heal: $Name granted on the RUNNING vault (acl.yaml alone would not have reached it)"
+            Write-DetailLog "[update] Vault ACL live self-heal: $Name granted on the RUNNING vault (acl.yaml alone would not have reached it)"
         }
     } else {
-        Write-Host "  [update] Vault ACL live self-heal: PUT /v1/admin/acl/$Name failed — will retry on next update: $resp"
+        Write-DetailLog "[update] Vault ACL live self-heal: PUT /v1/admin/acl/$Name failed — will retry on next update: $resp"
     }
 }
 
@@ -1337,7 +1427,7 @@ function Invoke-VaultClientCertSelfHeal {
     # stale directory is squatting on either path, remove it first so the
     # generation step below can actually create the file.
     if ((Test-Path $certPath) -and -not (Test-Path $certPath -PathType Leaf)) {
-        Write-Host "  [update] Cert self-heal: $certPath is a directory (stale empty bind-mount artifact), not a cert — removing so it can be regenerated"
+        Write-DetailLog "[update] Cert self-heal: $certPath is a directory (stale empty bind-mount artifact), not a cert — removing so it can be regenerated"
         Remove-Item -LiteralPath $certPath -Recurse -Force -ErrorAction SilentlyContinue
     }
     if ((Test-Path $keyPath) -and -not (Test-Path $keyPath -PathType Leaf)) {
@@ -1352,7 +1442,7 @@ function Invoke-VaultClientCertSelfHeal {
         return
     }
 
-    Write-Host "  [update] Cert self-heal: generating vault-tls\$Name-client (was missing)"
+    Write-DetailLog "[update] Cert self-heal: generating vault-tls\$Name-client (was missing)"
     $chmodExtra = if ($Name -eq "falconone" -or $Name -eq "cve-proxy") {
         "chmod 644 '$Name-client.key' '$Name-client.crt'"
     } else {
@@ -1390,7 +1480,7 @@ $chmodExtra
         -ErrorAction SilentlyContinue
     Remove-Item -Path $runStdout, $runStderr, $scriptFile -ErrorAction SilentlyContinue
     if (-not $proc -or $proc.ExitCode -ne 0 -or -not (Test-Path $certPath)) {
-        Write-Host "  [update] Cert self-heal: $Name-client generation failed (non-fatal, retried next run)"
+        Write-DetailLog "[update] Cert self-heal: $Name-client generation failed (non-fatal, retried next run)"
     }
 }
 
@@ -1420,8 +1510,17 @@ try {
     if ($ps -match "running") { $vaultRunning = $true }
 } catch { }
 
+# AUDIT-SECU-2026-08-04 (Vault H1): used to ALSO require -not $vaultRunning —
+# that assumption dates from when the vault auto-unsealed itself at boot, so
+# "running" implied "usable". It no longer does: the vault now ALWAYS boots
+# sealed and requires a real human Shamir ceremony that no script can
+# complete unattended. A container can be "running" for a long time while
+# sealed with secrets NOT yet migrated (steps below never got to run) —
+# treating that as "done" would silently strand the host on legacy stores
+# forever. Only the migration sentinel (written at the END of a successful
+# run) means the migration itself is actually complete.
 $vaultNeedsMigration = $false
-if (-not (Test-Path $vaultMigrationSentinel) -and -not $vaultRunning) {
+if (-not (Test-Path $vaultMigrationSentinel)) {
     $vaultNeedsMigration = $true
 }
 
@@ -1614,8 +1713,15 @@ if ($vaultNeedsMigration) {
     New-Item -ItemType Directory -Force -Path (Join-Path $INSTALL_DIR "vault-tls")    | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $INSTALL_DIR "vault-config") | Out-Null
 
+    # AUDIT-SECU-2026-08-04 (Vault H1 follow-up): tracks whether THIS run
+    # actually generated fresh vault-keys/vault-tls/vault-config material —
+    # used below to decide whether the running container genuinely needs to
+    # reload bind-mounted files, instead of always recreating it.
+    $vaultFreshBootstrap = $false
+
     # ── 4c.1 Age master key (ONCE — rotating it would orphan vault.db) ────
     if (-not (Test-Path $vaultAgeKey)) {
+        $vaultFreshBootstrap = $true
         Write-Host "  Generating vault master key..."
         $ageKeygen = Get-Command age-keygen -ErrorAction SilentlyContinue
         if (-not $ageKeygen) {
@@ -1977,54 +2083,106 @@ services:
 
     Write-Host "  Starting vault container..."
     Push-Location $INSTALL_DIR -ErrorAction Stop
-    # Explicit stop+rm to guarantee the container reloads cert/config files
-    # from the host bind mounts (the TLS PKI bootstrap regenerated them this
-    # run). --force-recreate alone has been observed to leave the container
-    # in "Running" state on Docker Desktop Windows, with stale certs in mem.
+
+    # AUDIT-SECU-2026-08-04 (Vault H1 follow-up — reseal-on-rerun bug): the
+    # stop+rm+up dance below exists so a genuinely NEW image or
+    # freshly-bootstrapped cert/config (4c above) gets loaded — --force-recreate
+    # alone has been observed to leave the container "Running" on Docker
+    # Desktop Windows with stale certs in memory. It used to run
+    # UNCONDITIONALLY every time this block executed (i.e. every re-run of
+    # update.ps1 while the .migrated sentinel is missing). Since the vault's
+    # seal state lives ONLY in the running process's memory (no persistent
+    # "unsealed" flag — the whole point of the H1 model), recreating an
+    # already-running, already-unsealed container reseals it as a pure side
+    # effect, BEFORE the seal-state check below ever runs — an operator who
+    # dutifully runs the real unseal ceremony and re-runs this script would
+    # see it reseal itself and never converge. Recreate ONLY when there is an
+    # actual reason to: it isn't running yet, this run just bootstrapped
+    # fresh keys/certs/config, or the just-pulled image differs from the one
+    # the running container was started from. Otherwise leave a running
+    # vault exactly as it is — it may already have been unsealed since the
+    # last run.
     # B20 (2026-06-08): all docker calls via Start-Process to avoid NativeCommandError PS 5.1
-    $vStopOut = Join-Path $env:TEMP "coderaft-vstop-out-$(Get-Random).log"
-    $vStopErr = Join-Path $env:TEMP "coderaft-vstop-err-$(Get-Random).log"
-    Start-Process -FilePath "docker" -ArgumentList (@("compose") + $vaultComposeArgs + @("stop","coderaft-vault")) `
-        -NoNewWindow -Wait `
-        -RedirectStandardOutput $vStopOut `
-        -RedirectStandardError  $vStopErr `
-        -ErrorAction SilentlyContinue | Out-Null
-    if (Test-Path $vStopOut) { Get-Content $vStopOut -ErrorAction SilentlyContinue | Tee-Object -FilePath $migrationLog -Append | Out-Null }
-    Remove-Item -Path $vStopOut,$vStopErr -ErrorAction SilentlyContinue
-
-    $vRmOut = Join-Path $env:TEMP "coderaft-vrm-out-$(Get-Random).log"
-    $vRmErr = Join-Path $env:TEMP "coderaft-vrm-err-$(Get-Random).log"
-    Start-Process -FilePath "docker" -ArgumentList (@("compose") + $vaultComposeArgs + @("rm","-f","coderaft-vault")) `
-        -NoNewWindow -Wait `
-        -RedirectStandardOutput $vRmOut `
-        -RedirectStandardError  $vRmErr `
-        -ErrorAction SilentlyContinue | Out-Null
-    if (Test-Path $vRmOut) { Get-Content $vRmOut -ErrorAction SilentlyContinue | Tee-Object -FilePath $migrationLog -Append | Out-Null }
-    Remove-Item -Path $vRmOut,$vRmErr -ErrorAction SilentlyContinue
-
-    $vUpOut = Join-Path $env:TEMP "coderaft-vup-out-$(Get-Random).log"
-    $vUpErr = Join-Path $env:TEMP "coderaft-vup-err-$(Get-Random).log"
-    $vUpProc = Start-Process -FilePath "docker" -ArgumentList (@("compose") + $vaultComposeArgs + @("up","-d","coderaft-vault")) `
-        -NoNewWindow -Wait -PassThru `
-        -RedirectStandardOutput $vUpOut `
-        -RedirectStandardError  $vUpErr `
-        -ErrorAction Stop
-    if (Test-Path $vUpOut) { Get-Content $vUpOut -ErrorAction SilentlyContinue | Tee-Object -FilePath $migrationLog -Append | Out-Host }
-    $upExit = $vUpProc.ExitCode
-    if ($upExit -ne 0 -and (Test-Path $vUpErr)) {
-        "[$(Get-Date -Format o)] docker compose up STDERR:" | Out-File -FilePath $migrationLog -Append -Encoding utf8
-        Get-Content $vUpErr -ErrorAction SilentlyContinue | Tee-Object -FilePath $migrationLog -Append | Out-Host
-        $logsOut = Join-Path $env:TEMP "coderaft-vlogs-$(Get-Random).log"
-        Start-Process -FilePath "docker" -ArgumentList @("logs","--tail","80","coderaft-vault") `
-            -NoNewWindow -Wait -RedirectStandardOutput $logsOut -RedirectStandardError $logsOut `
+    function _VaultDockerCapture {
+        param([string[]]$ArgList)
+        $o = Join-Path $env:TEMP "coderaft-vdc-out-$(Get-Random).log"
+        $e = Join-Path $env:TEMP "coderaft-vdc-err-$(Get-Random).log"
+        Start-Process -FilePath "docker" -ArgumentList $ArgList `
+            -NoNewWindow -Wait `
+            -RedirectStandardOutput $o -RedirectStandardError $e `
             -ErrorAction SilentlyContinue | Out-Null
-        if (Test-Path $logsOut) {
-            "[$(Get-Date -Format o)] coderaft-vault container logs (last 80):" | Out-File -FilePath $migrationLog -Append -Encoding utf8
-            Get-Content $logsOut -ErrorAction SilentlyContinue | Tee-Object -FilePath $migrationLog -Append | Out-Host
-            Remove-Item -Path $logsOut -ErrorAction SilentlyContinue
-        }
+        $result = ""
+        if (Test-Path $o) { $result = ((Get-Content $o -ErrorAction SilentlyContinue) | Select-Object -First 1) }
+        Remove-Item -Path $o,$e -ErrorAction SilentlyContinue
+        if ($result) { return $result.Trim() }
+        return ""
     }
-    Remove-Item -Path $vUpOut,$vUpErr -ErrorAction SilentlyContinue
+
+    $vaultImageRef = "ghcr.io/liamj74/coderaft-vault:latest"
+    $vaultCid = _VaultDockerCapture (@("compose") + $vaultComposeArgs + @("ps","-q","coderaft-vault"))
+    $vaultAlreadyRunning = $false
+    $vaultRunningImageId = ""
+    if ($vaultCid) {
+        $runState = _VaultDockerCapture @("inspect", $vaultCid, "--format", "{{.State.Running}}")
+        if ($runState -eq "true") { $vaultAlreadyRunning = $true }
+        $vaultRunningImageId = _VaultDockerCapture @("inspect", $vaultCid, "--format", "{{.Image}}")
+    }
+    $vaultPulledImageId = _VaultDockerCapture @("image", "inspect", $vaultImageRef, "--format", "{{.Id}}")
+
+    $vaultNeedsRecreate = $true
+    if ($vaultAlreadyRunning -and (-not $vaultFreshBootstrap) -and $vaultRunningImageId -and $vaultPulledImageId -and ($vaultRunningImageId -eq $vaultPulledImageId)) {
+        $vaultNeedsRecreate = $false
+    }
+    "[$(Get-Date -Format o)] recreate decision: alreadyRunning=$vaultAlreadyRunning freshBootstrap=$vaultFreshBootstrap runningImage=$vaultRunningImageId pulledImage=$vaultPulledImageId needsRecreate=$vaultNeedsRecreate" | Out-File -FilePath $migrationLog -Append -Encoding utf8
+
+    $upExit = 0
+    if ($vaultNeedsRecreate) {
+        $vStopOut = Join-Path $env:TEMP "coderaft-vstop-out-$(Get-Random).log"
+        $vStopErr = Join-Path $env:TEMP "coderaft-vstop-err-$(Get-Random).log"
+        Start-Process -FilePath "docker" -ArgumentList (@("compose") + $vaultComposeArgs + @("stop","coderaft-vault")) `
+            -NoNewWindow -Wait `
+            -RedirectStandardOutput $vStopOut `
+            -RedirectStandardError  $vStopErr `
+            -ErrorAction SilentlyContinue | Out-Null
+        if (Test-Path $vStopOut) { Get-Content $vStopOut -ErrorAction SilentlyContinue | Tee-Object -FilePath $migrationLog -Append | Out-Null }
+        Remove-Item -Path $vStopOut,$vStopErr -ErrorAction SilentlyContinue
+
+        $vRmOut = Join-Path $env:TEMP "coderaft-vrm-out-$(Get-Random).log"
+        $vRmErr = Join-Path $env:TEMP "coderaft-vrm-err-$(Get-Random).log"
+        Start-Process -FilePath "docker" -ArgumentList (@("compose") + $vaultComposeArgs + @("rm","-f","coderaft-vault")) `
+            -NoNewWindow -Wait `
+            -RedirectStandardOutput $vRmOut `
+            -RedirectStandardError  $vRmErr `
+            -ErrorAction SilentlyContinue | Out-Null
+        if (Test-Path $vRmOut) { Get-Content $vRmOut -ErrorAction SilentlyContinue | Tee-Object -FilePath $migrationLog -Append | Out-Null }
+        Remove-Item -Path $vRmOut,$vRmErr -ErrorAction SilentlyContinue
+
+        $vUpOut = Join-Path $env:TEMP "coderaft-vup-out-$(Get-Random).log"
+        $vUpErr = Join-Path $env:TEMP "coderaft-vup-err-$(Get-Random).log"
+        $vUpProc = Start-Process -FilePath "docker" -ArgumentList (@("compose") + $vaultComposeArgs + @("up","-d","coderaft-vault")) `
+            -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput $vUpOut `
+            -RedirectStandardError  $vUpErr `
+            -ErrorAction Stop
+        if (Test-Path $vUpOut) { Get-Content $vUpOut -ErrorAction SilentlyContinue | Tee-Object -FilePath $migrationLog -Append | Out-Host }
+        $upExit = $vUpProc.ExitCode
+        if ($upExit -ne 0 -and (Test-Path $vUpErr)) {
+            "[$(Get-Date -Format o)] docker compose up STDERR:" | Out-File -FilePath $migrationLog -Append -Encoding utf8
+            Get-Content $vUpErr -ErrorAction SilentlyContinue | Tee-Object -FilePath $migrationLog -Append | Out-Host
+            $logsOut = Join-Path $env:TEMP "coderaft-vlogs-$(Get-Random).log"
+            Start-Process -FilePath "docker" -ArgumentList @("logs","--tail","80","coderaft-vault") `
+                -NoNewWindow -Wait -RedirectStandardOutput $logsOut -RedirectStandardError $logsOut `
+                -ErrorAction SilentlyContinue | Out-Null
+            if (Test-Path $logsOut) {
+                "[$(Get-Date -Format o)] coderaft-vault container logs (last 80):" | Out-File -FilePath $migrationLog -Append -Encoding utf8
+                Get-Content $logsOut -ErrorAction SilentlyContinue | Tee-Object -FilePath $migrationLog -Append | Out-Host
+                Remove-Item -Path $logsOut -ErrorAction SilentlyContinue
+            }
+        }
+        Remove-Item -Path $vUpOut,$vUpErr -ErrorAction SilentlyContinue
+    } else {
+        Write-Host "  ✓ coderaft-vault already running with the current image — leaving it untouched (avoids resealing an already-unsealed vault)"
+    }
     Pop-Location -ErrorAction SilentlyContinue
     if ($upExit -ne 0) { Invoke-VaultMigrationRollback "docker compose up coderaft-vault failed (see $migrationLog)"; return }
 
@@ -2129,29 +2287,51 @@ services:
         Invoke-VaultMigrationRollback "coderaft-vault did not respond to TLS probes"; return
     }
 
-    # Unseal if sealed (PassphraseSealer = 1 share = the age private key bytes)
+    # AUDIT-SECU-2026-08-04 (Vault H1): coderaft-vault no longer auto-unseals
+    # and no longer treats vault-keys\age.key as a submittable "share" — it
+    # requires a REAL Shamir ceremony (POST /v1/init once, then POST
+    # /v1/unseal with a threshold of the returned shares) that NO unattended
+    # script can complete, by design. A sealed vault at this point is
+    # EXPECTED, not a migration failure — it must NOT roll back (that would
+    # tear down a perfectly good, already-backed-up-for, in-progress
+    # migration just because a human hasn't run the ceremony yet). Secret
+    # migration (below) genuinely cannot proceed while sealed (every
+    # /v1/secret/set call would fail), so this run stops here — no
+    # .migrated sentinel is written, so a future update.ps1 run retries once
+    # an operator has unsealed it.
     if ($lastSealed -eq "true") {
-        Write-Host "  Vault is sealed — sending unseal request..."
-        $ageKeyBytes = [System.IO.File]::ReadAllBytes($vaultAgeKey)
-        $shareB64 = [Convert]::ToBase64String($ageKeyBytes)
-        $unsealBody = @{ shares = @($shareB64) } | ConvertTo-Json -Compress
-        $unsealResp = Invoke-VaultCurl -Method "POST" -Path "/v1/unseal" -JsonBody $unsealBody
-        "[$(Get-Date -Format o)] unseal response → $unsealResp" | Out-File -FilePath $migrationLog -Append -Encoding utf8
-        if ($unsealResp -notmatch '"ok"\s*:\s*true|"sealed"\s*:\s*false') {
-            Write-Host "  Unseal response: $unsealResp" -ForegroundColor Yellow
-            Invoke-VaultMigrationRollback "vault unseal failed (see $migrationLog)"; return
-        }
-        Write-Host "  ✓ Vault unsealed"
+        Write-Host ""
+        Write-Host "  ────────────────────────────────────────────────────────────────" -ForegroundColor Yellow
+        Write-Host "  Vault is SEALED. This is expected — Coderaft Vault requires a" -ForegroundColor Yellow
+        Write-Host "  real, human, multi-operator Shamir ceremony (default: 3 of 5" -ForegroundColor Yellow
+        Write-Host "  shares) before it will hold or serve ANY secret. No script can" -ForegroundColor Yellow
+        Write-Host "  complete this unattended, by design." -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  Legacy secrets have NOT been migrated yet (this requires an"
+        Write-Host "  unsealed vault) — they remain safely in their existing stores"
+        Write-Host "  (.env / postgres / etc.), untouched. An operator must run:"
+        Write-Host ""
+        Write-Host "    # 1) ONE TIME ONLY per vault (skip if already run before):"
+        Write-Host "    docker run --rm --user 0:0 --network $vaultNetwork ``"
+        Write-Host "      -v `"$absTlsDir`:/tls:ro`" curlimages/curl:latest ``"
+        Write-Host "      --cert /tls/dashboard-api-client.crt --key /tls/dashboard-api-client.key ``"
+        Write-Host "      --cacert /tls/client-ca.crt -sS -X POST https://coderaft-vault:8200/v1/init"
+        Write-Host "    # -> WRITE DOWN the returned shares, one per operator, then:"
+        Write-Host ""
+        Write-Host "    # 2) EVERY time the vault starts sealed (every restart/reboot):"
+        Write-Host "    docker run --rm --user 0:0 --network $vaultNetwork ``"
+        Write-Host "      -v `"$absTlsDir`:/tls:ro`" curlimages/curl:latest ``"
+        Write-Host "      --cert /tls/dashboard-api-client.crt --key /tls/dashboard-api-client.key ``"
+        Write-Host "      --cacert /tls/client-ca.crt -sS -X POST https://coderaft-vault:8200/v1/unseal ``"
+        Write-Host "      -H 'Content-Type: application/json' -d '{`"shares`":[`"<share1>`",`"<share2>`",`"<share3>`"]}'"
+        Write-Host ""
+        Write-Host "  Then re-run this update script to finish migrating secrets into it."
+        Write-Host "  ────────────────────────────────────────────────────────────────" -ForegroundColor Yellow
+        Write-Host ""
+        "[$(Get-Date -Format o)] vault sealed after start — stopping migration here (no rollback), operator ceremony required" | Out-File -FilePath $migrationLog -Append -Encoding utf8
+        return
     }
-
-    # Final health check — must say sealed:false now
-    $finalHealth = Invoke-VaultCurl -Method "GET" -Path "/v1/health"
-    "[$(Get-Date -Format o)] final health → $finalHealth" | Out-File -FilePath $migrationLog -Append -Encoding utf8
-    if ($finalHealth -notmatch '"sealed"\s*:\s*false') {
-        Write-Host "  Final health: $finalHealth" -ForegroundColor Yellow
-        Invoke-VaultMigrationRollback "vault still sealed after unseal call"; return
-    }
-    Write-Host "  ✓ coderaft-vault is healthy"
+    Write-Host "  ✓ coderaft-vault is already unsealed"
 
     # ── 4e Migrate secrets ────────────────────────────────────────────────
     if ($env:CODERAFT_TEST_FAIL -eq "4e") { Invoke-VaultMigrationRollback "injected test failure at 4e"; return }
@@ -2266,7 +2446,11 @@ services:
 # Runs unconditionally on EVERY update, independent of the one-time vault
 # migration gate above, so already-migrated installs (vaultNeedsMigration =
 # $false) still get the extended-SAN falconone-tls cert and any missing ACL
-# permissions healed.
+# permissions healed. (2026-08-05) Console only gets one concise phase line —
+# every per-product ACL/PKI/cert self-heal detail below goes to $UPDATE_LOG via
+# Write-DetailLog instead (see the log-file setup near the top of this script).
+Write-Host ""
+Write-Host "  Checking vault ACL / PKI provisioning..."
 Invoke-FalconOneTlsBootstrap -InstallDir $INSTALL_DIR
 Invoke-FalconOneAclSelfHeal -AclPath (Join-Path $INSTALL_DIR "vault-config\acl.yaml")
 Invoke-VaultAclLiveSelfHeal -InstallDir $INSTALL_DIR -Name "falconone" -San "falconone.coderaft.local" -Permissions @(
@@ -2299,6 +2483,7 @@ Invoke-CveProxyAclSelfHeal -AclPath (Join-Path $INSTALL_DIR "vault-config\acl.ya
 Invoke-VaultAclLiveSelfHeal -InstallDir $INSTALL_DIR -Name "cve-proxy" -San "cve-proxy.coderaft.local" -Permissions @(
     "read:cve-proxy/*", "write:cve-proxy/*"
 )
+Write-Host "  ✓ Vault ACL / PKI provisioning OK (detail: $UPDATE_LOG)"
 
 # ── Banking-grade plaintext .env handling ─────────────────────────────────
 # B-PLAINTEXT-PURGE (2026-08-04, porting update.sh's 2026-06-14 fix — never
@@ -2334,21 +2519,97 @@ if (Test-Path $envPlain) {
         Set-Acl $envPlain $envAcl -ErrorAction Stop
     } catch {}
     if (Test-Path $envEnc) {
-        # Belt-and-braces: keep a daily snapshot of the plaintext so an
-        # operator-side mistake can be reverted within 7 days (mirrors
-        # update.sh's env-snapshot-<date>.bak retention).
-        $bakDir = Join-Path $INSTALL_DIR "dashboard_data"
-        New-Item -ItemType Directory -Force -Path $bakDir | Out-Null
-        $bakFile = Join-Path $bakDir ("env-snapshot-" + (Get-Date -Format "yyyyMMdd") + ".bak")
-        if (-not (Test-Path $bakFile)) {
-            Copy-Item $envPlain $bakFile -ErrorAction SilentlyContinue
+        # ── Auto-finalize (2026-08-05): actually FIX the sops-missing gap ────
+        # instead of only proposing it as a manual choice. Previously, when
+        # sops was unavailable, this block just printed two options (Dashboard
+        # -> Migrate secrets, or `migrate.ps1 -Finalize`) and left the
+        # plaintext .env in place forever unless an operator acted. Liam's
+        # direction: "il faut vraiment le fixer lors de l'update et pas le
+        # proposer." The caution that used to gate this (see the
+        # B-PLAINTEXT-PURGE comment above / commit daac49d) was specifically
+        # about the PURGE breaking `docker compose` because $ComposeArgs had
+        # no --env-file — that is now a solved, separate problem: the "Ensure
+        # .env is present + fresh before ANY docker compose call" block further
+        # below regenerates .env from .env.enc via sops right before every
+        # docker compose invocation, so purging .env here is safe again. This
+        # only ever auto-installs sops.exe (same release/URL migrate-to-sops.ps1's
+        # documented CLI option B already downloads) and only purges after
+        # verifying the decrypted .env.enc byte-for-byte matches (normalized)
+        # the plaintext .env — never a blind overwrite in either direction.
+        # Age key generation is intentionally NOT auto-healed here: if it's
+        # missing, .env.enc was encrypted with a key we no longer have, and
+        # generating a NEW one would not decrypt the existing file — that is a
+        # real, human-needed recovery scenario, not something safe to script.
+        $ageKeyFinalize = if ($env:SOPS_AGE_KEY_FILE) { $env:SOPS_AGE_KEY_FILE } else { Join-Path $INSTALL_DIR ".coderaft-age.key" }
+        if (-not (Test-Path $ageKeyFinalize) -and (Test-Path "C:\ProgramData\coderaft\age.key")) {
+            $ageKeyFinalize = "C:\ProgramData\coderaft\age.key"
         }
-        try {
-            Get-ChildItem -LiteralPath $bakDir -Filter "env-snapshot-*.bak" -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } |
-                Remove-Item -Force -ErrorAction SilentlyContinue
-        } catch {}
-        Write-Host "  ✓ .env protected (ACL-restricted) + .env.enc audit copy + daily snapshot in $bakDir"
+        $sopsFinalizeCmd = Get-Command sops -ErrorAction SilentlyContinue
+        if (-not $sopsFinalizeCmd -and (Test-Path $ageKeyFinalize)) {
+            try {
+                Write-DetailLog "[sops-finalize] sops.exe not found on host — downloading v3.8.1 to finalize automatically"
+                $finalizeArch = if ([System.Environment]::Is64BitOperatingSystem) { "amd64" } else { "arm64" }
+                $sopsFinalizeUrl = "https://github.com/getsops/sops/releases/download/v3.8.1/sops-v3.8.1.windows.$finalizeArch.exe"
+                $sopsFinalizeDst = "C:\Windows\System32\sops.exe"
+                Invoke-WebRequest -Uri $sopsFinalizeUrl -OutFile $sopsFinalizeDst -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+                $sopsFinalizeCmd = Get-Command sops -ErrorAction SilentlyContinue
+                Write-DetailLog "[sops-finalize] sops.exe downloaded to $sopsFinalizeDst (found: $([bool]$sopsFinalizeCmd))"
+            } catch {
+                Write-Host "  [!] Could not auto-download sops.exe ($($_.Exception.Message.Trim())) — plaintext .env left in place." -ForegroundColor Yellow
+                Write-DetailLog "[sops-finalize] sops.exe download failed: $($_.Exception.Message)"
+            }
+        }
+        if ($sopsFinalizeCmd -and (Test-Path $ageKeyFinalize)) {
+            $env:SOPS_AGE_KEY_FILE = $ageKeyFinalize
+            $decryptedFinalize = & $sopsFinalizeCmd.Path --decrypt --input-type dotenv --output-type dotenv $envEnc 2>$null
+            if ($decryptedFinalize) {
+                $plainNormFinalize   = (Get-Content $envPlain | Where-Object { $_ -notmatch '^\s*(#|$)' } | Sort-Object) -join "`n"
+                $decryptNormFinalize = ($decryptedFinalize | Where-Object { $_ -notmatch '^\s*(#|$)' } | Sort-Object) -join "`n"
+                if ($plainNormFinalize -eq $decryptNormFinalize) {
+                    $finBakDir = Join-Path $INSTALL_DIR "dashboard_data"
+                    New-Item -ItemType Directory -Force -Path $finBakDir | Out-Null
+                    $finBakFile = Join-Path $finBakDir ("env-pre-finalize-" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".bak")
+                    Copy-Item $envPlain $finBakFile -ErrorAction SilentlyContinue
+                    try {
+                        Get-ChildItem -LiteralPath $finBakDir -Filter "env-pre-finalize-*.bak" -File -ErrorAction SilentlyContinue |
+                            Where-Object { $_.LastWriteTime -lt (Get-Date).AddHours(-24) } |
+                            Remove-Item -Force -ErrorAction SilentlyContinue
+                    } catch {}
+                    Remove-Item $envPlain -Force
+                    Write-Host "  ✓ Plaintext .env purged automatically (verified against .env.enc; backup: $finBakFile)"
+                    Write-DetailLog "[sops-finalize] .env purged after verified match, backup=$finBakFile"
+                } else {
+                    Write-Host "  [!] .env and .env.enc differ — refusing to purge automatically." -ForegroundColor Yellow
+                    Write-Host "      Reconcile via Dashboard -> Settings -> Migrate secrets, or run migrate.ps1." -ForegroundColor Yellow
+                    Write-DetailLog "[sops-finalize] .env / .env.enc content mismatch — left plaintext in place"
+                }
+            } else {
+                Write-DetailLog "[sops-finalize] sops decrypt of .env.enc returned empty — left plaintext in place"
+            }
+        } elseif (-not (Test-Path $ageKeyFinalize)) {
+            Write-Host "  [!] .env.enc present but no age key found at $ageKeyFinalize — cannot verify it, plaintext .env left in place." -ForegroundColor Yellow
+            Write-DetailLog "[sops-finalize] age key not found at $ageKeyFinalize — cannot auto-finalize"
+        }
+
+        if (Test-Path $envPlain) {
+            # Belt-and-braces: keep a daily snapshot of the plaintext so an
+            # operator-side mistake can be reverted within 7 days (mirrors
+            # update.sh's env-snapshot-<date>.bak retention). Still runs even
+            # when auto-finalize above didn't purge (missing sops/age key, or
+            # a genuine content mismatch it correctly refused to touch).
+            $bakDir = Join-Path $INSTALL_DIR "dashboard_data"
+            New-Item -ItemType Directory -Force -Path $bakDir | Out-Null
+            $bakFile = Join-Path $bakDir ("env-snapshot-" + (Get-Date -Format "yyyyMMdd") + ".bak")
+            if (-not (Test-Path $bakFile)) {
+                Copy-Item $envPlain $bakFile -ErrorAction SilentlyContinue
+            }
+            try {
+                Get-ChildItem -LiteralPath $bakDir -Filter "env-snapshot-*.bak" -File -ErrorAction SilentlyContinue |
+                    Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } |
+                    Remove-Item -Force -ErrorAction SilentlyContinue
+            } catch {}
+            Write-Host "  ✓ .env protected (ACL-restricted) + .env.enc audit copy + daily snapshot in $bakDir"
+        }
     } else {
         Write-Host "  ✓ .env protected (ACL-restricted)"
     }
@@ -2453,6 +2714,24 @@ if ($postgresRunning) {
 }
 
 # ── Capture recovery snapshot via dashboard-api ───────────────────────────
+# BUG FIX (2026-08-05): Find-AdminToken was previously only ever attempted
+# ONCE, at the very top of the script, before any of the self-heal / ACL /
+# image-cache work below has run. On an already-configured, already-running
+# install — exactly the case this snapshot exists to protect — discovery
+# should succeed via the "docker compose exec dashboard-api cat
+# /data/admin_token" fallback inside Find-AdminToken: dashboard-api persists
+# its own long-lived CLI token there (server.js's ensureCliAdminToken(), in a
+# named Docker volume) and NOTHING ever writes it to the 3 static host file
+# paths the old warning suggested as manual fallbacks. A single early attempt
+# could hit a transient state (Docker Desktop still settling right as the
+# script starts, dashboard-api mid-restart from a previous run) and never
+# retry even though the stack is fully healthy by the time we get here. Retry
+# right where the token is actually needed instead of only once at the top.
+if (-not $ADMIN_TOKEN) {
+    $retriedAdminToken = Find-AdminToken
+    if ($retriedAdminToken) { $ADMIN_TOKEN = $retriedAdminToken }
+    Remove-Variable -Name retriedAdminToken -ErrorAction SilentlyContinue
+}
 Write-Host "  Capturing recovery snapshot..."
 if ($ADMIN_TOKEN) {
     try {
@@ -2468,7 +2747,10 @@ if ($ADMIN_TOKEN) {
     }
 } else {
     Write-Host "    [warn] ADMIN_TOKEN not found — snapshot skipped."
-    Write-Host "    (set `$env:ADMIN_TOKEN, or place token in $INSTALL_DIR\.env, C:\ProgramData\coderaft\admin_token, or ~/.coderaft/admin_token)"
+    Write-Host "    This is normally auto-discovered from the running dashboard-api container;"
+    Write-Host "    if you see this warning, dashboard-api may not be reachable via 'docker compose exec'."
+    Write-Host "    Manual overrides: set `$env:ADMIN_TOKEN, or place the token in $INSTALL_DIR\.env,"
+    Write-Host "    C:\ProgramData\coderaft\admin_token, or ~/.coderaft/admin_token."
 }
 
 # ── Pull and recreate ─────────────────────────────────────────────────────
@@ -2904,6 +3186,7 @@ if (-not $healthOk) {
         Write-Host "  rollback.ps1 not found. Manual rollback required."
         Write-Host "  Command: docker compose down; docker compose up -d"
     }
+    Write-Host "  Full update log: $UPDATE_LOG"
     return  # not 'exit' — irm|iex runs this in the caller's own scope, so exit would close their whole shell
 }
 
@@ -2958,3 +3241,4 @@ Write-Host ""
 Write-Host "  Update successful! Dashboard: http://localhost:3000"
 Write-Host "  If something went wrong: .\rollback.ps1"
 Write-Host "  (or: irm https://install.coderaft.io/rollback.ps1 | iex)"
+Write-Host "  Full update log: $UPDATE_LOG"

@@ -48,7 +48,7 @@ $ErrorActionPreference = 'Stop'
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.ps1/install.ps1.sha256 at all — today it still
 # proxies the legacy `coderaft-installer` repo.
-$CoderaftExpectedSha256 = "48f5bf815bc4ee01a6ca9287e84c604fdc75866968d274892405ab04e6742b07"
+$CoderaftExpectedSha256 = "58536f6befe8033c5154a209ef0ba29bfa4822a3e83bb7bf33e3c28701c32aca"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -366,20 +366,97 @@ $AbsoluteInstallDir = (Get-Location).Path
 # config (HOST_PROJECT_DIR, CODERAFT_HOST_OS, CODERAFT_HOST_ARCH) — never a
 # secret, never SOPS-encrypted. Every `docker compose` call below passes
 # `--env-file install-config.env --env-file .env` so both are interpolated.
+# BUG FIX (2026-08-05, found live on Liam's Windows test machine — see the
+# matching comment in deploy/scripts/update.ps1 for the full root-cause writeup
+# and a real-pwsh reproduction): `$text -split "..." | Where-Object {...}`
+# unwraps to a plain scalar STRING (not a 1-element array) whenever exactly one
+# line survives the filter. The next line, `$lines += "$Key=$Value"`, then does
+# STRING CONCATENATION instead of array-append, silently gluing the new
+# KEY=VALUE pair onto the previous line with zero separator — e.g.
+# CODERAFT_HOST_OS=windowsCODERAFT_HOST_ARCH=amd64HOST_PROJECT_DIR=C:\...
+# Wrapping the Where-Object result in `@(...)` forces it to always be a real
+# array. Get-InstallConfigVar is hardened the same way (first match only) in
+# case a file is already corrupted with duplicate lines for the same key.
 function Set-InstallConfigVar($Key, $Value) {
     $path = "$(Get-Location)\install-config.env"
     $text = if (Test-Path $path) { [System.IO.File]::ReadAllText($path, [System.Text.UTF8Encoding]::new($false)) } else { "" }
-    $lines = $text -split "`r?`n" | Where-Object { $_ -notmatch "^$Key=" -and $_ -ne "" }
+    $lines = @($text -split "`r?`n" | Where-Object { $_ -notmatch "^$Key=" -and $_ -ne "" })
     $lines += "$Key=$Value"
     [System.IO.File]::WriteAllText($path, (($lines -join "`n") + "`n"), [System.Text.UTF8Encoding]::new($false))
 }
 function Get-InstallConfigVar($Key) {
     $path = "$(Get-Location)\install-config.env"
     if (-not (Test-Path $path)) { return $null }
-    $m = Select-String -Path $path -Pattern "^$Key=(.+)$"
-    if ($m) { return $m.Matches.Groups[1].Value }
+    $m = @(Select-String -Path $path -Pattern "^$Key=(.+)$")
+    if ($m.Count -ge 1) { return $m[0].Matches.Groups[1].Value }
     return $null
 }
+
+# ── Self-heal: repair an ALREADY-corrupted install-config.env ──────────────
+# Same repair logic as deploy/scripts/update.ps1's Repair-InstallConfigCorruption
+# — detects any physical line containing 2+ of our known "KEY=" markers (the
+# corruption signature) and splits it back into one clean line per key, keeping
+# the LAST value seen for each key. Called once here, before any Get-/Set-
+# InstallConfigVar use below (existing-install branch backfills HOST_PROJECT_DIR/
+# CODERAFT_HOST_OS/CODERAFT_HOST_ARCH right after this).
+function Repair-InstallConfigCorruption {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path $Path)) { return }
+    $knownKeys = @("HOST_PROJECT_DIR", "CODERAFT_HOST_OS", "CODERAFT_HOST_ARCH")
+    $text = [System.IO.File]::ReadAllText($Path, [System.Text.UTF8Encoding]::new($false))
+    if (-not $text) { return }
+    $rawLines = @($text -split "`r?`n" | Where-Object { $_ -ne "" })
+    $markerPattern = "(?:" + (($knownKeys | ForEach-Object { [regex]::Escape($_) }) -join "|") + ")="
+    $corruptedFound = $false
+    $clean = [ordered]@{}
+    foreach ($line in $rawLines) {
+        $markerMatches = @([regex]::Matches($line, $markerPattern))
+        if ($markerMatches.Count -le 1) {
+            $eq = $line.IndexOf('=')
+            if ($eq -gt 0) { $clean[$line.Substring(0, $eq)] = $line.Substring($eq + 1) }
+            continue
+        }
+        $corruptedFound = $true
+        for ($i = 0; $i -lt $markerMatches.Count; $i++) {
+            $start = $markerMatches[$i].Index
+            $end = if ($i + 1 -lt $markerMatches.Count) { $markerMatches[$i + 1].Index } else { $line.Length }
+            $segment = $line.Substring($start, $end - $start)
+            $eq = $segment.IndexOf('=')
+            if ($eq -gt 0) { $clean[$segment.Substring(0, $eq)] = $segment.Substring($eq + 1) }
+        }
+    }
+    if (-not $corruptedFound) { return }
+    $ts = Get-Date -Format "yyyyMMddTHHmmssZ"
+    Copy-Item -LiteralPath $Path -Destination "$Path.bak-corrupt-$ts" -ErrorAction SilentlyContinue
+    $newLines = @($clean.Keys | ForEach-Object { "$_=$($clean[$_])" })
+    [System.IO.File]::WriteAllText($Path, (($newLines -join "`n") + "`n"), [System.Text.UTF8Encoding]::new($false))
+    Write-Host "  ⚠ install-config.env was corrupted (concatenated values from a known PowerShell array/string bug, now fixed) — repaired automatically." -ForegroundColor Yellow
+    Write-Host "    Backup of the corrupted file: $Path.bak-corrupt-$ts"
+}
+Repair-InstallConfigCorruption -Path "$(Get-Location)\install-config.env"
+
+# ── Detail log file (2026-08-05) ────────────────────────────────────────────
+# Same convention as deploy/scripts/update.ps1's Write-DetailLog: internal
+# per-product diagnostic detail (ACL self-heal internals, PKI SAN strings)
+# goes here instead of the console, which keeps one concise line per phase.
+# The path is printed once at the end of the install so it's easy to find.
+$LOG_DIR = Join-Path (Get-Location) "logs"
+try { New-Item -ItemType Directory -Force -Path $LOG_DIR -ErrorAction Stop | Out-Null } catch { $LOG_DIR = $env:TEMP }
+$INSTALL_LOG = Join-Path $LOG_DIR ("install-" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".log")
+try {
+    [System.IO.File]::WriteAllText($INSTALL_LOG, "[$(Get-Date -Format o)] install.ps1 started`n", [System.Text.UTF8Encoding]::new($false))
+} catch { }
+function Write-DetailLog {
+    param([Parameter(ValueFromPipeline = $true)][string]$Message)
+    process {
+        try { Add-Content -LiteralPath $script:INSTALL_LOG -Value "[$(Get-Date -Format o)] $Message" -Encoding utf8 -ErrorAction SilentlyContinue } catch { }
+    }
+}
+try {
+    Get-ChildItem -LiteralPath $LOG_DIR -Filter "install-*.log" -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -Skip 10 |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+} catch { }
 
 # ── Backup rotation (security hardening, 2026-07-31) — PowerShell parity ────
 # Every self-heal path below does Copy-Item $X "$X.bak-<timestamp>" before
@@ -729,83 +806,42 @@ function Invoke-VaultBootstrap {
         Write-Host "    The vault will still start; inherited ACL from the parent directory applies." -ForegroundColor Yellow
     }
 
-    # ── Step 2: Compute BIP39 recovery phrase ───────────────────────────────
-    # TODO (Phase 1 follow-up): verify -mnemonic-from-key sub-command exists
-    # in coderaft-vault image before relying on it.
-    $recoveryPhrase = ""
-    if ($env:CODERAFT_TEST_MODE -ne "1") {
-        $privKey = (Get-Content "vault-keys\age.key" | Where-Object { $_ -match '^AGE-SECRET-KEY-' } | Select-Object -First 1)
-        if ($privKey) {
-            try {
-                # B20 (2026-06-08): `& docker run --rm -i ... 2>$null` pipes stdin
-                # AND surfaces docker stderr as NativeCommandError in PS 5.1.
-                # Write the key to a temp file, mount it, run without stdin pipe.
-                $mnemonicKeyFile = Join-Path $env:TEMP "coderaft-vault-mnemonickey-$(Get-Random).txt"
-                $mnemonicStdout  = Join-Path $env:TEMP "coderaft-vault-mnemonicout-$(Get-Random).txt"
-                $mnemonicStderr  = Join-Path $env:TEMP "coderaft-vault-mnemonicerr-$(Get-Random).txt"
-                [System.IO.File]::WriteAllText($mnemonicKeyFile, "$privKey`n", [System.Text.UTF8Encoding]::new($false))
-                $mnemonicProc = Start-Process -FilePath "docker" -ArgumentList @(
-                    "run", "--rm",
-                    "-v", "${mnemonicKeyFile}:/input.key:ro",
-                    "ghcr.io/liamj74/coderaft-vault:latest",
-                    "-mnemonic-from-key", "/input.key"
-                ) -NoNewWindow -Wait -PassThru `
-                    -RedirectStandardOutput $mnemonicStdout `
-                    -RedirectStandardError  $mnemonicStderr `
-                    -ErrorAction SilentlyContinue
-                if (Test-Path $mnemonicStdout) {
-                    $recoveryPhrase = ((Get-Content $mnemonicStdout -ErrorAction SilentlyContinue) -join "").Trim()
-                }
-                Remove-Item -Path $mnemonicKeyFile,$mnemonicStdout,$mnemonicStderr -ErrorAction SilentlyContinue
-            } catch { $recoveryPhrase = "" }
-        }
-    }
-    # Fallback: use age public-key fingerprint as placeholder
-    if (-not $recoveryPhrase) {
-        $pubKey = (Get-Content "vault-keys\age.key" | Where-Object { $_ -match '# public key:' } | Select-Object -First 1) -replace '.*# public key:\s*', ''
-        $recoveryPhrase = "[FALLBACK — save vault-keys\age.key securely] fingerprint: $pubKey"
-        Write-Host ""
-        Write-Host "  [!] coderaft-vault -mnemonic-from-key not available yet (Phase 1 TODO)." -ForegroundColor Yellow
-        Write-Host "      Using fingerprint as placeholder. Secure vault-keys\age.key manually." -ForegroundColor Yellow
-        Write-Host ""
-    }
-
-    # ── Step 3: Display recovery phrase ─────────────────────────────────────
+    # ── Step 2: Generate mTLS PKI ────────────────────────────────────────────
+    # AUDIT-SECU-2026-08-04 (Vault H1 follow-up): this used to be "Step 2:
+    # Compute BIP39 recovery phrase" / "Step 3: Display recovery phrase" — a
+    # `docker run ... -mnemonic-from-key` call that NEVER existed as a real
+    # coderaft-vault sub-command (confirmed against
+    # cmd/coderaft-vault/main.go: the binary only accepts -config and
+    # -health-check), always silently fell through to a raw key-fingerprint
+    # placeholder, and displayed that under a banner claiming "This 24-word
+    # phrase is the ONLY way to recover your vault" — factually false even
+    # before this fix (the fingerprint isn't a recovery mechanism at all) and
+    # doubly so now: coderaft-vault no longer reads vault-keys\age.key for
+    # ANYTHING (keyprovider.NewAgeMasterKeyProvider() is stateless — see
+    # coderaft-vault/internal/keyprovider). Removed entirely. vault-keys\age.key
+    # itself is still generated (Step 1 above) purely as this function's own
+    # "already bootstrapped" idempotency marker — update.ps1/vault seeding key
+    # off its presence — but it is not, and was never really, a vault
+    # recovery secret.
+    #
+    # The REAL recovery mechanism is the Shamir ceremony (POST /v1/init once
+    # the vault container is actually running, POST /v1/unseal with a
+    # threshold of the returned shares) — it cannot run yet at this point in
+    # the script (the vault container doesn't exist until later). Once it is
+    # up, Invoke-VaultCheckSealState below prints the exact commands, and
+    # this is also documented in deploy/docs/vault.md ("Init + unseal
+    # ceremony").
     Write-Host ""
-    Write-Host "  +==================================================================+" -ForegroundColor Cyan
-    Write-Host "  | *** VAULT RECOVERY PHRASE — WRITE THIS DOWN NOW ***             |" -ForegroundColor Cyan
-    Write-Host "  |                                                                  |" -ForegroundColor Cyan
-    Write-Host "  | This 24-word phrase is the ONLY way to recover your vault       |" -ForegroundColor Cyan
-    Write-Host "  | if vault-keys\age.key is lost or corrupted.                     |" -ForegroundColor Cyan
-    Write-Host "  |                                                                  |" -ForegroundColor Cyan
-    Write-Host "  | Store it on an encrypted USB, in 1Password, or a physical safe. |" -ForegroundColor Cyan
-    Write-Host "  | DO NOT store it on this machine or in plaintext.                |" -ForegroundColor Cyan
-    Write-Host "  |                                                                  |" -ForegroundColor Cyan
-    Write-Host "  | If BOTH vault-keys\age.key AND this phrase are lost,            |" -ForegroundColor Cyan
-    Write-Host "  | ALL encrypted secrets are permanently unrecoverable.            |" -ForegroundColor Cyan
-    Write-Host "  +==================================================================+" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "  RECOVERY PHRASE:" -ForegroundColor Yellow
-    Write-Host ""
-    Write-Host "    $recoveryPhrase" -ForegroundColor White
+    Write-Host "  i Vault master key bootstrap complete (vault-keys\age.key)." -ForegroundColor Cyan
+    Write-Host "    This is NOT a vault recovery secret — coderaft-vault generates" -ForegroundColor Cyan
+    Write-Host "    its own master key internally and splits it into real Shamir" -ForegroundColor Cyan
+    Write-Host "    shares the first time an operator runs the init ceremony" -ForegroundColor Cyan
+    Write-Host "    (POST /v1/init) against the running container. This script will" -ForegroundColor Cyan
+    Write-Host "    print the exact commands once the vault is up. WRITE DOWN and" -ForegroundColor Cyan
+    Write-Host "    separately distribute every share when that happens — it is" -ForegroundColor Cyan
+    Write-Host "    the ONLY way to recover the vault; there is no other back door." -ForegroundColor Cyan
     Write-Host ""
 
-    if ($env:CODERAFT_TEST_MODE -eq "1") {
-        Write-Host "  [CODERAFT_TEST_MODE] Auto-accepting CONFIRMED prompt"
-        $reply = "CONFIRMED"
-    } else {
-        $reply = Read-Host "  Type CONFIRMED (all caps) once you have securely stored the phrase"
-    }
-
-    if ($reply -ne "CONFIRMED") {
-        Write-Host ""
-        Write-Host "  Aborted. vault-keys\age.key has been kept in place."
-        Write-Host "  Re-run the installer when you are ready."
-        exit 1
-    }
-    Write-Host "  ✓ Recovery phrase confirmed" -ForegroundColor Green
-
-    # ── Step 4: Generate mTLS PKI ────────────────────────────────────────────
     Invoke-VaultBootstrapTLS
 }
 
@@ -1047,7 +1083,7 @@ chmod 644 *.crt *.key 2>/dev/null || true
         "alpine:3.20", "sh", "/script.sh"
     ) -NoNewWindow -Wait -ErrorAction SilentlyContinue | Out-Null
     Remove-Item -Path $foScriptFile -ErrorAction SilentlyContinue
-    Write-Host "  ✓ FalconOne agents PKI written (SAN: $foSanString)"
+    Write-DetailLog "FalconOne agents PKI written (SAN: $foSanString)"
 }
 
 # ── ACL self-heal: falconone entry/permissions (#172) ────────────────────────
@@ -1064,7 +1100,7 @@ function Invoke-FalconOneAclSelfHeal {
     param([Parameter(Mandatory = $true)][string]$AclPath)
 
     if (-not (Test-Path $AclPath)) {
-        Write-Host "  [install] ACL self-heal: $AclPath not found — skipping (vault not provisioned yet)"
+        Write-DetailLog "[install] ACL self-heal: $AclPath not found — skipping (vault not provisioned yet)"
         return
     }
 
@@ -1113,7 +1149,7 @@ function Invoke-FalconOneAclSelfHeal {
       - "write:falconone/scripts_ca*"
 '@
         Add-Content -LiteralPath $AclPath -Value $newBlock
-        Write-Host "  [install] Self-heal ACL: falconone permissions updated (+$($requiredPerms.Count) added, entry created)"
+        Write-DetailLog "[install] Self-heal ACL: falconone permissions updated (+$($requiredPerms.Count) added, entry created)"
         return
     }
 
@@ -1126,7 +1162,7 @@ function Invoke-FalconOneAclSelfHeal {
     $missing = @($requiredPerms | Where-Object { $blockText -notmatch [regex]::Escape("`"$_`"") })
 
     if ($missing.Count -eq 0) {
-        Write-Host "  [install] ACL falconone already up-to-date"
+        Write-DetailLog "[install] ACL falconone already up-to-date"
         return
     }
 
@@ -1150,7 +1186,7 @@ function Invoke-FalconOneAclSelfHeal {
         $merged | Set-Content -LiteralPath $AclPath -Encoding UTF8
     }
 
-    Write-Host "  [install] Self-heal ACL: falconone permissions updated (+$($missing.Count) added)"
+    Write-DetailLog "[install] Self-heal ACL: falconone permissions updated (+$($missing.Count) added)"
 }
 
 # ── ACL self-heal: redfox connections/k8s vault-backed credentials ──────────
@@ -1166,7 +1202,7 @@ function Invoke-RedfoxAclSelfHeal {
     param([Parameter(Mandatory = $true)][string]$AclPath)
 
     if (-not (Test-Path $AclPath)) {
-        Write-Host "  [install] ACL self-heal: $AclPath not found — skipping (vault not provisioned yet)"
+        Write-DetailLog "[install] ACL self-heal: $AclPath not found — skipping (vault not provisioned yet)"
         return
     }
 
@@ -1211,7 +1247,7 @@ function Invoke-RedfoxAclSelfHeal {
       - "delete:redfox/k8s/*"
 '@
         Add-Content -LiteralPath $AclPath -Value $newBlock
-        Write-Host "  [install] Self-heal ACL: redfox permissions updated (+$($requiredPerms.Count) added, entry created)"
+        Write-DetailLog "[install] Self-heal ACL: redfox permissions updated (+$($requiredPerms.Count) added, entry created)"
         return
     }
 
@@ -1224,7 +1260,7 @@ function Invoke-RedfoxAclSelfHeal {
     $missing = @($requiredPerms | Where-Object { $blockText -notmatch [regex]::Escape("`"$_`"") })
 
     if ($missing.Count -eq 0) {
-        Write-Host "  [install] ACL redfox already up-to-date"
+        Write-DetailLog "[install] ACL redfox already up-to-date"
         return
     }
 
@@ -1248,7 +1284,7 @@ function Invoke-RedfoxAclSelfHeal {
         $merged | Set-Content -LiteralPath $AclPath -Encoding UTF8
     }
 
-    Write-Host "  [install] Self-heal ACL: redfox permissions updated (+$($missing.Count) added)"
+    Write-DetailLog "[install] Self-heal ACL: redfox permissions updated (+$($missing.Count) added)"
 }
 
 # ── ACL self-heal: cve-proxy entry (coderaft-cve-engine sidecar) ────────────
@@ -1257,14 +1293,14 @@ function Invoke-CveProxyAclSelfHeal {
     param([Parameter(Mandatory = $true)][string]$AclPath)
 
     if (-not (Test-Path $AclPath)) {
-        Write-Host "  [install] ACL self-heal: $AclPath not found — skipping (vault not provisioned yet)"
+        Write-DetailLog "[install] ACL self-heal: $AclPath not found — skipping (vault not provisioned yet)"
         return
     }
 
     $lines = @(Get-Content -LiteralPath $AclPath)
     $already = $lines | Where-Object { $_ -match '^\s*-\s*name:\s*cve-proxy\s*$' }
     if ($already) {
-        Write-Host "  [install] ACL cve-proxy already present"
+        Write-DetailLog "[install] ACL cve-proxy already present"
         return
     }
 
@@ -1280,7 +1316,7 @@ function Invoke-CveProxyAclSelfHeal {
       - "write:cve-proxy/*"
 '@
     Add-Content -LiteralPath $AclPath -Value $newBlock
-    Write-Host "  [install] Self-heal ACL: cve-proxy entry created"
+    Write-DetailLog "[install] Self-heal ACL: cve-proxy entry created"
 }
 
 # ── Vault client cert self-heal (any product whose cert was never
@@ -1303,7 +1339,7 @@ function Invoke-VaultClientCertSelfHeal {
         return
     }
 
-    Write-Host "  [install] Cert self-heal: generating vault-tls\$Name-client (was missing)"
+    Write-DetailLog "[install] Cert self-heal: generating vault-tls\$Name-client (was missing)"
     $chmodExtra = if ($Name -eq "falconone" -or $Name -eq "cve-proxy") {
         "chmod 644 '$Name-client.key' '$Name-client.crt'"
     } else {
@@ -1344,7 +1380,7 @@ $chmodExtra
         -ErrorAction SilentlyContinue
     Remove-Item -Path $runStdout, $runStderr, $scriptFile -ErrorAction SilentlyContinue
     if (-not $proc -or $proc.ExitCode -ne 0 -or -not (Test-Path $certPath)) {
-        Write-Host "  [install] Cert self-heal: $Name-client generation failed (non-fatal, retried next run)"
+        Write-DetailLog "[install] Cert self-heal: $Name-client generation failed (non-fatal, retried next run)"
     }
 }
 
@@ -1354,7 +1390,10 @@ Invoke-VaultBootstrap
 # Always run, independent of Invoke-VaultBootstrap's internal "already
 # exists — skipping" guards, so a re-run of this installer on an existing
 # install still gets the extended-SAN falconone-tls cert and any missing
-# ACL permissions healed.
+# ACL permissions healed. (2026-08-05) Console only gets one concise phase
+# line — per-product ACL/PKI/cert self-heal detail goes to $INSTALL_LOG via
+# Write-DetailLog instead (see the log-file setup near the top of this script).
+Write-Host "  Checking vault ACL / PKI provisioning..."
 Invoke-FalconOneTlsBootstrap -InstallDir (Get-Location).Path
 Invoke-FalconOneAclSelfHeal -AclPath (Join-Path (Get-Location).Path "vault-config\acl.yaml")
 
@@ -1370,6 +1409,7 @@ Invoke-RedfoxAclSelfHeal -AclPath (Join-Path (Get-Location).Path "vault-config\a
 Invoke-VaultClientCertSelfHeal -Name "falconone" -San "falconone.coderaft.local"
 Invoke-VaultClientCertSelfHeal -Name "cve-proxy" -San "cve-proxy.coderaft.local"
 Invoke-CveProxyAclSelfHeal -AclPath (Join-Path (Get-Location).Path "vault-config\acl.yaml")
+Write-Host "  ✓ Vault ACL / PKI provisioning OK (detail: $INSTALL_LOG)"
 
 # Append CODERAFT_VAULT_* env vars if not already present
 $envText = [System.IO.File]::ReadAllText("$(Get-Location)\.env", [System.Text.UTF8Encoding]::new($false))
@@ -2289,25 +2329,38 @@ exit 1
 '@ -Encoding UTF8
 }
 
-# ── Vault unseal helper (fresh install) ──────────────────────────────────────
+# ── Vault seal-state check (fresh install) ───────────────────────────────────
 # B6/B7 fix: vault image is distroless — no shell, no wget.
 # NEVER `docker compose exec coderaft-vault sh`. Use curlimages/curl sidecar.
-# B10 fix: vault starts sealed — must POST /v1/unseal after container is up.
-function Invoke-VaultUnsealFresh {
-    # B-PATH (2026-06-09): the original `vault-keys\age.key` was a relative
-    # path. During the install run, the CWD can drift (Start-Process child
-    # processes, exceptions from -Verb RunAs that restore an unexpected
-    # location, etc.), so by the time the unseal runs the relative path
-    # resolves under whatever folder PowerShell happens to be in — observed
-    # 2026-06-09 on Liam's Windows resolving to a random OneDrive subfolder.
-    # Force-restore CWD to the install dir and use absolute paths.
+#
+# AUDIT-SECU-2026-08-04 (Vault H1): coderaft-vault no longer auto-unseals and
+# no longer treats vault-keys/age.key as a submittable "share" — unsealing
+# now requires a REAL Shamir ceremony (default 3-of-5 shares, generated by
+# the vault itself at POST /v1/init and never persisted anywhere), which by
+# design NO unattended script can complete on its own. This function
+# (formerly Invoke-VaultUnsealFresh) therefore no longer attempts to unseal
+# the vault — it only polls for reachability and prints the operator's next
+# steps. A sealed vault after install is EXPECTED, not a failure.
+#
+# RESOLVED (2026-08-04, deploy-scripts-no-autounseal follow-up — see the
+# matching comment in deploy/install.sh's vault_check_seal_state): the fake
+# recovery-phrase banner this comment used to describe has been removed
+# from Invoke-VaultBootstrap's Step 2. vault-keys\age.key is still generated
+# there purely as an idempotency marker; it is never read by the vault for
+# anything. This function remains the single accurate source of ceremony
+# instructions, printed once the vault container is actually reachable.
+# Auto-running POST /v1/init inline during install was considered and
+# deliberately NOT done — a vault can only ever be initialized once, and
+# doing so silently with no operator confirmation of who is present to
+# receive which share defeats the point of a multi-operator ceremony. Left
+# as a possible future UX improvement, not a bug.
+function Invoke-VaultCheckSealState {
+    # B-PATH (2026-06-09): during the install run, the CWD can drift
+    # (Start-Process child processes, exceptions from -Verb RunAs that
+    # restore an unexpected location, etc.) — force-restore CWD to the
+    # install dir before resolving any relative paths below.
     if ($script:AbsoluteInstallDir -and (Test-Path $script:AbsoluteInstallDir)) {
         Set-Location -LiteralPath $script:AbsoluteInstallDir
-    }
-    $vaultAgeKey = Join-Path (Get-Location) "vault-keys\age.key"
-    if (-not (Test-Path $vaultAgeKey)) {
-        Write-Host "  ✗ $vaultAgeKey not found — cannot unseal" -ForegroundColor Red
-        return $false
     }
 
     # Detect compose project name (determines Docker network for sidecar).
@@ -2427,29 +2480,39 @@ function Invoke-VaultUnsealFresh {
         return $false
     }
 
-    # B10 fix: unseal if sealed (1 share = base64-encoded age key file bytes)
-    if ($lastSealed -eq "true") {
-        Write-Host "  Vault is sealed — sending unseal request..."
-        $ageKeyBytes = [System.IO.File]::ReadAllBytes($vaultAgeKey)
-        $shareB64 = [Convert]::ToBase64String($ageKeyBytes)
-        $unsealBody = @{ shares = @($shareB64) } | ConvertTo-Json -Compress
-        $unsealResp = Invoke-VaultCurlFresh -Method "POST" -Path "/v1/unseal" -JsonBody $unsealBody
-        if ($unsealResp -notmatch '"ok"\s*:\s*true|"sealed"\s*:\s*false') {
-            Write-Host "  Unseal response: $unsealResp" -ForegroundColor Yellow
-            Write-Host "  ✗ Vault unseal failed" -ForegroundColor Red
-            return $false
-        }
-        Write-Host "  ✓ Vault unsealed" -ForegroundColor Green
+    if ($lastSealed -eq "false") {
+        Write-Host "  ✓ coderaft-vault is already initialized and unsealed" -ForegroundColor Green
+        return $true
     }
 
-    $finalHealth = Invoke-VaultCurlFresh -Method "GET" -Path "/v1/health"
-    if ($finalHealth -notmatch '"sealed"\s*:\s*false') {
-        Write-Host "  Final health: $finalHealth" -ForegroundColor Yellow
-        Write-Host "  ✗ Vault still sealed after unseal call" -ForegroundColor Red
-        return $false
-    }
-    Write-Host "  ✓ coderaft-vault is healthy (sealed:false)" -ForegroundColor Green
-    return $true
+    Write-Host ""
+    Write-Host "  ────────────────────────────────────────────────────────────────" -ForegroundColor Yellow
+    Write-Host "  Vault is SEALED. This is expected — Coderaft Vault requires a" -ForegroundColor Yellow
+    Write-Host "  real, human, multi-operator Shamir ceremony (default: 3 of 5" -ForegroundColor Yellow
+    Write-Host "  shares) before it will hold or serve ANY secret. No script can" -ForegroundColor Yellow
+    Write-Host "  complete this unattended, by design (AUDIT-SECU-2026-08-04)." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  An operator must run, from this directory (PowerShell):"
+    Write-Host ""
+    Write-Host "    # 1) ONE TIME ONLY per vault (skip if already run before):"
+    Write-Host "    docker run --rm --user 0:0 --network $vaultNetwork ``"
+    Write-Host "      -v `"$absTlsDir`:/tls:ro`" curlimages/curl:latest ``"
+    Write-Host "      --cert /tls/dashboard-api-client.crt --key /tls/dashboard-api-client.key ``"
+    Write-Host "      --cacert /tls/client-ca.crt -sS -X POST https://coderaft-vault:8200/v1/init"
+    Write-Host "    # -> WRITE DOWN the returned shares, one per operator, then:"
+    Write-Host ""
+    Write-Host "    # 2) EVERY time the vault starts sealed (every restart/reboot):"
+    Write-Host "    docker run --rm --user 0:0 --network $vaultNetwork ``"
+    Write-Host "      -v `"$absTlsDir`:/tls:ro`" curlimages/curl:latest ``"
+    Write-Host "      --cert /tls/dashboard-api-client.crt --key /tls/dashboard-api-client.key ``"
+    Write-Host "      --cacert /tls/client-ca.crt -sS -X POST https://coderaft-vault:8200/v1/unseal ``"
+    Write-Host "      -H 'Content-Type: application/json' -d '{`"shares`":[`"<share1>`",`"<share2>`",`"<share3>`"]}'"
+    Write-Host ""
+    Write-Host "  Until this runs, every product shows `"vault unavailable`" — that"
+    Write-Host "  is fail-closed behavior, not a crash."
+    Write-Host "  ────────────────────────────────────────────────────────────────" -ForegroundColor Yellow
+    Write-Host ""
+    return $false
 }
 
 # ── Vault bootstrap-secrets seeding (fresh install race fix, PowerShell parity) ──
@@ -2675,11 +2738,11 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host ""
-Write-Host "  Unsealing vault..."
-$vaultOk = Invoke-VaultUnsealFresh
+Write-Host "  Checking vault seal state..."
+$vaultOk = Invoke-VaultCheckSealState
 if (-not $vaultOk) {
-    Write-Host "  ⚠ Vault unseal failed — dashboard may show 'vault unavailable'." -ForegroundColor Yellow
-    Write-Host "    Re-run the installer or run: docker compose restart coderaft-vault"
+    Write-Host "  ⚠ Vault is sealed — dashboard will show 'vault unavailable' until an" -ForegroundColor Yellow
+    Write-Host "    operator completes the ceremony printed above."
 }
 
 Write-Host ""
@@ -2752,6 +2815,7 @@ Write-Host "  ║   and deploy your products.                          ║" -For
 Write-Host "  ╚══════════════════════════════════════════════════════╝" -ForegroundColor Green
 Write-Host ""
 Write-Host "  Commands:  .\start.ps1  .\stop.ps1  .\update.ps1  .\rollback.ps1"
+Write-Host "  Full install log: $INSTALL_LOG"
 Write-Host ""
 
 Start-Process $DashboardUrl

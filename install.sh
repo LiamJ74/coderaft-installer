@@ -49,7 +49,7 @@ set -e
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.sh/install.sh.sha256 at all — today it still proxies
 # the legacy `coderaft-installer` repo.
-EXPECTED_SHA256="60ffe818918f40fb60bc971bbb34848e5fba6f8140603cf3e80fbaaf990edc19"
+EXPECTED_SHA256="57b0fccd63b1a47956ce37a0c3eb3a37c794534c276e00c33a4724dbe2f2a4c7"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -555,82 +555,43 @@ vault_bootstrap() {
     }
     chmod 400 vault-keys/age.key
 
-    # ── Step 2: Compute BIP39 recovery phrase ───────────────────────────────
-    # The vault container exposes: docker run --rm ... -mnemonic-from-key /dev/stdin
-    # We feed it the raw age private key to get a 24-word BIP39 mnemonic.
-    # TODO (Phase 1 follow-up): verify this sub-command exists in coderaft-vault
-    # image — if it returns non-zero, we fall back to the raw key fingerprint
-    # as a placeholder so the installer is never blocked.
-    RECOVERY_PHRASE=""
-    if [ "${CODERAFT_TEST_MODE:-0}" != "1" ]; then
-        VAULT_PRIV_KEY=$(grep '^AGE-SECRET-KEY-' vault-keys/age.key 2>/dev/null || true)
-        if [ -n "$VAULT_PRIV_KEY" ]; then
-            RECOVERY_PHRASE=$(echo "$VAULT_PRIV_KEY" | \
-                docker run --rm -i ghcr.io/liamj74/coderaft-vault:latest \
-                    -mnemonic-from-key /dev/stdin 2>/dev/null || true)
-        fi
-    fi
-    # Fallback: use age public-key fingerprint as placeholder
-    if [ -z "$RECOVERY_PHRASE" ]; then
-        VAULT_PUB=$(grep '# public key:' vault-keys/age.key 2>/dev/null | awk '{print $NF}' || true)
-        RECOVERY_PHRASE="[FALLBACK — save vault-keys/age.key securely] fingerprint: ${VAULT_PUB}"
-        echo ""
-        echo "  ⚠ coderaft-vault -mnemonic-from-key not available yet (Phase 1 TODO)."
-        echo "    Using fingerprint as placeholder. Secure vault-keys/age.key manually."
-        echo ""
-    fi
-
-    # ── Step 3: Display recovery phrase with big warning ────────────────────
+    # ── Step 2: Generate mTLS PKI (D3) ──────────────────────────────────────
+    # AUDIT-SECU-2026-08-04 (Vault H1 follow-up): this used to be "Step 2:
+    # Compute BIP39 recovery phrase" / "Step 3: Display recovery phrase with
+    # big warning" — a `docker run ... -mnemonic-from-key` call that NEVER
+    # existed as a real coderaft-vault sub-command (confirmed against
+    # cmd/coderaft-vault/main.go: the binary only accepts -config and
+    # -health-check), always silently fell through to a raw key-fingerprint
+    # placeholder, and displayed that under a banner claiming "This 24-word
+    # phrase is the ONLY way to recover your vault" — factually false even
+    # before this fix (the fingerprint isn't a recovery mechanism at all) and
+    # doubly so now: coderaft-vault no longer reads vault-keys/age.key for
+    # ANYTHING (keyprovider.NewAgeMasterKeyProvider() is stateless — see
+    # coderaft-vault/internal/keyprovider). Removed entirely rather than
+    # patched, per the "KNOWN FOLLOW-UP" this file already flagged in
+    # vault_check_seal_state() above. vault-keys/age.key itself is still
+    # generated (see Step 1) purely as this function's own "already
+    # bootstrapped" idempotency marker — update.sh/vault_seed_bootstrap_secrets
+    # key off its presence — but it is not, and was never really, a vault
+    # recovery secret.
+    #
+    # The REAL recovery mechanism is the Shamir ceremony (POST /v1/init once
+    # the vault container is actually running, POST /v1/unseal with a
+    # threshold of the returned shares) — it cannot run yet at this point in
+    # the script (the vault container doesn't exist until later). Once it is
+    # up, vault_check_seal_state() below prints the exact commands and this
+    # is also documented in deploy/docs/vault.md ("Init + unseal ceremony").
     echo ""
-    echo "  ╔══════════════════════════════════════════════════════════════════╗"
-    echo "  ║   *** VAULT RECOVERY PHRASE — WRITE THIS DOWN NOW ***           ║"
-    echo "  ║                                                                  ║"
-    echo "  ║   This 24-word phrase is the ONLY way to recover your vault     ║"
-    echo "  ║   if vault-keys/age.key is lost or corrupted.                   ║"
-    echo "  ║                                                                  ║"
-    echo "  ║   Store it on an encrypted USB, in 1Password, or a physical     ║"
-    echo "  ║   safe. DO NOT store it on this machine or in plaintext.        ║"
-    echo "  ║                                                                  ║"
-    echo "  ║   If BOTH vault-keys/age.key AND this phrase are lost,          ║"
-    echo "  ║   ALL encrypted secrets are permanently unrecoverable.          ║"
-    echo "  ╚══════════════════════════════════════════════════════════════════╝"
-    echo ""
-    echo "  RECOVERY PHRASE:"
-    echo ""
-    echo "    ${RECOVERY_PHRASE}"
-    echo ""
-    echo "  ╔══════════════════════════════════════════════════════════════════╗"
-    echo "  ║   Type CONFIRMED (all caps) once you have securely stored       ║"
-    echo "  ║   the recovery phrase, then press Enter to continue.            ║"
-    echo "  ╚══════════════════════════════════════════════════════════════════╝"
+    echo "  ℹ Vault master key bootstrap complete (vault-keys/age.key)."
+    echo "    This is NOT a vault recovery secret — coderaft-vault generates"
+    echo "    its own master key internally and splits it into real Shamir"
+    echo "    shares the first time an operator runs the init ceremony"
+    echo "    (POST /v1/init) against the running container. This script will"
+    echo "    print the exact commands once the vault is up. WRITE DOWN and"
+    echo "    separately distribute every share when that happens — it is"
+    echo "    the ONLY way to recover the vault; there is no other back door."
     echo ""
 
-    if [ "${CODERAFT_TEST_MODE:-0}" = "1" ]; then
-        echo "  [CODERAFT_TEST_MODE] Auto-accepting CONFIRMED prompt"
-        REPLY="CONFIRMED"
-    else
-        # stty trick: disable echo so the phrase isn't logged twice, then re-enable
-        if command -v stty &>/dev/null; then
-            stty -echo 2>/dev/null || true
-            printf "  Type CONFIRMED to continue: "
-            read -r REPLY
-            stty echo 2>/dev/null || true
-            echo ""
-        else
-            printf "  Type CONFIRMED to continue: "
-            read -r REPLY
-        fi
-    fi
-
-    if [ "$REPLY" != "CONFIRMED" ]; then
-        echo ""
-        echo "  Aborted. vault-keys/age.key has been kept in place."
-        echo "  Re-run the installer when you are ready."
-        exit 1
-    fi
-    echo "  ✓ Recovery phrase confirmed"
-
-    # ── Step 4: Generate mTLS PKI (D3) ─────────────────────────────────────
     vault_bootstrap_tls
 }
 
@@ -1060,6 +1021,98 @@ FALCONONEACL
     echo "  [install] Self-heal ACL: falconone permissions updated (+${#missing[@]} added)"
 }
 
+# ── ACL self-heal: mantisstrike entry/permissions (Phase 1 platform wiring,
+# same pattern as _falconone_acl_selfheal above) ─────────────────────────────
+# The static acl.yaml written by _vault_write_config predates MantisStrike
+# and has no `mantisstrike` entry — this self-heal is additive-only,
+# idempotent, and safe on every install/update run (fresh installs included:
+# it runs unconditionally right after vault_bootstrap, same as falconone's
+# own self-heal). Permissions mirror the CURRENT real
+# coderaft-vault/configs/acl.yaml (verified directly against that file,
+# 2026-08-04) — deliberately NOT copying _vault_write_config's stale
+# embedded template above, which still includes the since-removed (2026-07-
+# 31) `read:license_key` grant.
+_mantisstrike_acl_selfheal() {
+    local acl_path="$1"
+
+    if [ ! -f "$acl_path" ]; then
+        echo "  [install] ACL self-heal: $acl_path not found — skipping (vault not provisioned yet)"
+        return 0
+    fi
+
+    local required_perms=(
+        "read:mantisstrike_*"
+        "read:platform/identity/oidc"
+        "read:platform/identity/graph-tools"
+    )
+
+    local ts
+    ts="$(date -u +"%Y%m%dT%H%M%SZ")"
+
+    if ! grep -qE '^[[:space:]]*-[[:space:]]*name:[[:space:]]*mantisstrike[[:space:]]*$' "$acl_path"; then
+        cp "$acl_path" "${acl_path}.bak-${ts}"
+        _rotate_backups "$acl_path"
+        cat >> "$acl_path" <<'MANTISSTRIKEACL'
+
+  - name: mantisstrike
+    cert_san: "mantisstrike.coderaft.local"
+    permissions:
+      - "read:mantisstrike_*"
+      - "read:platform/identity/oidc"
+      - "read:platform/identity/graph-tools"
+MANTISSTRIKEACL
+        echo "  [install] Self-heal ACL: mantisstrike permissions updated (+${#required_perms[@]} added, entry created)"
+        return 0
+    fi
+
+    local start_line end_line
+    start_line=$(grep -nE '^[[:space:]]*-[[:space:]]*name:[[:space:]]*mantisstrike[[:space:]]*$' "$acl_path" | head -1 | cut -d: -f1)
+    end_line=$(awk -v s="$start_line" 'NR>s && /^[[:space:]]*-[[:space:]]*name:/{print NR; exit}' "$acl_path")
+    if [ -z "$end_line" ]; then
+        end_line=$(( $(wc -l < "$acl_path") + 1 ))
+    fi
+
+    local block
+    block=$(sed -n "${start_line},$((end_line - 1))p" "$acl_path")
+
+    local missing=()
+    local p
+    for p in "${required_perms[@]}"; do
+        if ! grep -qF "\"${p}\"" <<< "$block"; then
+            missing+=("$p")
+        fi
+    done
+
+    if [ "${#missing[@]}" -eq 0 ]; then
+        echo "  [install] ACL mantisstrike already up-to-date"
+        return 0
+    fi
+
+    cp "$acl_path" "${acl_path}.bak-${ts}"
+    _rotate_backups "$acl_path"
+
+    if grep -qE '^[[:space:]]*permissions:[[:space:]]*\[.*\][[:space:]]*$' <<< "$block"; then
+        local additions=""
+        for p in "${missing[@]}"; do additions="${additions},\"${p}\""; done
+        awk -v s="$start_line" -v e="$end_line" -v add="$additions" '
+            NR>=s && NR<e && /^[[:space:]]*permissions:[[:space:]]*\[.*\][[:space:]]*$/ {
+                sub(/\][[:space:]]*$/, add "]")
+            }
+            { print }
+        ' "$acl_path" > "${acl_path}.tmp" && mv "${acl_path}.tmp" "$acl_path"
+    else
+        local addition_block=""
+        for p in "${missing[@]}"; do addition_block="${addition_block}      - \"${p}\""$'\n'; done
+        local insert_line=$(( end_line - 1 ))
+        awk -v ins="$insert_line" -v add="$addition_block" '
+            { print }
+            NR==ins { printf "%s", add }
+        ' "$acl_path" > "${acl_path}.tmp" && mv "${acl_path}.tmp" "$acl_path"
+    fi
+
+    echo "  [install] Self-heal ACL: mantisstrike permissions updated (+${#missing[@]} added)"
+}
+
 # ── ACL self-heal: redfox connections/k8s vault-backed credentials ──────────
 # Zero-Knowledge Credential Architecture Palier 1
 # (coderaft-platform/docs/redfox-zero-knowledge-scoping.md): target
@@ -1252,6 +1305,11 @@ vault_bootstrap
 # permissions healed.
 _falconone_tls_bootstrap "$PWD"
 _falconone_acl_selfheal "vault-config/acl.yaml"
+
+# ── MantisStrike vault client cert + ACL self-heal (Phase 1 platform wiring,
+# same pattern as falconone above) ───────────────────────────────────────────
+_vault_client_cert_selfheal "mantisstrike" "mantisstrike.coderaft.local"
+_mantisstrike_acl_selfheal "vault-config/acl.yaml"
 
 # ── RedFox connections/k8s vault-backed credentials ACL self-heal ───────────
 # Zero-Knowledge Credential Architecture Palier 1 — see _redfox_acl_selfheal
@@ -2351,18 +2409,39 @@ for img in \
     verify_coderaft_image "${img}"
 done
 
-# ── Vault unseal helper (fresh install) ──────────────────────────────────────
+# ── Vault seal-state check (fresh install) ───────────────────────────────────
 # B6/B7 fix: vault image is distroless — no shell, no wget. NEVER use
 # `docker compose exec coderaft-vault sh -c`. Use a curlimages/curl sidecar
 # on the coderaft-vault-net network with the dashboard-api client cert.
-# B10 fix: vault starts sealed — must POST /v1/unseal after container is up.
-vault_unseal_fresh() {
-    local vault_age_key="vault-keys/age.key"
-    if [ ! -f "$vault_age_key" ]; then
-        echo "  ✗ vault-keys/age.key not found — cannot unseal" >&2
-        return 1
-    fi
-
+#
+# AUDIT-SECU-2026-08-04 (Vault H1): coderaft-vault no longer auto-unseals and
+# no longer treats vault-keys/age.key as a submittable "share" — unsealing
+# now requires a REAL Shamir ceremony (default 3-of-5 shares, generated by
+# the vault itself at POST /v1/init and never persisted anywhere), which by
+# design NO unattended script can complete on its own. This function
+# (formerly vault_unseal_fresh) therefore no longer attempts to unseal the
+# vault — it only polls for reachability and prints the operator's next
+# steps. A sealed vault after install is EXPECTED, not a failure: every
+# product will show "vault unavailable" (fail-closed) until an operator
+# completes the ceremony.
+#
+# RESOLVED (2026-08-04, deploy-scripts-no-autounseal follow-up): the
+# vault_bootstrap() BIP39/mnemonic block this comment used to describe (fake
+# "recovery phrase" banner, `-mnemonic-from-key` sub-command that never
+# existed) has been removed outright — see vault_bootstrap()'s Step 2 above.
+# vault-keys/age.key is still generated there purely as an idempotency
+# marker; it is never read by the vault for anything. This function remains
+# the single accurate source of ceremony instructions, printed once the
+# vault container is actually reachable. Auto-running POST /v1/init inline
+# during install (so a fresh install could display real shares immediately
+# instead of waiting for the operator to run it separately afterwards) was
+# considered and deliberately NOT done here — it would silently perform a
+# security-critical, one-time-only action (a vault can only ever be
+# initialized once) on every fresh install with no operator confirmation of
+# WHO is present to receive which share, which cuts against the entire
+# point of a multi-operator ceremony. Left as a possible future UX
+# improvement, not a bug.
+vault_check_seal_state() {
     # Detect compose project name (determines Docker network name)
     local vault_project
     vault_project=$(docker inspect coderaft-coderaft-vault-1 \
@@ -2418,31 +2497,39 @@ vault_unseal_fresh() {
         return 1
     fi
 
-    # B10 fix: unseal if sealed (1 share = base64-encoded age key file bytes)
-    if [ "$last_sealed" = "true" ]; then
-        echo "  Vault is sealed — sending unseal request..."
-        local share_b64
-        share_b64=$(base64 < "$vault_age_key" | tr -d '\n')
-        local unseal_body="{\"shares\":[\"${share_b64}\"]}"
-        local unseal_resp
-        unseal_resp=$(_vault_curl_fresh "POST" "/v1/unseal" "$unseal_body" 2>/dev/null || true)
-        if ! echo "$unseal_resp" | grep -qE '"ok"\s*:\s*true|"sealed"\s*:\s*false'; then
-            echo "  Unseal response: $unseal_resp" >&2
-            echo "  ✗ Vault unseal failed" >&2
-            return 1
-        fi
-        echo "  ✓ Vault unsealed"
+    if [ "$last_sealed" = "false" ]; then
+        echo "  ✓ coderaft-vault is already initialized and unsealed"
+        return 0
     fi
 
-    # Final health check — must say sealed:false
-    local final_health
-    final_health=$(_vault_curl_fresh "GET" "/v1/health" 2>/dev/null || true)
-    if ! echo "$final_health" | grep -q '"sealed":false'; then
-        echo "  Final health: $final_health" >&2
-        echo "  ✗ Vault still sealed after unseal call" >&2
-        return 1
-    fi
-    echo "  ✓ coderaft-vault is healthy (sealed:false)"
+    echo ""
+    echo "  ────────────────────────────────────────────────────────────────"
+    echo "  Vault is SEALED. This is expected — Coderaft Vault requires a"
+    echo "  real, human, multi-operator Shamir ceremony (default: 3 of 5"
+    echo "  shares) before it will hold or serve ANY secret. No script can"
+    echo "  complete this unattended, by design (AUDIT-SECU-2026-08-04)."
+    echo ""
+    echo "  An operator must run, from this directory:"
+    echo ""
+    echo "    # 1) ONE TIME ONLY per vault (skip if already run before):"
+    echo "    docker run --rm --user 0:0 --network ${vault_network} \\"
+    echo "      -v \"\$(cd vault-tls && pwd)\":/tls:ro curlimages/curl:latest \\"
+    echo "      --cert /tls/dashboard-api-client.crt --key /tls/dashboard-api-client.key \\"
+    echo "      --cacert /tls/client-ca.crt -sS -X POST https://coderaft-vault:8200/v1/init"
+    echo "    # -> WRITE DOWN the returned shares, one per operator, then:"
+    echo ""
+    echo "    # 2) EVERY time the vault starts sealed (every restart/reboot):"
+    echo "    docker run --rm --user 0:0 --network ${vault_network} \\"
+    echo "      -v \"\$(cd vault-tls && pwd)\":/tls:ro curlimages/curl:latest \\"
+    echo "      --cert /tls/dashboard-api-client.crt --key /tls/dashboard-api-client.key \\"
+    echo "      --cacert /tls/client-ca.crt -sS -X POST https://coderaft-vault:8200/v1/unseal \\"
+    echo "      -H 'Content-Type: application/json' -d '{\"shares\":[\"<share1>\",\"<share2>\",\"<share3>\"]}'"
+    echo ""
+    echo "  Until this runs, every product shows \"vault unavailable\" — that"
+    echo "  is fail-closed behavior, not a crash."
+    echo "  ────────────────────────────────────────────────────────────────"
+    echo ""
+    return 1
 }
 
 # ── Vault bootstrap-secrets seeding (fresh install race fix) ────────────────
@@ -2584,10 +2671,10 @@ else
     fi
 
     echo ""
-    echo "  Unsealing vault..."
-    vault_unseal_fresh || {
-        echo "  ⚠ Vault unseal failed — dashboard may show 'vault unavailable'."
-        echo "    Re-run the installer or run: docker compose restart coderaft-vault"
+    echo "  Checking vault seal state..."
+    vault_check_seal_state || {
+        echo "  ⚠ Vault is sealed — dashboard will show 'vault unavailable' until an"
+        echo "    operator completes the ceremony printed above."
     }
 
     echo ""

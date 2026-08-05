@@ -857,6 +857,93 @@ FALCONONEACL
     echo "  [install] Self-heal ACL: falconone permissions updated (+${#missing[@]} added)"
 }
 
+# ── ACL self-heal: mantisstrike entry/permissions (Phase 1 platform wiring,
+# same pattern as _falconone_acl_selfheal above) ─────────────────────────────
+# Permissions mirror the CURRENT real coderaft-vault/configs/acl.yaml
+# (verified directly against that file, 2026-08-04) — NOT the stale embedded
+# template in _vault_write_config, which still includes the since-removed
+# (2026-07-31) `read:license_key` grant.
+_mantisstrike_acl_selfheal() {
+    local acl_path="$1"
+
+    if [ ! -f "$acl_path" ]; then
+        echo "  [install] ACL self-heal: $acl_path not found — skipping (vault not provisioned yet)"
+        return 0
+    fi
+
+    local required_perms=(
+        "read:mantisstrike_*"
+        "read:platform/identity/oidc"
+        "read:platform/identity/graph-tools"
+    )
+
+    local ts
+    ts="$(date -u +"%Y%m%dT%H%M%SZ")"
+
+    if ! grep -qE '^[[:space:]]*-[[:space:]]*name:[[:space:]]*mantisstrike[[:space:]]*$' "$acl_path"; then
+        cp "$acl_path" "${acl_path}.bak-${ts}"
+        _rotate_backups "$acl_path"
+        cat >> "$acl_path" <<'MANTISSTRIKEACL'
+
+  - name: mantisstrike
+    cert_san: "mantisstrike.coderaft.local"
+    permissions:
+      - "read:mantisstrike_*"
+      - "read:platform/identity/oidc"
+      - "read:platform/identity/graph-tools"
+MANTISSTRIKEACL
+        echo "  [install] Self-heal ACL: mantisstrike permissions updated (+${#required_perms[@]} added, entry created)"
+        return 0
+    fi
+
+    local start_line end_line
+    start_line=$(grep -nE '^[[:space:]]*-[[:space:]]*name:[[:space:]]*mantisstrike[[:space:]]*$' "$acl_path" | head -1 | cut -d: -f1)
+    end_line=$(awk -v s="$start_line" 'NR>s && /^[[:space:]]*-[[:space:]]*name:/{print NR; exit}' "$acl_path")
+    if [ -z "$end_line" ]; then
+        end_line=$(( $(wc -l < "$acl_path") + 1 ))
+    fi
+
+    local block
+    block=$(sed -n "${start_line},$((end_line - 1))p" "$acl_path")
+
+    local missing=()
+    local p
+    for p in "${required_perms[@]}"; do
+        if ! grep -qF "\"${p}\"" <<< "$block"; then
+            missing+=("$p")
+        fi
+    done
+
+    if [ "${#missing[@]}" -eq 0 ]; then
+        echo "  [install] ACL mantisstrike already up-to-date"
+        return 0
+    fi
+
+    cp "$acl_path" "${acl_path}.bak-${ts}"
+    _rotate_backups "$acl_path"
+
+    if grep -qE '^[[:space:]]*permissions:[[:space:]]*\[.*\][[:space:]]*$' <<< "$block"; then
+        local additions=""
+        for p in "${missing[@]}"; do additions="${additions},\"${p}\""; done
+        awk -v s="$start_line" -v e="$end_line" -v add="$additions" '
+            NR>=s && NR<e && /^[[:space:]]*permissions:[[:space:]]*\[.*\][[:space:]]*$/ {
+                sub(/\][[:space:]]*$/, add "]")
+            }
+            { print }
+        ' "$acl_path" > "${acl_path}.tmp" && mv "${acl_path}.tmp" "$acl_path"
+    else
+        local addition_block=""
+        for p in "${missing[@]}"; do addition_block="${addition_block}      - \"${p}\""$'\n'; done
+        local insert_line=$(( end_line - 1 ))
+        awk -v ins="$insert_line" -v add="$addition_block" '
+            { print }
+            NR==ins { printf "%s", add }
+        ' "$acl_path" > "${acl_path}.tmp" && mv "${acl_path}.tmp" "$acl_path"
+    fi
+
+    echo "  [install] Self-heal ACL: mantisstrike permissions updated (+${#missing[@]} added)"
+}
+
 # ── ACL self-heal: redfox connections/k8s vault-backed credentials ──────────
 # Zero-Knowledge Credential Architecture Palier 1
 # (coderaft-platform/docs/redfox-zero-knowledge-scoping.md): target
@@ -1166,28 +1253,29 @@ echo ""
 echo "  Checking vault migration status..."
 
 _vault_migration_needed() {
-    # 4a: skip if sentinel exists OR vault container is running
+    # 4a: skip ONLY if the migration sentinel exists.
+    #
+    # AUDIT-SECU-2026-08-04 (Vault H1): this used to ALSO skip whenever the
+    # coderaft-vault container was already "running" — that assumption dates
+    # from when the vault auto-unsealed itself at boot, so "running" implied
+    # "usable". It no longer does: the vault now ALWAYS boots sealed and
+    # requires a real human Shamir ceremony (POST /v1/init then /v1/unseal)
+    # that no script can complete unattended. A vault container can now be
+    # "running" for a long time while sealed, with the legacy secrets NOT
+    # yet migrated into it (steps 4e+ below never ran) — treating that as
+    # "done" would silently strand the host on legacy stores forever. Only
+    # the migration sentinel (.migrated, written at the END of a successful
+    # 4e-4h run) means the migration itself is actually complete.
     if [ -f "${INSTALL_DIR}/vault-data/.migrated" ]; then
         echo "  ✓ Vault migration already complete (sentinel found)"
         return 1
-    fi
-    if (cd "${INSTALL_DIR}" 2>/dev/null && docker compose "${COMPOSE_ENV_ARGS[@]}" ps coderaft-vault 2>/dev/null | grep -q "running"); then
-        echo "  ✓ coderaft-vault already running — skipping migration"
-        return 1
-    fi
-    # If vault service is in docker-compose.yml it means install.sh already
-    # ran with vault support — check if the keys dir is missing instead.
-    if [ ! -f "${INSTALL_DIR}/vault-keys/age.key" ]; then
-        echo "  Vault master key absent — migration required"
-        return 0
     fi
     return 0
 }
 
 _vault_migration_needed || true
 _VAULT_NEEDS_MIGRATION=0
-if ! [ -f "${INSTALL_DIR}/vault-data/.migrated" ] && \
-   ! (cd "${INSTALL_DIR}" 2>/dev/null && docker compose "${COMPOSE_ENV_ARGS[@]}" ps coderaft-vault 2>/dev/null | grep -q "running") 2>/dev/null; then
+if [ ! -f "${INSTALL_DIR}/vault-data/.migrated" ]; then
     _VAULT_NEEDS_MIGRATION=1
 fi
 
@@ -1231,7 +1319,13 @@ if [ "${_VAULT_NEEDS_MIGRATION}" = "1" ]; then
     echo "  ✓ Pre-flight backup complete"
 
     # ── 4c Key bootstrap ──────────────────────────────────────────────────
+    # AUDIT-SECU-2026-08-04 (Vault H1 follow-up): tracks whether THIS run
+    # actually generated fresh vault-keys/vault-tls/vault-config material —
+    # used below (4d) to decide whether the running container genuinely
+    # needs to reload bind-mounted files, instead of always recreating it.
+    _VAULT_FRESH_BOOTSTRAP=0
     if [ ! -f "${INSTALL_DIR}/vault-keys/age.key" ]; then
+        _VAULT_FRESH_BOOTSTRAP=1
         echo "  Generating vault master key..."
         mkdir -p "${INSTALL_DIR}/vault-keys" "${INSTALL_DIR}/vault-tls" "${INSTALL_DIR}/vault-config"
         if ! command -v age-keygen &>/dev/null; then
@@ -1398,12 +1492,49 @@ VAULTOVERRIDE
     # Task #150: both env files, always explicit (see COMPOSE_ENV_ARGS above).
     _VAULT_COMPOSE_ARGS+=(--env-file "${INSTALL_CONFIG_PATH}" --env-file "${INSTALL_DIR}/.env")
 
-    # B9 fix: explicit stop+rm guarantees the container reloads cert/config
-    # from bind mounts. --force-recreate alone has been observed to leave
-    # a Running container in Docker Desktop with stale certs in memory.
-    (cd "${INSTALL_DIR}" && docker compose "${_VAULT_COMPOSE_ARGS[@]}" stop coderaft-vault 2>/dev/null || true)
-    (cd "${INSTALL_DIR}" && docker compose "${_VAULT_COMPOSE_ARGS[@]}" rm -f coderaft-vault 2>/dev/null || true)
-    (cd "${INSTALL_DIR}" && docker compose "${_VAULT_COMPOSE_ARGS[@]}" up -d coderaft-vault 2>/dev/null) || _VAULT_ROLLBACK
+    # AUDIT-SECU-2026-08-04 (Vault H1 follow-up — reseal-on-rerun bug):
+    # the stop+rm+up dance below (B9 fix, 2026-05-07) exists so a genuinely
+    # NEW image or freshly-bootstrapped cert/config (4c above) gets loaded —
+    # --force-recreate alone was observed to leave a Running container in
+    # Docker Desktop with stale certs in memory. It used to run
+    # UNCONDITIONALLY every time this block executed (i.e. every re-run of
+    # update.sh while the .migrated sentinel is missing). Since the vault's
+    # seal state lives ONLY in the running process's memory (no persistent
+    # "unsealed" flag — that is the whole point of the H1 model), recreating
+    # an already-running, already-unsealed container reseals it as a pure
+    # side effect, BEFORE the seal-state check below ever runs — so an
+    # operator who dutifully runs the real unseal ceremony and then re-runs
+    # this script would see it reseal itself and never converge. Recreate
+    # the container ONLY when there is an actual reason to: it isn't running
+    # yet, this run just bootstrapped fresh keys/certs/config (4c), or the
+    # image that was just pulled differs from the one the running container
+    # was started from. Otherwise leave a running vault exactly as it is —
+    # it may already have been unsealed by an operator since the last run.
+    _VAULT_IMAGE_REF="ghcr.io/liamj74/coderaft-vault:latest"
+    _VAULT_CID=$(cd "${INSTALL_DIR}" && docker compose "${_VAULT_COMPOSE_ARGS[@]}" ps -q coderaft-vault 2>/dev/null || true)
+    _VAULT_ALREADY_RUNNING=0
+    _VAULT_RUNNING_IMAGE_ID=""
+    if [ -n "$_VAULT_CID" ]; then
+        [ "$(docker inspect "$_VAULT_CID" --format '{{.State.Running}}' 2>/dev/null || echo false)" = "true" ] \
+            && _VAULT_ALREADY_RUNNING=1
+        _VAULT_RUNNING_IMAGE_ID=$(docker inspect "$_VAULT_CID" --format '{{.Image}}' 2>/dev/null || true)
+    fi
+    _VAULT_PULLED_IMAGE_ID=$(docker image inspect "$_VAULT_IMAGE_REF" --format '{{.Id}}' 2>/dev/null || true)
+
+    _VAULT_NEEDS_RECREATE=1
+    if [ "$_VAULT_ALREADY_RUNNING" = "1" ] && [ "$_VAULT_FRESH_BOOTSTRAP" != "1" ] \
+       && [ -n "$_VAULT_RUNNING_IMAGE_ID" ] && [ -n "$_VAULT_PULLED_IMAGE_ID" ] \
+       && [ "$_VAULT_RUNNING_IMAGE_ID" = "$_VAULT_PULLED_IMAGE_ID" ]; then
+        _VAULT_NEEDS_RECREATE=0
+    fi
+
+    if [ "$_VAULT_NEEDS_RECREATE" = "1" ]; then
+        (cd "${INSTALL_DIR}" && docker compose "${_VAULT_COMPOSE_ARGS[@]}" stop coderaft-vault 2>/dev/null || true)
+        (cd "${INSTALL_DIR}" && docker compose "${_VAULT_COMPOSE_ARGS[@]}" rm -f coderaft-vault 2>/dev/null || true)
+        (cd "${INSTALL_DIR}" && docker compose "${_VAULT_COMPOSE_ARGS[@]}" up -d coderaft-vault 2>/dev/null) || _VAULT_ROLLBACK
+    else
+        echo "  ✓ coderaft-vault already running with the current image — leaving it untouched (avoids resealing an already-unsealed vault)"
+    fi
 
     # Detect compose project name (determines Docker network for sidecar)
     _VAULT_PROJECT=$(docker inspect coderaft-coderaft-vault-1 \
@@ -1453,28 +1584,54 @@ VAULTOVERRIDE
         _VAULT_ROLLBACK
     fi
 
-    # B10 fix: unseal if sealed (1 share = base64-encoded age key file bytes)
+    # AUDIT-SECU-2026-08-04 (Vault H1): coderaft-vault no longer auto-unseals
+    # and no longer treats vault-keys/age.key as a submittable "share" — it
+    # requires a REAL Shamir ceremony (POST /v1/init once, then POST
+    # /v1/unseal with a threshold of the returned shares) that NO unattended
+    # script can complete, by design. A sealed vault at this point is
+    # EXPECTED, not a migration failure — it must NOT trigger a rollback
+    # (rollback here would tear down a perfectly good, already-backed-up-for,
+    # in-progress migration just because a human hasn't run the ceremony
+    # yet). Secret migration (4e-4h below) genuinely cannot proceed while
+    # sealed (every /v1/secret/set call would fail), so it is skipped this
+    # run — no .migrated sentinel is written, so a future update.sh run
+    # retries once an operator has unsealed it.
+    _VAULT_SEALED_SKIP_MIGRATION=0
     if [ "$_LAST_SEALED" = "true" ]; then
-        echo "  Vault is sealed — sending unseal request..."
-        _SHARE_B64=$(base64 < "${INSTALL_DIR}/vault-keys/age.key" | tr -d '\n')
-        _UNSEAL_BODY="{\"shares\":[\"${_SHARE_B64}\"]}"
-        _UNSEAL_RESP=$(_vault_curl_update "POST" "/v1/unseal" "$_UNSEAL_BODY" 2>/dev/null || true)
-        if ! echo "$_UNSEAL_RESP" | grep -qE '"ok"\s*:\s*true|"sealed"\s*:\s*false'; then
-            echo "  Unseal response: $_UNSEAL_RESP" >&2
-            _VAULT_ROLLBACK
-        fi
-        echo "  ✓ Vault unsealed"
+        _VAULT_SEALED_SKIP_MIGRATION=1
+        echo ""
+        echo "  ────────────────────────────────────────────────────────────────"
+        echo "  Vault is SEALED. This is expected — Coderaft Vault requires a"
+        echo "  real, human, multi-operator Shamir ceremony (default: 3 of 5"
+        echo "  shares) before it will hold or serve ANY secret. No script can"
+        echo "  complete this unattended, by design."
+        echo ""
+        echo "  Legacy secrets have NOT been migrated yet (this requires an"
+        echo "  unsealed vault) — they remain safely in their existing stores"
+        echo "  (.env / postgres / etc.), untouched. An operator must run:"
+        echo ""
+        echo "    # 1) ONE TIME ONLY per vault (skip if already run before):"
+        echo "    docker run --rm --user 0:0 --network ${_VAULT_NETWORK} \\"
+        echo "      -v \"${_ABS_TLS_DIR}\":/tls:ro curlimages/curl:latest \\"
+        echo "      --cert /tls/dashboard-api-client.crt --key /tls/dashboard-api-client.key \\"
+        echo "      --cacert /tls/client-ca.crt -sS -X POST https://coderaft-vault:8200/v1/init"
+        echo "    # -> WRITE DOWN the returned shares, one per operator, then:"
+        echo ""
+        echo "    # 2) EVERY time the vault starts sealed (every restart/reboot):"
+        echo "    docker run --rm --user 0:0 --network ${_VAULT_NETWORK} \\"
+        echo "      -v \"${_ABS_TLS_DIR}\":/tls:ro curlimages/curl:latest \\"
+        echo "      --cert /tls/dashboard-api-client.crt --key /tls/dashboard-api-client.key \\"
+        echo "      --cacert /tls/client-ca.crt -sS -X POST https://coderaft-vault:8200/v1/unseal \\"
+        echo "      -H 'Content-Type: application/json' -d '{\"shares\":[\"<share1>\",\"<share2>\",\"<share3>\"]}'"
+        echo ""
+        echo "  Then re-run this update script to finish migrating secrets into it."
+        echo "  ────────────────────────────────────────────────────────────────"
+        echo ""
+    else
+        echo "  ✓ coderaft-vault is already unsealed"
     fi
 
-    # Final health check — must say sealed:false
-    _FINAL_HEALTH=$(_vault_curl_update "GET" "/v1/health" 2>/dev/null || true)
-    if ! echo "$_FINAL_HEALTH" | grep -q '"sealed":false'; then
-        echo "  Final health: $_FINAL_HEALTH" >&2
-        echo "  ✗ Vault still sealed after unseal call" >&2
-        _VAULT_ROLLBACK
-    fi
-    echo "  ✓ coderaft-vault is healthy"
-
+if [ "$_VAULT_SEALED_SKIP_MIGRATION" = "0" ]; then
     # ── 4e Migrate secrets one at a time ─────────────────────────────────
     # B6 fix: NEVER use `docker compose exec coderaft-vault sh` — distroless image
     # has no shell. Use curlimages/curl sidecar (_vault_curl_update defined above).
@@ -1600,6 +1757,7 @@ VAULTOVERRIDE
     echo "  Legacy stores retained for 7-day grace period."
     echo "  The dashboard will show a banner to purge them after 7 days of stable operation."
     echo ""
+fi # _VAULT_SEALED_SKIP_MIGRATION
 fi
 
 _vault_gen_tls_update() {
@@ -1764,6 +1922,19 @@ _vault_acl_live_selfheal "falconone" "falconone.coderaft.local" \
     "read:falconone/pki/agents-ca/cert" "read:pki/falconone-agents-ca*" \
     "write:pki/falconone-agents-ca*" "read:falconone/scripts_ca*" \
     "write:falconone/scripts_ca*"
+
+# ── MantisStrike vault client cert + ACL self-heal (Phase 1 platform wiring,
+# same pattern as falconone above — including the live-vault reconciliation,
+# without which an already-bootstrapped vault would keep rejecting the
+# mantisstrike client cert with 401 forever, see _vault_acl_live_selfheal's
+# own header comment). mantisstrike's client cert does NOT already exist
+# (unlike redfox's, which piggy-backed on platform/identity/oidc from an
+# earlier release), so _vault_client_cert_selfheal is required here.
+_vault_client_cert_selfheal "mantisstrike" "mantisstrike.coderaft.local"
+_mantisstrike_acl_selfheal "${INSTALL_DIR}/vault-config/acl.yaml"
+_vault_acl_live_selfheal "mantisstrike" "mantisstrike.coderaft.local" \
+    "read:mantisstrike_*" "read:platform/identity/oidc" \
+    "read:platform/identity/graph-tools"
 
 # ── RedFox connections/k8s vault-backed credentials ACL self-heal ───────────
 # Zero-Knowledge Credential Architecture Palier 1 — see _redfox_acl_selfheal
