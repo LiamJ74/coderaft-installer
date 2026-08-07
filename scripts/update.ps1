@@ -2545,7 +2545,8 @@ if (Test-Path $envPlain) {
             $ageKeyFinalize = "C:\ProgramData\coderaft\age.key"
         }
         $sopsFinalizeCmd = Get-Command sops -ErrorAction SilentlyContinue
-        if (-not $sopsFinalizeCmd -and (Test-Path $ageKeyFinalize)) {
+        $sopsFinalizePath = if ($sopsFinalizeCmd) { $sopsFinalizeCmd.Path } else { $null }
+        if (-not $sopsFinalizePath -and (Test-Path $ageKeyFinalize)) {
             try {
                 # BUG (2026-08-07, found live on Liam's machine): v3.8.1 was
                 # never a real Windows arch fallback — the old
@@ -2566,18 +2567,27 @@ if (Test-Path $envPlain) {
                 # assets, which do) — sops-v3.13.1.amd64.exe /
                 # sops-v3.13.1.arm64.exe, confirmed both return HTTP 200.
                 $sopsFinalizeUrl = "https://github.com/getsops/sops/releases/download/v3.13.1/sops-v3.13.1.$finalizeArch.exe"
-                $sopsFinalizeDst = "C:\Windows\System32\sops.exe"
+                # BUG #2 (2026-08-07, found live right after fixing the 404
+                # above): C:\Windows\System32 requires admin elevation to
+                # write to — "irm|iex" one-liners run in a normal (non-
+                # elevated) PowerShell session for most users, so this ALWAYS
+                # failed with Access Denied for anyone not already running
+                # as admin. Download into $INSTALL_DIR instead (already
+                # writable — the whole install lives there) and reference it
+                # by full path directly rather than depending on PATH/
+                # Get-Command to find it afterward.
+                $sopsFinalizeDst = Join-Path $INSTALL_DIR "sops.exe"
                 Invoke-WebRequest -Uri $sopsFinalizeUrl -OutFile $sopsFinalizeDst -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
-                $sopsFinalizeCmd = Get-Command sops -ErrorAction SilentlyContinue
-                Write-DetailLog "[sops-finalize] sops.exe downloaded to $sopsFinalizeDst (found: $([bool]$sopsFinalizeCmd))"
+                if (Test-Path $sopsFinalizeDst) { $sopsFinalizePath = $sopsFinalizeDst }
+                Write-DetailLog "[sops-finalize] sops.exe downloaded to $sopsFinalizeDst (found: $([bool]$sopsFinalizePath))"
             } catch {
                 Write-Host "  [!] Could not auto-download sops.exe ($($_.Exception.Message.Trim())) — plaintext .env left in place." -ForegroundColor Yellow
                 Write-DetailLog "[sops-finalize] sops.exe download failed: $($_.Exception.Message)"
             }
         }
-        if ($sopsFinalizeCmd -and (Test-Path $ageKeyFinalize)) {
+        if ($sopsFinalizePath -and (Test-Path $ageKeyFinalize)) {
             $env:SOPS_AGE_KEY_FILE = $ageKeyFinalize
-            $decryptedFinalize = & $sopsFinalizeCmd.Path --decrypt --input-type dotenv --output-type dotenv $envEnc 2>$null
+            $decryptedFinalize = & $sopsFinalizePath --decrypt --input-type dotenv --output-type dotenv $envEnc 2>$null
             if ($decryptedFinalize) {
                 $plainNormFinalize   = (Get-Content $envPlain | Where-Object { $_ -notmatch '^\s*(#|$)' } | Sort-Object) -join "`n"
                 $decryptNormFinalize = ($decryptedFinalize | Where-Object { $_ -notmatch '^\s*(#|$)' } | Sort-Object) -join "`n"
