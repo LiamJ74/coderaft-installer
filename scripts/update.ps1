@@ -2547,9 +2547,25 @@ if (Test-Path $envPlain) {
         $sopsFinalizeCmd = Get-Command sops -ErrorAction SilentlyContinue
         if (-not $sopsFinalizeCmd -and (Test-Path $ageKeyFinalize)) {
             try {
-                Write-DetailLog "[sops-finalize] sops.exe not found on host — downloading v3.8.1 to finalize automatically"
-                $finalizeArch = if ([System.Environment]::Is64BitOperatingSystem) { "amd64" } else { "arm64" }
-                $sopsFinalizeUrl = "https://github.com/getsops/sops/releases/download/v3.8.1/sops-v3.8.1.windows.$finalizeArch.exe"
+                # BUG (2026-08-07, found live on Liam's machine): v3.8.1 was
+                # never a real Windows arch fallback — the old
+                # Is64BitOperatingSystem check mapped "not 64-bit" to
+                # "arm64", which is incoherent (ARM64 IS 64-bit; a genuine
+                # 32-bit host would need "386", not arm64) — and v3.8.1 itself
+                # is long gone from GitHub releases (404), while the rest of
+                # this codebase already standardized on v3.13.1 (F-024,
+                # 2026-06-21, newer Go stdlib). Reuse the arch this script
+                # already resolved into install-config.env instead of
+                # re-deriving it with a separate, wrong heuristic.
+                Write-DetailLog "[sops-finalize] sops.exe not found on host — downloading v3.13.1 to finalize automatically"
+                $finalizeArch = Get-InstallConfigVar "CODERAFT_HOST_ARCH"
+                if ($finalizeArch -notin @("amd64", "arm64")) { $finalizeArch = "amd64" }
+                # Verified directly against the real GitHub release assets
+                # (2026-08-07): sops's Windows .exe assets have NO ".windows."
+                # segment in the filename for this version (unlike the Linux
+                # assets, which do) — sops-v3.13.1.amd64.exe /
+                # sops-v3.13.1.arm64.exe, confirmed both return HTTP 200.
+                $sopsFinalizeUrl = "https://github.com/getsops/sops/releases/download/v3.13.1/sops-v3.13.1.$finalizeArch.exe"
                 $sopsFinalizeDst = "C:\Windows\System32\sops.exe"
                 Invoke-WebRequest -Uri $sopsFinalizeUrl -OutFile $sopsFinalizeDst -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
                 $sopsFinalizeCmd = Get-Command sops -ErrorAction SilentlyContinue
@@ -3221,6 +3237,130 @@ if ($v6Value -eq "1") {
     Write-Host "     Fix: docker compose stop dashboard-api ; docker compose up -d --force-recreate dashboard-api"
 } else {
     Write-Host "  ⚠  Could not read /proc/sys/net/ipv6/conf/all/disable_ipv6 (empty or non-Linux). Skipping IPv6 verify." -ForegroundColor Yellow
+}
+
+# ── B-OVERRIDE-RACE reconciliation pass (live incident 2026-08-07) ───────
+# ROOT CAUSE: the `docker compose up -d --force-recreate --remove-orphans`
+# call above computes its ENTIRE "what should exist" plan by reading
+# docker-compose.override.yml AS IT EXISTS ON DISK the instant the command
+# starts. dashboard-api — one of the containers THAT SAME command
+# (re)creates — regenerates that override file fresh on every boot
+# (server.js bootstrap()'s `app.listen(...)` callback, logging
+# "[dashboard-api] override.yml refreshed for products: ...") specifically
+# as a self-heal for stale overrides. But that regen only starts once the
+# new container's Node process is up — strictly AFTER this same
+# `docker compose up` invocation already read the OLD override, computed
+# its plan and executed it. With --remove-orphans, any product container
+# absent from that stale plan is removed, and nothing re-runs
+# `docker compose up` afterward to reconcile against the now-correct file.
+# CONFIRMED LIVE 2026-08-07 (Liam's Windows test machine): every product
+# container (entraguard-*, redfox-*, ravenscan*, falconone-*, neo4j) was
+# removed and never recreated after update.ps1; a second manual
+# `docker compose up -d` fixed it instantly — full recovery.
+#
+# Fix: wait for dashboard-api's own log line confirming its override.yml
+# regen has actually completed (bounded poll, not an assumption — the
+# HTTP health check above can return 200 before this async work in the
+# listen() callback finishes), then run `docker compose up -d` again
+# WITHOUT --force-recreate so it only creates/starts whatever the
+# corrected override adds, without needlessly recreating containers that
+# are already correctly running.
+Write-Host ""
+Write-Host "  Reconciliation pass: waiting for dashboard-api override.yml self-heal..."
+$overrideRefreshed = $false
+$reconcileTimeoutSec = 60
+$reconcilePollSec = 2
+$reconcileElapsed = 0
+while ($reconcileElapsed -lt $reconcileTimeoutSec) {
+    $logOut = Join-Path $env:TEMP "coderaft-reconcile-log-$(Get-Random).log"
+    $logErr = Join-Path $env:TEMP "coderaft-reconcile-log-err-$(Get-Random).log"
+    # `docker compose logs <service>` (not `docker logs <container>`) so this
+    # resolves the container purely from the service name — independent of
+    # $projectPrefix / COMPOSE_PROJECT_NAME naming, and consistent with
+    # update.sh's equivalent poll.
+    $logProc = Start-Process -FilePath "docker" -ArgumentList (@() + $ComposeArgs + @("logs", "dashboard-api")) `
+        -NoNewWindow -PassThru `
+        -RedirectStandardOutput $logOut `
+        -RedirectStandardError  $logErr `
+        -ErrorAction SilentlyContinue
+    if ($logProc -and -not $logProc.WaitForExit(15000)) {   # 15s
+        try { $logProc.Kill() } catch {}
+    }
+    # `docker logs` writes container stdout/stderr to BOTH our stdout and
+    # stderr redirection depending on how the app wrote it — console.log
+    # goes to the container's stdout, but check both temp files regardless.
+    $logContent = ""
+    if (Test-Path $logOut) { $logContent += (Get-Content $logOut -Raw -ErrorAction SilentlyContinue) }
+    if (Test-Path $logErr) { $logContent += (Get-Content $logErr -Raw -ErrorAction SilentlyContinue) }
+    Remove-Item -Path $logOut, $logErr -ErrorAction SilentlyContinue
+    if ($logContent -and $logContent.Contains("override.yml refreshed for products:")) {
+        $overrideRefreshed = $true
+        break
+    }
+    Start-Sleep -Seconds $reconcilePollSec
+    $reconcileElapsed += $reconcilePollSec
+}
+
+if ($overrideRefreshed) {
+    Write-Host "  ✓ dashboard-api override.yml self-heal confirmed."
+} else {
+    Write-Host "  ⚠  Timed out after ${reconcileTimeoutSec}s waiting for dashboard-api's override.yml self-heal log line." -ForegroundColor Yellow
+    Write-Host "     This is EXPECTED if no license/products are configured yet (nothing to regenerate)." -ForegroundColor Yellow
+    Write-Host "     Otherwise, product containers may still be down — proceeding with reconciliation anyway." -ForegroundColor Yellow
+}
+
+# Snapshot running services before reconciling so we only report what
+# actually changed, instead of spamming already-healthy installs.
+$preReconcileOut = Join-Path $env:TEMP "coderaft-prerec-out-$(Get-Random).log"
+$preReconcileErr = Join-Path $env:TEMP "coderaft-prerec-err-$(Get-Random).log"
+$preProc = Start-Process -FilePath "docker" -ArgumentList (@() + $ComposeArgs + @("ps","--services","--filter","status=running")) `
+    -NoNewWindow -PassThru `
+    -RedirectStandardOutput $preReconcileOut `
+    -RedirectStandardError  $preReconcileErr `
+    -ErrorAction SilentlyContinue
+if ($preProc -and -not $preProc.WaitForExit(30000)) { try { $preProc.Kill() } catch {} }
+$preRunning = @((Get-Content $preReconcileOut -ErrorAction SilentlyContinue) | Where-Object { $_ })
+Remove-Item -Path $preReconcileOut, $preReconcileErr -ErrorAction SilentlyContinue
+
+Write-Host "  Reconciliation pass: docker compose up -d (no --force-recreate)..."
+$reconcileUpOut = Join-Path $env:TEMP "coderaft-reconcile-up-out-$(Get-Random).log"
+$reconcileUpErr = Join-Path $env:TEMP "coderaft-reconcile-up-err-$(Get-Random).log"
+$reconcileUpProc = Start-Process -FilePath "docker" -ArgumentList (@() + $ComposeArgs + @("up","-d")) `
+    -NoNewWindow -PassThru `
+    -RedirectStandardOutput $reconcileUpOut `
+    -RedirectStandardError  $reconcileUpErr `
+    -ErrorAction SilentlyContinue
+if ($reconcileUpProc -and -not $reconcileUpProc.WaitForExit(180000)) {   # 3min
+    Write-Host "  ⚠  Reconciliation 'docker compose up -d' timed out after 180s." -ForegroundColor Yellow
+    try { $reconcileUpProc.Kill() } catch {}
+}
+$reconcileExit = if ($reconcileUpProc) { $reconcileUpProc.ExitCode } else { -1 }
+$reconcileUpLog = ""
+if (Test-Path $reconcileUpErr) { $reconcileUpLog = (Get-Content $reconcileUpErr -Raw -ErrorAction SilentlyContinue) }
+Remove-Item -Path $reconcileUpOut, $reconcileUpErr -ErrorAction SilentlyContinue
+
+if ($reconcileExit -ne 0) {
+    Write-Host "  ⚠  Reconciliation 'docker compose up -d' exited with code $reconcileExit." -ForegroundColor Yellow
+    if ($reconcileUpLog) { Write-Host "     $reconcileUpLog" -ForegroundColor Yellow }
+    Write-Host "     Manual fix: cd `"$INSTALL_DIR`" ; docker compose up -d" -ForegroundColor Yellow
+} else {
+    $postReconcileOut = Join-Path $env:TEMP "coderaft-postrec-out-$(Get-Random).log"
+    $postReconcileErr = Join-Path $env:TEMP "coderaft-postrec-err-$(Get-Random).log"
+    $postProc = Start-Process -FilePath "docker" -ArgumentList (@() + $ComposeArgs + @("ps","--services","--filter","status=running")) `
+        -NoNewWindow -PassThru `
+        -RedirectStandardOutput $postReconcileOut `
+        -RedirectStandardError  $postReconcileErr `
+        -ErrorAction SilentlyContinue
+    if ($postProc -and -not $postProc.WaitForExit(30000)) { try { $postProc.Kill() } catch {} }
+    $postRunning = @((Get-Content $postReconcileOut -ErrorAction SilentlyContinue) | Where-Object { $_ })
+    Remove-Item -Path $postReconcileOut, $postReconcileErr -ErrorAction SilentlyContinue
+
+    $newlyStarted = @($postRunning | Where-Object { $preRunning -notcontains $_ })
+    if ($newlyStarted.Count -gt 0) {
+        Write-Host "  ✓ Reconciliation pass started $($newlyStarted.Count) additional container(s): $($newlyStarted -join ', ')" -ForegroundColor Green
+    } else {
+        Write-Host "  ✓ Reconciliation pass: nothing to reconcile, all services already up to date."
+    }
 }
 
 # ── Post-update notification ──────────────────────────────────────────────

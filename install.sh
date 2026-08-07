@@ -49,7 +49,7 @@ set -e
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.sh/install.sh.sha256 at all — today it still proxies
 # the legacy `coderaft-installer` repo.
-EXPECTED_SHA256="57b0fccd63b1a47956ce37a0c3eb3a37c794534c276e00c33a4724dbe2f2a4c7"
+EXPECTED_SHA256="8399334643dae39499e3bff534e771bdd89fab8e35f6ccc14437c8dd6897cea0"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -2360,6 +2360,20 @@ curl -fsSL "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/
 #!/bin/bash
 echo "Updating CodeRaft..."
 docker compose --env-file install-config.env --env-file .env pull && docker compose --env-file install-config.env --env-file .env up -d --force-recreate --remove-orphans
+# Reconciliation pass (mirrors the fix in the real update.sh, B-OVERRIDE-RACE
+# 2026-08-07): dashboard-api regenerates docker-compose.override.yml on its
+# own boot as a self-heal for stale product lists, but that happens AFTER
+# the 'up' above already computed its plan from the OLD file, so
+# --remove-orphans can silently drop product containers with nothing left
+# to bring them back. Wait for dashboard-api's own confirmation log line,
+# then re-run 'up -d' (no --force-recreate) so anything the corrected
+# override adds gets created without needlessly recreating what already
+# runs.
+for i in $(seq 1 30); do
+    docker compose --env-file install-config.env --env-file .env logs dashboard-api 2>&1 | grep -q "override.yml refreshed for products:" && break
+    sleep 2
+done
+docker compose --env-file install-config.env --env-file .env up -d
 echo "  Updated! Dashboard: http://localhost:3000"
 EOF
 

@@ -2255,6 +2255,78 @@ if [ "$HEALTH_OK" -ne 0 ]; then
     exit 1
 fi
 
+# ── B-OVERRIDE-RACE reconciliation pass (live incident 2026-08-07) ───────
+# ROOT CAUSE: the `docker compose up -d --force-recreate --remove-orphans`
+# call above computes its ENTIRE "what should exist" plan by reading
+# docker-compose.override.yml AS IT EXISTS ON DISK the instant the command
+# starts. dashboard-api — one of the containers THAT SAME command
+# (re)creates — regenerates that override file fresh on every boot
+# (server.js bootstrap()'s `app.listen(...)` callback, logging
+# "[dashboard-api] override.yml refreshed for products: ...") specifically
+# as a self-heal for stale overrides. But that regen only starts once the
+# new container's Node process is up — strictly AFTER this same
+# `docker compose up` invocation already read the OLD override, computed
+# its plan and executed it. With --remove-orphans, any product container
+# absent from that stale plan is removed, and nothing re-runs
+# `docker compose up` afterward to reconcile against the now-correct file.
+# CONFIRMED LIVE 2026-08-07 (Liam's Windows test machine, ported here for
+# parity — same architecture on both scripts): every product container
+# (entraguard-*, redfox-*, ravenscan*, falconone-*, neo4j) was removed and
+# never recreated after update; a second manual `docker compose up -d`
+# fixed it instantly — full recovery.
+#
+# Fix: wait for dashboard-api's own log line confirming its override.yml
+# regen has actually completed (bounded poll, not an assumption — the
+# HTTP health check above can return 200 before this async work in the
+# listen() callback finishes), then run `docker compose up -d` again
+# WITHOUT --force-recreate so it only creates/starts whatever the
+# corrected override adds, without needlessly recreating containers that
+# are already correctly running.
+echo ""
+echo "  Reconciliation pass: waiting for dashboard-api override.yml self-heal..."
+RECONCILE_TIMEOUT=60
+RECONCILE_POLL=2
+RECONCILE_ELAPSED=0
+OVERRIDE_REFRESHED=1   # 1 = false, 0 = true (shell exit-code convention)
+while [ "$RECONCILE_ELAPSED" -lt "$RECONCILE_TIMEOUT" ]; do
+    if docker compose "${COMPOSE_ARGS[@]}" logs dashboard-api 2>&1 | grep -q "override.yml refreshed for products:"; then
+        OVERRIDE_REFRESHED=0
+        break
+    fi
+    sleep "$RECONCILE_POLL"
+    RECONCILE_ELAPSED=$((RECONCILE_ELAPSED + RECONCILE_POLL))
+done
+
+if [ "$OVERRIDE_REFRESHED" -eq 0 ]; then
+    echo "  Dashboard-api override.yml self-heal confirmed."
+else
+    echo "  [warn] Timed out after ${RECONCILE_TIMEOUT}s waiting for dashboard-api's override.yml self-heal log line."
+    echo "  This is EXPECTED if no license/products are configured yet (nothing to regenerate)."
+    echo "  Otherwise, product containers may still be down — proceeding with reconciliation anyway."
+fi
+
+# Snapshot running services before reconciling so we only report what
+# actually changed, instead of spamming already-healthy installs.
+PRE_RECONCILE_RUNNING=$(docker compose "${COMPOSE_ARGS[@]}" ps --services --filter status=running 2>/dev/null || true)
+
+echo "  Reconciliation pass: docker compose up -d (no --force-recreate)..."
+RECONCILE_EXIT=0
+docker compose "${COMPOSE_ARGS[@]}" up -d || RECONCILE_EXIT=$?
+
+if [ "$RECONCILE_EXIT" -ne 0 ]; then
+    echo "  [warn] Reconciliation 'docker compose up -d' exited with code $RECONCILE_EXIT."
+    echo "  Manual fix: cd \"$INSTALL_DIR\" && docker compose up -d"
+else
+    POST_RECONCILE_RUNNING=$(docker compose "${COMPOSE_ARGS[@]}" ps --services --filter status=running 2>/dev/null || true)
+    NEWLY_STARTED=$(comm -13 <(echo "$PRE_RECONCILE_RUNNING" | sort) <(echo "$POST_RECONCILE_RUNNING" | sort) | grep -v '^$' || true)
+    if [ -n "$NEWLY_STARTED" ]; then
+        NEWLY_STARTED_LIST=$(echo "$NEWLY_STARTED" | paste -sd, -)
+        echo "  Reconciliation pass started additional container(s): $NEWLY_STARTED_LIST"
+    else
+        echo "  Reconciliation pass: nothing to reconcile, all services already up to date."
+    fi
+fi
+
 # ── Post-update notification ──────────────────────────────────────────────
 if [ -n "$ADMIN_TOKEN" ]; then
     curl -fsS -X POST "$DASHBOARD_API/api/platform/update/notify" \
