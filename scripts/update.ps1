@@ -464,6 +464,19 @@ if (-not $env:CODERAFT_UPDATE_REEXEC) {
         Start-Sleep -Seconds 1
         $env:CODERAFT_UPDATE_REEXEC = "1"
         & $PSBin -NoProfile -ExecutionPolicy Bypass -File ".\update.ps1"
+        # BUG (2026-08-07, found live — every re-test in the same PowerShell
+        # window after the FIRST self-update silently ran a stale on-disk
+        # copy forever): $env:CODERAFT_UPDATE_REEXEC is process-wide state,
+        # not scoped to this one invocation. The child process spawned above
+        # gets its own independent copy of the environment at spawn time (as
+        # every OS child process does) and needed it set to "1" to avoid
+        # looping — but by the time `& $PSBin ...` returns here, that child
+        # has already run to completion and exited, so clearing OUR OWN
+        # (parent) copy now cannot affect it. Without this, THIS interactive
+        # shell session would never self-update again, since every future
+        # `.\update.ps1` run in the same window would see the guard still
+        # set and skip the check — exactly what happened live today.
+        Remove-Item Env:\CODERAFT_UPDATE_REEXEC -ErrorAction SilentlyContinue
         return  # not 'exit' — irm|iex runs this in the caller's own scope, so exit would close their whole shell
     }
 }
