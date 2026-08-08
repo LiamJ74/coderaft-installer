@@ -44,6 +44,63 @@ $HEALTHCHECK_RETRIES = if ($env:HEALTHCHECK_RETRIES) { [int]$env:HEALTHCHECK_RET
 $HEALTHCHECK_DELAY   = if ($env:HEALTHCHECK_DELAY)   { [int]$env:HEALTHCHECK_DELAY }   else { 3 }
 $INSTALL_DIR         = if ($env:INSTALL_DIR)         { $env:INSTALL_DIR }         else { (Get-Location).Path }
 
+# ── Backup rotation (security hardening, 2026-07-31) ────────────────────────
+# Every self-heal path below does Copy-Item $X "$X.bak-<tag>-<timestamp>"
+# before touching $X — acl.yaml, docker-compose.yml, docker-compose.override.yml
+# (plus one "docker-compose.override.yml.broken-<timestamp>" corruption
+# backup with a different separator). On a deployment that runs unattended
+# for months/years across many update.ps1 runs, these accumulate without
+# bound. Keep only the $Keep most recent (default 5) matching $GlobSuffix
+# under $BasePath's name; delete anything older. Safe/idempotent: a no-op
+# when there are $Keep or fewer, or none at all.
+#
+# Defined here (before Repair-InstallConfigCorruption and every other
+# self-heal block) because — unlike most scripting languages — PowerShell
+# does NOT hoist top-level `function` statements in a plain .ps1 script:
+# a function must already have executed its `function Name {...}` statement
+# before anything can call it. Verified empirically (a forward-reference
+# call throws "term is not recognized"), so this definition was moved up
+# from its previous spot further down the script instead of relying on
+# call-before-define.
+function Invoke-RotateBackups {
+    param(
+        [Parameter(Mandatory = $true)][string]$BasePath,
+        [int]$Keep = 5,
+        [string]$GlobSuffix = "bak-*",
+        # Full literal Get-ChildItem -Filter, overrides the "$leaf.$GlobSuffix"
+        # composition below. Needed for backup families whose naming doesn't
+        # follow the "<name>.<suffix>" convention — e.g. the encrypted SQL
+        # pre-update dumps, named "preupdate-<timestamp>.sql.age" (timestamp
+        # is embedded mid-name via a dash, not appended as a dot-suffix).
+        [string]$Filter = $null
+    )
+    $dir = Split-Path -Path $BasePath -Parent
+    if ([string]::IsNullOrEmpty($dir)) { $dir = "." }
+    $leaf = Split-Path -Path $BasePath -Leaf
+    $effectiveFilter = if ($Filter) { $Filter } else { "$leaf.$GlobSuffix" }
+    $backups = Get-ChildItem -LiteralPath $dir -Filter $effectiveFilter -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending
+    if ($backups -and $backups.Count -gt $Keep) {
+        $backups | Select-Object -Skip $Keep | ForEach-Object {
+            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# ── Self-heal backup directory (root-directory decluttering, 2026-08-07) ──
+# All the timestamped self-heal safety copies above (docker-compose.yml.bak-*,
+# docker-compose.override.yml.bak-*/.broken-*, acl.yaml.bak-*, plus the rare
+# install-config.env.bak-corrupt-*) used to land directly in $INSTALL_DIR,
+# right next to docker-compose.yml/.env/etc. Real customer feedback from live
+# testing: "a lot of pollution on disk" for a product marketed as
+# banking-grade. Moved into one dedicated, out-of-the-way subdirectory —
+# retention (Invoke-RotateBackups above, keep-last-N) is unchanged, only the
+# base path each backup family lives under moves. The live docker-compose.yml
+# / docker-compose.override.yml / vault-config/acl.yaml files themselves are
+# NOT moved (Docker Compose and the vault need them at their existing paths).
+$SELF_HEAL_BACKUP_DIR = Join-Path $INSTALL_DIR ".backups\self-heal"
+New-Item -ItemType Directory -Force -Path $SELF_HEAL_BACKUP_DIR -ErrorAction SilentlyContinue | Out-Null
+
 # ── install-config.env: install-time / public config, NEVER encrypted ──────
 # Task #150 (2026-07-31): HOST_PROJECT_DIR / CODERAFT_HOST_OS / CODERAFT_HOST_ARCH
 # are not secrets. They used to be written straight into .env (then swept into
@@ -124,11 +181,14 @@ function Repair-InstallConfigCorruption {
     }
     if (-not $corruptedFound) { return }
     $ts = Get-Date -Format "yyyyMMddTHHmmssZ"
-    Copy-Item -LiteralPath $Path -Destination "$Path.bak-corrupt-$ts" -ErrorAction SilentlyContinue
+    $corruptLeaf = Split-Path -Leaf $Path
+    $corruptBak = Join-Path $script:SELF_HEAL_BACKUP_DIR "$corruptLeaf.bak-corrupt-$ts"
+    Copy-Item -LiteralPath $Path -Destination $corruptBak -ErrorAction SilentlyContinue
+    Invoke-RotateBackups -BasePath (Join-Path $script:SELF_HEAL_BACKUP_DIR $corruptLeaf) -GlobSuffix "bak-corrupt-*"
     $newLines = @($clean.Keys | ForEach-Object { "$_=$($clean[$_])" })
     [System.IO.File]::WriteAllText($Path, (($newLines -join "`n") + "`n"), [System.Text.UTF8Encoding]::new($false))
     Write-Host "  ⚠ install-config.env was corrupted (concatenated values from a known PowerShell array/string bug, now fixed) — repaired automatically." -ForegroundColor Yellow
-    Write-Host "    Backup of the corrupted file: $Path.bak-corrupt-$ts"
+    Write-Host "    Backup of the corrupted file: $corruptBak"
 }
 Repair-InstallConfigCorruption -Path $INSTALL_CONFIG_PATH
 
@@ -160,32 +220,8 @@ try {
         Remove-Item -Force -ErrorAction SilentlyContinue
 } catch { }
 
-# ── Backup rotation (security hardening, 2026-07-31) ────────────────────────
-# Every self-heal path below does Copy-Item $X "$X.bak-<tag>-<timestamp>"
-# before touching $X — acl.yaml, docker-compose.yml, docker-compose.override.yml
-# (plus one "docker-compose.override.yml.broken-<timestamp>" corruption
-# backup with a different separator). On a deployment that runs unattended
-# for months/years across many update.ps1 runs, these accumulate without
-# bound. Keep only the $Keep most recent (default 5) matching $GlobSuffix
-# under $BasePath's name; delete anything older. Safe/idempotent: a no-op
-# when there are $Keep or fewer, or none at all.
-function Invoke-RotateBackups {
-    param(
-        [Parameter(Mandatory = $true)][string]$BasePath,
-        [int]$Keep = 5,
-        [string]$GlobSuffix = "bak-*"
-    )
-    $dir = Split-Path -Path $BasePath -Parent
-    if ([string]::IsNullOrEmpty($dir)) { $dir = "." }
-    $leaf = Split-Path -Path $BasePath -Leaf
-    $backups = Get-ChildItem -LiteralPath $dir -Filter "$leaf.$GlobSuffix" -File -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending
-    if ($backups -and $backups.Count -gt $Keep) {
-        $backups | Select-Object -Skip $Keep | ForEach-Object {
-            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
-        }
-    }
-}
+# (Invoke-RotateBackups moved up above — right after $INSTALL_DIR — so it's
+# defined before Repair-InstallConfigCorruption, which now also uses it.)
 function Remove-FromMainEnv($Key) {
     $envPath = Join-Path $INSTALL_DIR ".env"
     if (Test-Path $envPath) {
@@ -521,9 +557,9 @@ if (Test-Path $composePath) {
     $oldDep = 'coderaft-vault: { condition: service_healthy }'
     $newDep = 'coderaft-vault: { condition: service_started }'
     if ($composeText.Contains($oldDep)) {
-        $bak = "$composePath.bak-" + (Get-Date -Format "yyyyMMdd_HHmmss")
+        $bak = Join-Path $SELF_HEAL_BACKUP_DIR ((Split-Path -Leaf $composePath) + ".bak-" + (Get-Date -Format "yyyyMMdd_HHmmss"))
         try { Copy-Item -LiteralPath $composePath -Destination $bak -Force -ErrorAction SilentlyContinue } catch {}
-        Invoke-RotateBackups -BasePath $composePath
+        Invoke-RotateBackups -BasePath (Join-Path $SELF_HEAL_BACKUP_DIR (Split-Path -Leaf $composePath))
         $composeText = $composeText.Replace($oldDep, $newDep)
         [System.IO.File]::WriteAllText($composePath, $composeText, [System.Text.UTF8Encoding]::new($false))
         Write-Host "  ✓ Self-heal docker-compose.yml — coderaft-vault: service_healthy → service_started"
@@ -546,14 +582,14 @@ $composePathB15 = Join-Path $INSTALL_DIR "docker-compose.yml"
 if (Test-Path $composePathB15) {
     $composeTextB15 = [System.IO.File]::ReadAllText($composePathB15, [System.Text.UTF8Encoding]::new($false))
     if ($composeTextB15 -notmatch 'NODE_OPTIONS=--dns-result-order=ipv4first') {
-        $bakB15 = "$composePathB15.bak-" + (Get-Date -Format "yyyyMMddHHmmss")
+        $bakB15 = Join-Path $SELF_HEAL_BACKUP_DIR ((Split-Path -Leaf $composePathB15) + ".bak-" + (Get-Date -Format "yyyyMMddHHmmss"))
         $patched = $false
 
         # Path A — literal marker (fast path, works on stock installs)
         $marker = '      - LICENSE_SERVER_URL=https://license.coderaft.io'
         if ($composeTextB15.Contains($marker)) {
             try { Copy-Item -LiteralPath $composePathB15 -Destination $bakB15 -Force -ErrorAction SilentlyContinue } catch {}
-            Invoke-RotateBackups -BasePath $composePathB15
+            Invoke-RotateBackups -BasePath (Join-Path $SELF_HEAL_BACKUP_DIR (Split-Path -Leaf $composePathB15))
             $replacement = '      - NODE_OPTIONS=--dns-result-order=ipv4first' + "`n" + $marker
             $idx = $composeTextB15.IndexOf($marker)
             $composeTextB15 = $composeTextB15.Substring(0, $idx) + $replacement + $composeTextB15.Substring($idx + $marker.Length)
@@ -571,7 +607,7 @@ if (Test-Path $composePathB15) {
             $m = [regex]::Match($composeTextB15, $pattern)
             if ($m.Success) {
                 try { Copy-Item -LiteralPath $composePathB15 -Destination $bakB15 -Force -ErrorAction SilentlyContinue } catch {}
-                Invoke-RotateBackups -BasePath $composePathB15
+                Invoke-RotateBackups -BasePath (Join-Path $SELF_HEAL_BACKUP_DIR (Split-Path -Leaf $composePathB15))
                 $envIndent = $m.Groups[1].Value + $m.Groups[2].Value
                 $insertion = $envIndent + '  - NODE_OPTIONS=--dns-result-order=ipv4first' + "`n"
                 $endOfEnvLine = $m.Index + $m.Length
@@ -655,9 +691,15 @@ if (Test-Path $composePathB15) {
             [void]$out.Add($ln)
         }
         if ($sysAdded) {
-            $bakIP6 = "$composePathB15.bak-ipv6-" + (Get-Date -Format "yyyyMMddHHmmss")
+            $bakIP6 = Join-Path $SELF_HEAL_BACKUP_DIR ((Split-Path -Leaf $composePathB15) + ".bak-ipv6-" + (Get-Date -Format "yyyyMMddHHmmss"))
             try { Copy-Item -LiteralPath $composePathB15 -Destination $bakIP6 -Force -ErrorAction SilentlyContinue } catch {}
-            Invoke-RotateBackups -BasePath $composePathB15
+            # No -GlobSuffix override: matches original behavior, where this
+            # shares ONE "docker-compose.yml.bak-*" rotation pool (keep last 5
+            # total) with every other docker-compose.yml self-heal reason below
+            # (vault-dep, NODE_OPTIONS, tmpfs, pgsecret, cve-proxy) — all their
+            # backup names start with "bak-", so the default glob "bak-*"
+            # already covers all of them together, same as before this change.
+            Invoke-RotateBackups -BasePath (Join-Path $SELF_HEAL_BACKUP_DIR (Split-Path -Leaf $composePathB15))
             [System.IO.File]::WriteAllLines($composePathB15, $out, [System.Text.UTF8Encoding]::new($false))
             Write-Host "  ✓ Self-heal docker-compose.yml — sysctls IPv6 kill ajouté à dashboard-api"
         }
@@ -679,9 +721,9 @@ if (Test-Path $ComposePathTmpfs) {
     $ComposeTextTmpfs = [System.IO.File]::ReadAllText($ComposePathTmpfs, [System.Text.UTF8Encoding]::new($false))
     $TmpfsMarker = "      - ./vault-tls/dashboard-api-client.key:/vault-tls/dashboard-api-client.key:ro"
     if (($ComposeTextTmpfs -notmatch [regex]::Escape('/run/coderaft-env')) -and $ComposeTextTmpfs.Contains($TmpfsMarker)) {
-        $BakTmpfs = "$ComposePathTmpfs.bak-tmpfsenv-" + (Get-Date -Format "yyyyMMddHHmmss")
+        $BakTmpfs = Join-Path $SELF_HEAL_BACKUP_DIR ((Split-Path -Leaf $ComposePathTmpfs) + ".bak-tmpfsenv-" + (Get-Date -Format "yyyyMMddHHmmss"))
         try { Copy-Item -LiteralPath $ComposePathTmpfs -Destination $BakTmpfs -Force -ErrorAction SilentlyContinue } catch {}
-        Invoke-RotateBackups -BasePath $ComposePathTmpfs
+        Invoke-RotateBackups -BasePath (Join-Path $SELF_HEAL_BACKUP_DIR (Split-Path -Leaf $ComposePathTmpfs))
         $TmpfsReplacement = $TmpfsMarker + "`n    tmpfs:`n      - /run/coderaft-env:size=1m,mode=0700,uid=0"
         $idxTmpfs = $ComposeTextTmpfs.IndexOf($TmpfsMarker)
         $ComposeTextTmpfs = $ComposeTextTmpfs.Substring(0, $idxTmpfs) + $TmpfsReplacement + $ComposeTextTmpfs.Substring($idxTmpfs + $TmpfsMarker.Length)
@@ -707,9 +749,9 @@ if (Test-Path $ComposePathPgSecret) {
     $ComposeTextPgSecret = [System.IO.File]::ReadAllText($ComposePathPgSecret, [System.Text.UTF8Encoding]::new($false))
     $PgPwMarker = '      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}'
     if ($ComposeTextPgSecret.Contains($PgPwMarker) -and ($ComposeTextPgSecret -notmatch [regex]::Escape('POSTGRES_PASSWORD_FILE'))) {
-        $BakPgSecret = "$ComposePathPgSecret.bak-pgsecret-" + (Get-Date -Format "yyyyMMddHHmmss")
+        $BakPgSecret = Join-Path $SELF_HEAL_BACKUP_DIR ((Split-Path -Leaf $ComposePathPgSecret) + ".bak-pgsecret-" + (Get-Date -Format "yyyyMMddHHmmss"))
         try { Copy-Item -LiteralPath $ComposePathPgSecret -Destination $BakPgSecret -Force -ErrorAction SilentlyContinue } catch {}
-        Invoke-RotateBackups -BasePath $ComposePathPgSecret
+        Invoke-RotateBackups -BasePath (Join-Path $SELF_HEAL_BACKUP_DIR (Split-Path -Leaf $ComposePathPgSecret))
 
         $SecretsDirPg = Join-Path $INSTALL_DIR "secrets"
         New-Item -ItemType Directory -Force -Path $SecretsDirPg | Out-Null
@@ -763,9 +805,9 @@ $overridePath = Join-Path $INSTALL_DIR "docker-compose.override.yml"
 if (Test-Path $overridePath) {
     $overrideText = [System.IO.File]::ReadAllText($overridePath, [System.Text.UTF8Encoding]::new($false))
     if ($overrideText -match '"7687:7687"|- 7687:7687') {
-        $bak2 = "$overridePath.bak-" + (Get-Date -Format "yyyyMMdd_HHmmss")
+        $bak2 = Join-Path $SELF_HEAL_BACKUP_DIR ((Split-Path -Leaf $overridePath) + ".bak-" + (Get-Date -Format "yyyyMMdd_HHmmss"))
         try { Copy-Item -LiteralPath $overridePath -Destination $bak2 -Force -ErrorAction SilentlyContinue } catch {}
-        Invoke-RotateBackups -BasePath $overridePath
+        Invoke-RotateBackups -BasePath (Join-Path $SELF_HEAL_BACKUP_DIR (Split-Path -Leaf $overridePath))
         $overrideText = $overrideText -replace '"7687:7687"', '"127.0.0.1:${NEO4J_BOLT_PORT:-7687}:7687"'
         $overrideText = $overrideText -replace '- 7687:7687', '- "127.0.0.1:${NEO4J_BOLT_PORT:-7687}:7687"'
         [System.IO.File]::WriteAllText($overridePath, $overrideText, [System.Text.UTF8Encoding]::new($false))
@@ -789,9 +831,9 @@ if (Test-Path $composePathCveProxy) {
         if ($cveProxyLines[$i] -match '^\s*postgres:\s*$') { $postgresLineIdx = $i; break }
     }
     if (-not $hasCveProxy -and $postgresLineIdx -ge 0) {
-        $bakCveProxy = "$composePathCveProxy.bak-cveproxy-" + (Get-Date -Format "yyyyMMddHHmmss")
+        $bakCveProxy = Join-Path $SELF_HEAL_BACKUP_DIR ((Split-Path -Leaf $composePathCveProxy) + ".bak-cveproxy-" + (Get-Date -Format "yyyyMMddHHmmss"))
         try { Copy-Item -LiteralPath $composePathCveProxy -Destination $bakCveProxy -Force -ErrorAction SilentlyContinue } catch {}
-        Invoke-RotateBackups -BasePath $composePathCveProxy
+        Invoke-RotateBackups -BasePath (Join-Path $SELF_HEAL_BACKUP_DIR (Split-Path -Leaf $composePathCveProxy))
         $cveProxyBlock = @(
             "  # ── coderaft-cve-proxy ───────────────────────────────────────────────────"
             "  # Internal sidecar in front of the shared coderaft-cve-engine"
@@ -884,9 +926,9 @@ try {
 if (-not $composeOK) {
     Write-Host "  ⚠ docker-compose.override.yml appears corrupted — auto-recovery..."
     if (Test-Path "docker-compose.override.yml") {
-        $brokenBak = "docker-compose.override.yml.broken-" + (Get-Date -Format "yyyyMMdd_HHmmss")
+        $brokenBak = Join-Path $SELF_HEAL_BACKUP_DIR ("docker-compose.override.yml.broken-" + (Get-Date -Format "yyyyMMdd_HHmmss"))
         try { Copy-Item "docker-compose.override.yml" $brokenBak -ErrorAction SilentlyContinue } catch { }
-        Invoke-RotateBackups -BasePath "docker-compose.override.yml" -GlobSuffix "broken-*"
+        Invoke-RotateBackups -BasePath (Join-Path $SELF_HEAL_BACKUP_DIR "docker-compose.override.yml") -GlobSuffix "broken-*"
         try { Remove-Item "docker-compose.override.yml" -ErrorAction SilentlyContinue } catch { }
         Write-Host "    ✓ override backed up + removed"
     }
@@ -1078,7 +1120,13 @@ function Invoke-FalconOneAclSelfHeal {
     $ts = Get-Date -Format "yyyyMMddTHHmmssZ"
 
     if ($blockStart -eq -1) {
-        Copy-Item -LiteralPath $AclPath -Destination "${AclPath}.bak-${ts}"
+        $aclBakLeaf = Split-Path -Leaf $AclPath
+        Copy-Item -LiteralPath $AclPath -Destination (Join-Path $script:SELF_HEAL_BACKUP_DIR "$aclBakLeaf.bak-${ts}")
+        # BUG FIX (2026-08-07): unlike its update.sh counterpart (which calls
+        # `_rotate_backups "$acl_path"` right after every `cp`), this Copy-Item
+        # never had a matching Invoke-RotateBackups call — acl.yaml backups
+        # accumulated without bound on Windows specifically. Fixed here.
+        Invoke-RotateBackups -BasePath (Join-Path $script:SELF_HEAL_BACKUP_DIR $aclBakLeaf)
         $newBlock = @'
 
   - name: falconone
@@ -1115,7 +1163,13 @@ function Invoke-FalconOneAclSelfHeal {
         return
     }
 
-    Copy-Item -LiteralPath $AclPath -Destination "${AclPath}.bak-${ts}"
+    $aclBakLeaf = Split-Path -Leaf $AclPath
+    Copy-Item -LiteralPath $AclPath -Destination (Join-Path $script:SELF_HEAL_BACKUP_DIR "$aclBakLeaf.bak-${ts}")
+    # BUG FIX (2026-08-07): unlike its update.sh counterpart (which calls
+    # `_rotate_backups "$acl_path"` right after every `cp`), this Copy-Item
+    # never had a matching Invoke-RotateBackups call — acl.yaml backups
+    # accumulated without bound on Windows specifically. Fixed here.
+    Invoke-RotateBackups -BasePath (Join-Path $script:SELF_HEAL_BACKUP_DIR $aclBakLeaf)
 
     $permsLineIdx = -1
     for ($k = $blockStart; $k -lt $blockEnd; $k++) {
@@ -1176,7 +1230,13 @@ function Invoke-RedfoxAclSelfHeal {
     $ts = Get-Date -Format "yyyyMMddTHHmmssZ"
 
     if ($blockStart -eq -1) {
-        Copy-Item -LiteralPath $AclPath -Destination "${AclPath}.bak-${ts}"
+        $aclBakLeaf = Split-Path -Leaf $AclPath
+        Copy-Item -LiteralPath $AclPath -Destination (Join-Path $script:SELF_HEAL_BACKUP_DIR "$aclBakLeaf.bak-${ts}")
+        # BUG FIX (2026-08-07): unlike its update.sh counterpart (which calls
+        # `_rotate_backups "$acl_path"` right after every `cp`), this Copy-Item
+        # never had a matching Invoke-RotateBackups call — acl.yaml backups
+        # accumulated without bound on Windows specifically. Fixed here.
+        Invoke-RotateBackups -BasePath (Join-Path $script:SELF_HEAL_BACKUP_DIR $aclBakLeaf)
         $newBlock = @'
 
   - name: redfox
@@ -1211,7 +1271,13 @@ function Invoke-RedfoxAclSelfHeal {
         return
     }
 
-    Copy-Item -LiteralPath $AclPath -Destination "${AclPath}.bak-${ts}"
+    $aclBakLeaf = Split-Path -Leaf $AclPath
+    Copy-Item -LiteralPath $AclPath -Destination (Join-Path $script:SELF_HEAL_BACKUP_DIR "$aclBakLeaf.bak-${ts}")
+    # BUG FIX (2026-08-07): unlike its update.sh counterpart (which calls
+    # `_rotate_backups "$acl_path"` right after every `cp`), this Copy-Item
+    # never had a matching Invoke-RotateBackups call — acl.yaml backups
+    # accumulated without bound on Windows specifically. Fixed here.
+    Invoke-RotateBackups -BasePath (Join-Path $script:SELF_HEAL_BACKUP_DIR $aclBakLeaf)
 
     $permsLineIdx = -1
     for ($k = $blockStart; $k -lt $blockEnd; $k++) {
@@ -1251,7 +1317,13 @@ function Invoke-CveProxyAclSelfHeal {
     }
 
     $ts = Get-Date -Format "yyyyMMddTHHmmssZ"
-    Copy-Item -LiteralPath $AclPath -Destination "${AclPath}.bak-${ts}"
+    $aclBakLeaf = Split-Path -Leaf $AclPath
+    Copy-Item -LiteralPath $AclPath -Destination (Join-Path $script:SELF_HEAL_BACKUP_DIR "$aclBakLeaf.bak-${ts}")
+    # BUG FIX (2026-08-07): unlike its update.sh counterpart (which calls
+    # `_rotate_backups "$acl_path"` right after every `cp`), this Copy-Item
+    # never had a matching Invoke-RotateBackups call — acl.yaml backups
+    # accumulated without bound on Windows specifically. Fixed here.
+    Invoke-RotateBackups -BasePath (Join-Path $script:SELF_HEAL_BACKUP_DIR $aclBakLeaf)
     $newBlock = @'
 
   - name: cve-proxy
@@ -2702,6 +2774,142 @@ switch ($hostOsValue) {
     }
 }
 
+# ── Backup encryption helpers (banking-grade at-rest protection, 2026-08-07) ──
+# The pre-update pg_dumpall SQL backup below is a full database dump —
+# findings data, scan results, license cache, session data — and used to be
+# written to disk in PLAINTEXT with zero retention. Encrypt it with the SAME
+# customer-controlled age key already used for .env.enc (NEVER a Coderaft-held
+# key — that key lives on the customer's own host, generated at install time,
+# and only the customer can decrypt their own secrets; encrypting a customer
+# DB dump with a Coderaft-held key would defeat the point). Both helpers below
+# are best-effort and never throw: if the key or the `age` CLI genuinely
+# cannot be obtained (sops/age availability has been a real live problem on
+# this exact class of host), the caller falls back to leaving the backup in
+# plaintext with a loud warning rather than blocking the whole update — the
+# "no backup = no update" rule covers pg_dumpall succeeding, not the
+# encryption layered on top of it.
+
+# Resolves the recipient (age key file + its public key) using the exact same
+# priority order already established twice further down this script (the
+# "sops-finalize" and "pre-deploy .env refresh" blocks): $env:SOPS_AGE_KEY_FILE
+# → $INSTALL_DIR\.coderaft-age.key → legacy system-wide
+# C:\ProgramData\coderaft\age.key. Returns $null if no key exists at all
+# (e.g. a very old install that predates the SOPS migration).
+function Resolve-BackupAgeRecipient {
+    $keyFile = if ($env:SOPS_AGE_KEY_FILE) { $env:SOPS_AGE_KEY_FILE } else { Join-Path $INSTALL_DIR ".coderaft-age.key" }
+    if (-not (Test-Path $keyFile) -and (Test-Path "C:\ProgramData\coderaft\age.key")) {
+        $keyFile = "C:\ProgramData\coderaft\age.key"
+    }
+    if (-not (Test-Path $keyFile)) { return $null }
+    $pubLine = (Get-Content $keyFile -ErrorAction SilentlyContinue | Where-Object { $_ -match '# public key:' } | Select-Object -First 1)
+    if (-not $pubLine) { return $null }
+    $pub = ($pubLine -replace '.*# public key:\s*', '').Trim()
+    if (-not $pub) { return $null }
+    return [pscustomobject]@{ KeyFile = $keyFile; PublicKey = $pub }
+}
+
+# Resolves a working `age` CLI (the full encrypt/decrypt binary — distinct
+# from `age-keygen`, which is all the vault-bootstrap block elsewhere in this
+# script ever downloads, and which sops does NOT need since sops links age
+# natively — but sops's own binary-file mode base64-wraps the whole content
+# in memory, ~10x peak RAM and +33% disk for a multi-GB dump in local
+# testing, so the streaming `age` CLI is the right tool for a full DB dump
+# specifically). Order: PATH (already present on most Linux/macOS installs —
+# install.sh's ensure_age_binary installs the full `age` binary, not just
+# age-keygen) → a cache this function populated on a previous run
+# ($INSTALL_DIR\.coderaft-tools\age.exe, never re-downloaded once present) →
+# best-effort download from the EXACT SAME GitHub release archive/version
+# already trusted elsewhere in this script for age-keygen
+# (github.com/FiloSottile/age, v1.2.1) — not a new external dependency, just
+# one more file out of an archive this codebase already fetches. Returns
+# $null (never throws) if age truly cannot be obtained.
+function Find-AgeCli {
+    $cmd = Get-Command age -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    $cacheDir = Join-Path $INSTALL_DIR ".coderaft-tools"
+    $cached = Join-Path $cacheDir "age.exe"
+    if (Test-Path $cached) { return $cached }
+    try {
+        New-Item -ItemType Directory -Force -Path $cacheDir -ErrorAction Stop | Out-Null
+        $ageVersion = "v1.2.1"
+        $ageArch = if ([Environment]::Is64BitOperatingSystem) { "amd64" } else { "386" }
+        $ageTmp = Join-Path $env:TEMP "coderaft-age-cli-$(Get-Random)"
+        New-Item -ItemType Directory -Force -Path $ageTmp -ErrorAction Stop | Out-Null
+        $ageZip = Join-Path $ageTmp "age.zip"
+        $ageUrl = "https://github.com/FiloSottile/age/releases/download/$ageVersion/age-$ageVersion-windows-$ageArch.zip"
+        Invoke-WebRequest -Uri $ageUrl -OutFile $ageZip -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+        Expand-Archive -Path $ageZip -DestinationPath $ageTmp -Force -ErrorAction Stop
+        $ageExe = Get-ChildItem -Path $ageTmp -Filter "age.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $ageExe) {
+            Remove-Item -Path $ageTmp -Recurse -Force -ErrorAction SilentlyContinue
+            return $null
+        }
+        Copy-Item -LiteralPath $ageExe.FullName -Destination $cached -Force -ErrorAction Stop
+        Remove-Item -Path $ageTmp -Recurse -Force -ErrorAction SilentlyContinue
+        return $cached
+    } catch {
+        Write-DetailLog "[backup-encrypt] age CLI unavailable and download failed: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+# Encrypts $PlainFile to "$PlainFile.age" using $Recipient's public key, then
+# decrypts it right back with the SAME private key file and SHA-256-compares
+# against the original before ever deleting the plaintext — mirrors the
+# integrity-verify pattern already used for .env.enc elsewhere in this
+# codebase (migrate-to-sops.ps1's Compare-Object, the sops-finalize hash
+# check further down this script). Returns $true and deletes the plaintext
+# ONLY on a fully verified round trip; on any failure, removes just the
+# (unverified) encrypted output and leaves the original plaintext untouched.
+function Protect-BackupFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$PlainFile,
+        [Parameter(Mandatory = $true)][string]$AgeCli,
+        [Parameter(Mandatory = $true)]$Recipient
+    )
+    $encFile = "$PlainFile.age"
+    $encErr = Join-Path $env:TEMP "coderaft-backupenc-err-$(Get-Random).log"
+    try {
+        $encProc = Start-Process -FilePath $AgeCli -ArgumentList @("-r", $Recipient.PublicKey, "-o", $encFile, $PlainFile) `
+            -NoNewWindow -Wait -PassThru -RedirectStandardError $encErr -ErrorAction Stop
+    } catch {
+        Remove-Item -Path $encErr -ErrorAction SilentlyContinue
+        Write-DetailLog "[backup-encrypt] age encrypt threw: $($_.Exception.Message)"
+        return $false
+    }
+    Remove-Item -Path $encErr -ErrorAction SilentlyContinue
+    if ($encProc.ExitCode -ne 0 -or -not (Test-Path $encFile) -or (Get-Item $encFile).Length -eq 0) {
+        Remove-Item -LiteralPath $encFile -Force -ErrorAction SilentlyContinue
+        Write-DetailLog "[backup-encrypt] age encrypt failed (exit $($encProc.ExitCode))"
+        return $false
+    }
+
+    # Round-trip verify before trusting the encrypted copy with the only data.
+    $verifyOut = Join-Path $env:TEMP "coderaft-backupverify-$(Get-Random).sql"
+    $decErr = Join-Path $env:TEMP "coderaft-backupdec-err-$(Get-Random).log"
+    $verifyOk = $false
+    try {
+        $decProc = Start-Process -FilePath $AgeCli -ArgumentList @("-d", "-i", $Recipient.KeyFile, "-o", $verifyOut, $encFile) `
+            -NoNewWindow -Wait -PassThru -RedirectStandardError $decErr -ErrorAction Stop
+        if ($decProc.ExitCode -eq 0 -and (Test-Path $verifyOut)) {
+            $h1 = (Get-FileHash -Algorithm SHA256 -Path $PlainFile).Hash
+            $h2 = (Get-FileHash -Algorithm SHA256 -Path $verifyOut).Hash
+            $verifyOk = ($h1 -eq $h2)
+        }
+    } catch {
+        Write-DetailLog "[backup-encrypt] verify decrypt threw: $($_.Exception.Message)"
+    }
+    Remove-Item -Path $verifyOut,$decErr -ErrorAction SilentlyContinue
+
+    if (-not $verifyOk) {
+        Remove-Item -LiteralPath $encFile -Force -ErrorAction SilentlyContinue
+        Write-DetailLog "[backup-encrypt] round-trip verify failed — kept plaintext, discarded unverified $encFile"
+        return $false
+    }
+    Remove-Item -LiteralPath $PlainFile -Force
+    return $true
+}
+
 # ── Mandatory pre-update backup ───────────────────────────────────────────
 # If pg_dumpall fails → block the update (no backup = no update).
 Write-Host ""
@@ -2739,6 +2947,39 @@ if ($postgresRunning) {
 
         if ($proc.ExitCode -eq 0 -and (Get-Item $BACKUP_FILE).Length -gt 0) {
             Write-Host "  Backup saved: $BACKUP_FILE"
+
+            # ── Encrypt at rest (2026-08-07) ──────────────────────────────
+            $backupRecipient = Resolve-BackupAgeRecipient
+            if ($backupRecipient) {
+                $ageCli = Find-AgeCli
+                if ($ageCli) {
+                    if (Protect-BackupFile -PlainFile $BACKUP_FILE -AgeCli $ageCli -Recipient $backupRecipient) {
+                        Write-Host "  ✓ Backup encrypted at rest: $BACKUP_FILE.age"
+                    } else {
+                        Write-Host "  ⚠ Backup encryption failed or could not be verified — left in plaintext: $BACKUP_FILE" -ForegroundColor Yellow
+                    }
+                } else {
+                    Write-Host "  ⚠ age CLI unavailable (offline / GitHub unreachable) — backup left in plaintext: $BACKUP_FILE" -ForegroundColor Yellow
+                }
+            } else {
+                Write-Host "  ⚠ No age key found (.coderaft-age.key / C:\ProgramData\coderaft\age.key) — backup left in plaintext: $BACKUP_FILE" -ForegroundColor Yellow
+                Write-Host "     Run migrate-to-sops.ps1 to set up SOPS+age; future backups then encrypt automatically." -ForegroundColor Yellow
+            }
+
+            # ── Retention (2026-08-07) ──────────────────────────────────────
+            # A full pg_dumpall is the "something went badly wrong" last-resort
+            # DB safety net — kept longer than the 5-deep self-heal .bak-*
+            # pools above (those protect a single config-file edit; this one
+            # protects the entire database) but still bounded: an unattended
+            # deployment must not accumulate these forever. 10 was chosen
+            # over the config self-heal default of 5 because updates run far
+            # less often than self-heals fire, and this is the highest-value
+            # backup family in the whole script — still nowhere near
+            # "unbounded". Two independent pools (encrypted vs. leftover
+            # plaintext) so a temporarily-unavailable age/key doesn't cause
+            # already-encrypted history to be evicted early.
+            Invoke-RotateBackups -BasePath (Join-Path $BACKUP_DIR "preupdate") -Keep 10 -Filter "preupdate-*.sql.age"
+            Invoke-RotateBackups -BasePath (Join-Path $BACKUP_DIR "preupdate") -Keep 10 -Filter "preupdate-*.sql"
         } else {
             Write-Host "  ERROR: pg_dumpall failed (exit $($proc.ExitCode)). Update cancelled."
             Write-Host "  Check that the postgres container is healthy: docker compose ps"

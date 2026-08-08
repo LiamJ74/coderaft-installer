@@ -300,15 +300,69 @@ strip_from_main_env() {
 # upsert_install_config's first self-heal callers below) so it's available to
 # both the top-level self-heal blocks further down this script and the ACL
 # self-heal functions defined later.
+#
+# BUG FIX (2026-08-07): the original body did
+#   ls -t "${dir}/${base}.${glob_suffix}" 2>/dev/null | tail ...
+# — fully double-quoted, which means bash NEVER glob-expands the literal `*`
+# baked into $glob_suffix's value (quoting a parameter expansion suppresses
+# pathname expansion of its result). `ls` therefore always received a literal
+# filename containing a `*` character, always failed with "No such file or
+# directory" (silently swallowed by 2>/dev/null), and the while loop always
+# saw zero input. Net effect: this function has NEVER rotated anything since
+# it shipped — every backup family below has been accumulating unbounded on
+# every bash-based (Linux/macOS) install this whole time, silently, despite
+# the CHANGELOG entry claiming it was "verified... rotates correctly".
+# Confirmed empirically (real `bash`, not the login/interactive shell): 7
+# seeded docker-compose.yml.bak-* files, keep=5 → 0 removed with the old
+# quoted body, 2 removed (5 kept) with the fix below.
+#
+# Rewritten on `find -name` instead of a shell glob: `-name` does its OWN
+# internal pattern matching without ever asking the shell to expand `*`, so
+# there's no quoting-vs-globbing conflict — and it's also spaces-in-path
+# safe (`$dir` — usually $INSTALL_DIR — is single-quoted as an argument to
+# find, not glob-expanded), unlike the unquoted-glob alternative, which
+# would still break on a space anywhere in $INSTALL_DIR. Also added an
+# optional 4th arg, $filter_override, a full `find -name` pattern that
+# bypasses the "$base.$glob_suffix" composition — needed for backup families
+# whose naming doesn't follow that "<name>.<suffix>" convention, e.g. the
+# encrypted SQL pre-update dumps ("preupdate-<timestamp>.sql.age", timestamp
+# embedded mid-name via a dash, not a dot-suffix). All existing 3-arg call
+# sites below are unaffected (same behavior, just actually working now).
 _rotate_backups() {
-    local base_path="$1" keep="${2:-5}" glob_suffix="${3:-bak-*}"
-    local dir base
+    local base_path="$1" keep="${2:-5}" glob_suffix="${3:-bak-*}" filter_override="${4:-}"
+    local dir base name_pattern
     dir="$(dirname "$base_path")"
-    base="$(basename "$base_path")"
-    ls -t "${dir}/${base}.${glob_suffix}" 2>/dev/null | tail -n "+$((keep + 1))" | while IFS= read -r f; do
-        rm -f -- "$f"
-    done
+    if [ -n "$filter_override" ]; then
+        name_pattern="$filter_override"
+    else
+        base="$(basename "$base_path")"
+        name_pattern="${base}.${glob_suffix}"
+    fi
+    find "$dir" -maxdepth 1 -type f -name "$name_pattern" -print0 2>/dev/null \
+        | while IFS= read -r -d '' f; do
+            local mtime
+            mtime=$(stat -f '%m' "$f" 2>/dev/null || stat -c '%Y' "$f" 2>/dev/null || echo 0)
+            printf '%s\t%s\n' "$mtime" "$f"
+        done \
+        | sort -rn \
+        | tail -n "+$((keep + 1))" \
+        | cut -f2- \
+        | while IFS= read -r f; do rm -f -- "$f"; done
 }
+
+# ── Self-heal backup directory (root-directory decluttering, 2026-08-07) ───
+# All the timestamped self-heal safety copies above (docker-compose.yml.bak-*,
+# docker-compose.override.yml.bak-*/.broken-*, acl.yaml.bak-*) used to land
+# directly in $INSTALL_DIR, right next to docker-compose.yml/.env/etc. Real
+# customer feedback from live testing: "a lot of pollution on disk" for a
+# product marketed as banking-grade. Moved into one dedicated, out-of-the-way
+# subdirectory — retention (_rotate_backups above, keep-last-N) is unchanged,
+# only the base path each backup family lives under moves. The live
+# docker-compose.yml / docker-compose.override.yml / vault-config/acl.yaml
+# files themselves are NOT moved (Docker Compose and the vault need them at
+# their existing paths).
+SELF_HEAL_BACKUP_DIR="${INSTALL_DIR}/.backups/self-heal"
+mkdir -p "$SELF_HEAL_BACKUP_DIR" 2>/dev/null || true
 
 # ── Self-heal CODERAFT_HOST_OS in install-config.env (B25) ────────────────
 # Les installs antérieures préservaient .env sans ajouter CODERAFT_HOST_OS.
@@ -352,8 +406,8 @@ strip_from_main_env "CODERAFT_HOST_ARCH"
 # toujours unhealthy → dashboard-api bloqué. Workaround: service_started.
 COMPOSE_PATH="${INSTALL_DIR}/docker-compose.yml"
 if [ -f "$COMPOSE_PATH" ] && grep -qF 'coderaft-vault: { condition: service_healthy }' "$COMPOSE_PATH"; then
-    cp "$COMPOSE_PATH" "$COMPOSE_PATH.bak-$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
-    _rotate_backups "$COMPOSE_PATH"
+    cp "$COMPOSE_PATH" "$SELF_HEAL_BACKUP_DIR/$(basename "$COMPOSE_PATH").bak-$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+    _rotate_backups "$SELF_HEAL_BACKUP_DIR/$(basename "$COMPOSE_PATH")"
     sed -i.tmp 's|coderaft-vault: { condition: service_healthy }|coderaft-vault: { condition: service_started }|' "$COMPOSE_PATH"
     rm -f "$COMPOSE_PATH.tmp"
     echo "  ✓ Self-heal docker-compose.yml — coderaft-vault: service_healthy → service_started"
@@ -365,8 +419,8 @@ fi
 # 'Authentication failed: server_error' lors du callback Entra.
 if [ -f "$COMPOSE_PATH" ] && ! grep -qF 'NODE_OPTIONS=--dns-result-order=ipv4first' "$COMPOSE_PATH"; then
     if grep -qF '      - LICENSE_SERVER_URL=https://license.coderaft.io' "$COMPOSE_PATH"; then
-        cp "$COMPOSE_PATH" "$COMPOSE_PATH.bak-b15-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
-        _rotate_backups "$COMPOSE_PATH"
+        cp "$COMPOSE_PATH" "$SELF_HEAL_BACKUP_DIR/$(basename "$COMPOSE_PATH").bak-b15-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+        _rotate_backups "$SELF_HEAL_BACKUP_DIR/$(basename "$COMPOSE_PATH")"
         # Inject NODE_OPTIONS line BEFORE every LICENSE_SERVER_URL line.
         sed -i.tmp 's|      - LICENSE_SERVER_URL=https://license.coderaft.io|      - NODE_OPTIONS=--dns-result-order=ipv4first\
       - LICENSE_SERVER_URL=https://license.coderaft.io|g' "$COMPOSE_PATH"
@@ -382,8 +436,8 @@ fi
 # reaches every existing install regardless of which products are licensed.
 if [ -f "$COMPOSE_PATH" ] && ! grep -qE '^[[:space:]]*coderaft-cve-proxy:[[:space:]]*$' "$COMPOSE_PATH" \
    && grep -qE '^[[:space:]]*postgres:[[:space:]]*$' "$COMPOSE_PATH"; then
-    cp "$COMPOSE_PATH" "$COMPOSE_PATH.bak-cveproxy-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
-    _rotate_backups "$COMPOSE_PATH"
+    cp "$COMPOSE_PATH" "$SELF_HEAL_BACKUP_DIR/$(basename "$COMPOSE_PATH").bak-cveproxy-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    _rotate_backups "$SELF_HEAL_BACKUP_DIR/$(basename "$COMPOSE_PATH")"
     _cveproxy_block=$(cat <<'CVEPROXYBLOCK'
   # ── coderaft-cve-proxy ───────────────────────────────────────────────────
   # Internal sidecar in front of the shared coderaft-cve-engine
@@ -441,8 +495,8 @@ fi
 # #148 report for the full experimental writeup.
 if [ -f "$COMPOSE_PATH" ] && ! grep -qF '/run/coderaft-env' "$COMPOSE_PATH" \
    && grep -qF './vault-tls/dashboard-api-client.key:/vault-tls/dashboard-api-client.key:ro' "$COMPOSE_PATH"; then
-    cp "$COMPOSE_PATH" "$COMPOSE_PATH.bak-tmpfsenv-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
-    _rotate_backups "$COMPOSE_PATH"
+    cp "$COMPOSE_PATH" "$SELF_HEAL_BACKUP_DIR/$(basename "$COMPOSE_PATH").bak-tmpfsenv-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    _rotate_backups "$SELF_HEAL_BACKUP_DIR/$(basename "$COMPOSE_PATH")"
     sed -i.tmp 's|      - ./vault-tls/dashboard-api-client.key:/vault-tls/dashboard-api-client.key:ro|      - ./vault-tls/dashboard-api-client.key:/vault-tls/dashboard-api-client.key:ro\
     tmpfs:\
       - /run/coderaft-env:size=1m,mode=0700,uid=0|' "$COMPOSE_PATH"
@@ -464,8 +518,8 @@ fi
 # DB connection after this same update.
 if [ -f "$COMPOSE_PATH" ] && grep -qF 'POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}' "$COMPOSE_PATH" \
    && ! grep -qF 'POSTGRES_PASSWORD_FILE' "$COMPOSE_PATH"; then
-    cp "$COMPOSE_PATH" "$COMPOSE_PATH.bak-pgsecret-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
-    _rotate_backups "$COMPOSE_PATH"
+    cp "$COMPOSE_PATH" "$SELF_HEAL_BACKUP_DIR/$(basename "$COMPOSE_PATH").bak-pgsecret-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    _rotate_backups "$SELF_HEAL_BACKUP_DIR/$(basename "$COMPOSE_PATH")"
 
     mkdir -p "${INSTALL_DIR}/secrets"
     chmod 700 "${INSTALL_DIR}/secrets"
@@ -518,8 +572,8 @@ fi
 # random one) so the running redis's real credential keeps matching.
 if [ -f "$COMPOSE_PATH" ] && grep -qF 'command: redis-server --requirepass ${REDIS_PASSWORD} --maxmemory 128mb' "$COMPOSE_PATH" \
    && ! grep -qF '/run/secrets/redis_password' "$COMPOSE_PATH"; then
-    cp "$COMPOSE_PATH" "$COMPOSE_PATH.bak-redissecret-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
-    _rotate_backups "$COMPOSE_PATH"
+    cp "$COMPOSE_PATH" "$SELF_HEAL_BACKUP_DIR/$(basename "$COMPOSE_PATH").bak-redissecret-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    _rotate_backups "$SELF_HEAL_BACKUP_DIR/$(basename "$COMPOSE_PATH")"
 
     mkdir -p "${INSTALL_DIR}/secrets"
     chmod 700 "${INSTALL_DIR}/secrets"
@@ -592,8 +646,8 @@ fi
 # Bind 127.0.0.1 + port paramétrable. Banking-grade.
 OVERRIDE_PATH="${INSTALL_DIR}/docker-compose.override.yml"
 if [ -f "$OVERRIDE_PATH" ] && grep -qE '"7687:7687"|- 7687:7687' "$OVERRIDE_PATH"; then
-    cp "$OVERRIDE_PATH" "$OVERRIDE_PATH.bak-$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
-    _rotate_backups "$OVERRIDE_PATH"
+    cp "$OVERRIDE_PATH" "$SELF_HEAL_BACKUP_DIR/$(basename "$OVERRIDE_PATH").bak-$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+    _rotate_backups "$SELF_HEAL_BACKUP_DIR/$(basename "$OVERRIDE_PATH")"
     sed -i.tmp 's|"7687:7687"|"127.0.0.1:${NEO4J_BOLT_PORT:-7687}:7687"|g; s|- 7687:7687|- "127.0.0.1:${NEO4J_BOLT_PORT:-7687}:7687"|g' "$OVERRIDE_PATH"
     rm -f "$OVERRIDE_PATH.tmp"
     echo "  ✓ Self-heal docker-compose.override.yml — neo4j 127.0.0.1 only + paramétrable"
@@ -631,8 +685,8 @@ echo "  Checking compose integrity..."
 if ! docker compose "${COMPOSE_ENV_ARGS[@]}" ps >/dev/null 2>&1; then
     echo "  ⚠ docker-compose.override.yml appears corrupted — auto-recovery..."
     if [ -f "docker-compose.override.yml" ]; then
-        cp docker-compose.override.yml "docker-compose.override.yml.broken-$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
-        _rotate_backups "docker-compose.override.yml" 5 "broken-*"
+        cp docker-compose.override.yml "$SELF_HEAL_BACKUP_DIR/docker-compose.override.yml.broken-$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+        _rotate_backups "$SELF_HEAL_BACKUP_DIR/docker-compose.override.yml" 5 "broken-*"
         rm -f docker-compose.override.yml
         echo "    ✓ override backed up + removed"
     fi
@@ -785,8 +839,8 @@ _falconone_acl_selfheal() {
     ts="$(date -u +"%Y%m%dT%H%M%SZ")"
 
     if ! grep -qE '^[[:space:]]*-[[:space:]]*name:[[:space:]]*falconone[[:space:]]*$' "$acl_path"; then
-        cp "$acl_path" "${acl_path}.bak-${ts}"
-        _rotate_backups "$acl_path"
+        cp "$acl_path" "$SELF_HEAL_BACKUP_DIR/$(basename "$acl_path").bak-${ts}"
+        _rotate_backups "$SELF_HEAL_BACKUP_DIR/$(basename "$acl_path")"
         cat >> "$acl_path" <<'FALCONONEACL'
 
   - name: falconone
@@ -832,8 +886,8 @@ FALCONONEACL
         return 0
     fi
 
-    cp "$acl_path" "${acl_path}.bak-${ts}"
-    _rotate_backups "$acl_path"
+    cp "$acl_path" "$SELF_HEAL_BACKUP_DIR/$(basename "$acl_path").bak-${ts}"
+    _rotate_backups "$SELF_HEAL_BACKUP_DIR/$(basename "$acl_path")"
 
     if grep -qE '^[[:space:]]*permissions:[[:space:]]*\[.*\][[:space:]]*$' <<< "$block"; then
         local additions=""
@@ -881,8 +935,8 @@ _mantisstrike_acl_selfheal() {
     ts="$(date -u +"%Y%m%dT%H%M%SZ")"
 
     if ! grep -qE '^[[:space:]]*-[[:space:]]*name:[[:space:]]*mantisstrike[[:space:]]*$' "$acl_path"; then
-        cp "$acl_path" "${acl_path}.bak-${ts}"
-        _rotate_backups "$acl_path"
+        cp "$acl_path" "$SELF_HEAL_BACKUP_DIR/$(basename "$acl_path").bak-${ts}"
+        _rotate_backups "$SELF_HEAL_BACKUP_DIR/$(basename "$acl_path")"
         cat >> "$acl_path" <<'MANTISSTRIKEACL'
 
   - name: mantisstrike
@@ -919,8 +973,8 @@ MANTISSTRIKEACL
         return 0
     fi
 
-    cp "$acl_path" "${acl_path}.bak-${ts}"
-    _rotate_backups "$acl_path"
+    cp "$acl_path" "$SELF_HEAL_BACKUP_DIR/$(basename "$acl_path").bak-${ts}"
+    _rotate_backups "$SELF_HEAL_BACKUP_DIR/$(basename "$acl_path")"
 
     if grep -qE '^[[:space:]]*permissions:[[:space:]]*\[.*\][[:space:]]*$' <<< "$block"; then
         local additions=""
@@ -978,8 +1032,8 @@ _redfox_acl_selfheal() {
     ts="$(date -u +"%Y%m%dT%H%M%SZ")"
 
     if ! grep -qE '^[[:space:]]*-[[:space:]]*name:[[:space:]]*redfox[[:space:]]*$' "$acl_path"; then
-        cp "$acl_path" "${acl_path}.bak-${ts}"
-        _rotate_backups "$acl_path"
+        cp "$acl_path" "$SELF_HEAL_BACKUP_DIR/$(basename "$acl_path").bak-${ts}"
+        _rotate_backups "$SELF_HEAL_BACKUP_DIR/$(basename "$acl_path")"
         cat >> "$acl_path" <<'REDFOXACL'
 
   - name: redfox
@@ -1023,8 +1077,8 @@ REDFOXACL
         return 0
     fi
 
-    cp "$acl_path" "${acl_path}.bak-${ts}"
-    _rotate_backups "$acl_path"
+    cp "$acl_path" "$SELF_HEAL_BACKUP_DIR/$(basename "$acl_path").bak-${ts}"
+    _rotate_backups "$SELF_HEAL_BACKUP_DIR/$(basename "$acl_path")"
 
     if grep -qE '^[[:space:]]*permissions:[[:space:]]*\[.*\][[:space:]]*$' <<< "$block"; then
         local additions=""
@@ -1065,8 +1119,8 @@ _cveproxy_acl_selfheal() {
 
     local ts
     ts="$(date -u +"%Y%m%dT%H%M%SZ")"
-    cp "$acl_path" "${acl_path}.bak-${ts}"
-    _rotate_backups "$acl_path"
+    cp "$acl_path" "$SELF_HEAL_BACKUP_DIR/$(basename "$acl_path").bak-${ts}"
+    _rotate_backups "$SELF_HEAL_BACKUP_DIR/$(basename "$acl_path")"
     cat >> "$acl_path" <<'CVEPROXYACL'
 
   - name: cve-proxy
@@ -2027,6 +2081,146 @@ case "$HOST_OS_VALUE" in
         ;;
 esac
 
+# ── Backup encryption helpers (banking-grade at-rest protection, 2026-08-07) ──
+# The pre-update pg_dumpall SQL backup below is a full database dump —
+# findings data, scan results, license cache, session data — and used to be
+# written to disk in PLAINTEXT with zero retention. Encrypt it with the SAME
+# customer-controlled age key already used for .env.enc (NEVER a Coderaft-held
+# key — that key lives on the customer's own host, generated at install time,
+# and only the customer can decrypt their own secrets; encrypting a customer
+# DB dump with a Coderaft-held key would defeat the point). All three helpers
+# below are best-effort and safe under `set -e` (verified empirically: a
+# failing command inside a function called as `$(func || true)`, or tested
+# directly in an `if`, does not abort the script) — if the key or the `age`
+# CLI genuinely cannot be obtained (sops/age availability has been a real
+# live problem on this exact class of host), the caller falls back to
+# leaving the backup in plaintext with a loud warning rather than blocking
+# the whole update: "no backup = no update" covers pg_dumpall succeeding,
+# not the encryption layered on top of it.
+
+# Resolves the recipient (age key file + its public key). Sets
+# BACKUP_AGE_KEYFILE / BACKUP_AGE_PUBKEY and returns 0 on success. Priority:
+# $SOPS_AGE_KEY_FILE → ${INSTALL_DIR}/.coderaft-age.key → legacy system-wide
+# /etc/coderaft/age.key — same AGE_KEY_LOCAL/AGE_KEY_PATH priority already
+# established in install.sh/migrate-to-sops.sh. Returns 1 if no key exists
+# at all (e.g. a very old install that predates the SOPS migration).
+_resolve_backup_age_recipient() {
+    local key_file="${SOPS_AGE_KEY_FILE:-${INSTALL_DIR}/.coderaft-age.key}"
+    if [ ! -f "$key_file" ] && [ -f "/etc/coderaft/age.key" ]; then
+        key_file="/etc/coderaft/age.key"
+    fi
+    [ -f "$key_file" ] || return 1
+    local pub
+    pub=$(grep '# public key:' "$key_file" 2>/dev/null | awk '{print $NF}')
+    [ -n "$pub" ] || return 1
+    BACKUP_AGE_KEYFILE="$key_file"
+    BACKUP_AGE_PUBKEY="$pub"
+    return 0
+}
+
+# Resolves a working `age` CLI (the full encrypt/decrypt binary — distinct
+# from age-keygen, and not needed by sops itself since sops links age
+# natively, but sops's own binary-file mode base64-wraps the whole content
+# in memory: ~10x peak RAM and +33% disk for a multi-GB dump measured
+# locally, so the streaming `age` CLI is the right tool for a full DB dump
+# specifically). Order: PATH (already present on most installs —
+# install.sh's ensure_age_binary installs the full `age` binary, not just
+# age-keygen) → a cache this function populated on a previous run
+# (${INSTALL_DIR}/.coderaft-tools/age, never re-downloaded once present) →
+# best-effort download from the EXACT SAME GitHub release archive/version
+# already trusted elsewhere in this script for age-keygen
+# (github.com/FiloSottile/age, v1.2.1) — not a new external dependency, just
+# one more file out of an archive this codebase already fetches. Echoes the
+# resolved path and returns 0, or returns 1 if age truly cannot be obtained.
+_find_age_cli() {
+    if command -v age &>/dev/null; then
+        command -v age
+        return 0
+    fi
+    local cache_dir="${INSTALL_DIR}/.coderaft-tools"
+    local cached="${cache_dir}/age"
+    if [ -x "$cached" ]; then
+        echo "$cached"
+        return 0
+    fi
+    mkdir -p "$cache_dir" 2>/dev/null || return 1
+    local age_version="v1.2.1" age_os age_arch
+    case "$(uname -s)" in
+        Darwin) age_os="darwin" ;;
+        Linux)  age_os="linux" ;;
+        *)      return 1 ;;
+    esac
+    case "$(uname -m)" in
+        arm64|aarch64) age_arch="arm64" ;;
+        x86_64|amd64)  age_arch="amd64" ;;
+        *)             return 1 ;;
+    esac
+    local tmp
+    tmp="$(mktemp -d)" || return 1
+    if ! curl -fsSL "https://github.com/FiloSottile/age/releases/download/${age_version}/age-${age_version}-${age_os}-${age_arch}.tar.gz" \
+        -o "${tmp}/age.tar.gz" 2>/dev/null; then
+        rm -rf "$tmp"
+        return 1
+    fi
+    tar -xzf "${tmp}/age.tar.gz" -C "$tmp" 2>/dev/null || true
+    if [ ! -f "${tmp}/age/age" ]; then
+        rm -rf "$tmp"
+        return 1
+    fi
+    install -m 755 "${tmp}/age/age" "$cached" 2>/dev/null || cp "${tmp}/age/age" "$cached" 2>/dev/null
+    chmod 755 "$cached" 2>/dev/null || true
+    rm -rf "$tmp"
+    if [ -x "$cached" ]; then
+        echo "$cached"
+        return 0
+    fi
+    return 1
+}
+
+_sha256_of() {
+    if command -v sha256sum &>/dev/null; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+
+# Encrypts $1 to "$1.age" using $3 (public key), then decrypts it right back
+# with $4 (the SAME private key file) and SHA-256-compares against the
+# original before ever deleting the plaintext — mirrors the integrity-verify
+# pattern already used for .env.enc elsewhere in this codebase
+# (migrate-to-sops.sh's byte comparison). Returns 0 and deletes the plaintext
+# ONLY on a fully verified round trip; on any failure, removes just the
+# (unverified) encrypted output and leaves the original plaintext untouched.
+_protect_backup_file() {
+    local plain_file="$1" age_cli="$2" pubkey="$3" keyfile="$4"
+    local enc_file="${plain_file}.age"
+    if ! "$age_cli" -r "$pubkey" -o "$enc_file" "$plain_file" 2>/dev/null; then
+        rm -f "$enc_file"
+        return 1
+    fi
+    if [ ! -s "$enc_file" ]; then
+        rm -f "$enc_file"
+        return 1
+    fi
+    local verify_out
+    verify_out="$(mktemp)"
+    if ! "$age_cli" -d -i "$keyfile" -o "$verify_out" "$enc_file" 2>/dev/null; then
+        rm -f "$enc_file" "$verify_out"
+        return 1
+    fi
+    local h1 h2
+    h1=$(_sha256_of "$plain_file")
+    h2=$(_sha256_of "$verify_out")
+    rm -f "$verify_out"
+    if [ -z "$h1" ] || [ "$h1" != "$h2" ]; then
+        rm -f "$enc_file"
+        return 1
+    fi
+    rm -f "$plain_file"
+    return 0
+}
+
 # ── Mandatory pre-update backup ───────────────────────────────────────────
 # If pg_dump fails → block the update (no backup = no update).
 echo ""
@@ -2043,6 +2237,36 @@ if docker compose "${COMPOSE_ENV_ARGS[@]}" ps postgres --quiet 2>/dev/null | gre
     # silently after "Backup saved" (no error, no rollback).
     if docker compose "${COMPOSE_ENV_ARGS[@]}" exec -T postgres pg_dumpall -U coderaft < /dev/null 2>/dev/null | gzip > "$BACKUP_FILE"; then
         echo "  Backup saved: $BACKUP_FILE"
+
+        # ── Encrypt at rest (2026-08-07) ────────────────────────────────────
+        BACKUP_AGE_KEYFILE=""
+        BACKUP_AGE_PUBKEY=""
+        if _resolve_backup_age_recipient; then
+            AGE_CLI="$(_find_age_cli || true)"
+            if [ -n "$AGE_CLI" ]; then
+                if _protect_backup_file "$BACKUP_FILE" "$AGE_CLI" "$BACKUP_AGE_PUBKEY" "$BACKUP_AGE_KEYFILE"; then
+                    echo "  ✓ Backup encrypted at rest: ${BACKUP_FILE}.age"
+                else
+                    echo "  ⚠ Backup encryption failed or could not be verified — left in plaintext: $BACKUP_FILE"
+                fi
+            else
+                echo "  ⚠ age CLI unavailable (offline / GitHub unreachable) — backup left in plaintext: $BACKUP_FILE"
+            fi
+        else
+            echo "  ⚠ No age key found (.coderaft-age.key / /etc/coderaft/age.key) — backup left in plaintext: $BACKUP_FILE"
+            echo "     Run migrate-to-sops.sh to set up SOPS+age; future backups then encrypt automatically."
+        fi
+
+        # ── Retention (2026-08-07) ──────────────────────────────────────────
+        # Same rationale as the self-heal .bak-* pools above but a longer
+        # window (10, not 5): a full pg_dumpall is the "something went badly
+        # wrong" last-resort DB safety net, the highest-value backup family
+        # in this script, and updates run far less often than self-heals
+        # fire — still bounded, just not as tight. Two independent pools
+        # (encrypted vs. leftover plaintext) so a temporarily-unavailable
+        # age/key doesn't cause already-encrypted history to be evicted early.
+        _rotate_backups "${BACKUP_DIR}/preupdate" 10 "" "preupdate-*.sql.gz.age"
+        _rotate_backups "${BACKUP_DIR}/preupdate" 10 "" "preupdate-*.sql.gz"
     else
         echo "  ERROR: pg_dump failed. Update cancelled (no backup = no update)."
         echo "  Check that the postgres container is healthy: docker compose ps"
