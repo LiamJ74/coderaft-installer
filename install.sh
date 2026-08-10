@@ -49,7 +49,7 @@ set -e
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.sh/install.sh.sha256 at all — today it still proxies
 # the legacy `coderaft-installer` repo.
-EXPECTED_SHA256="1ab9d1a2b9541d1ad8906d9c590d1e96c3a212a1150d5fc61017b2331ad11049"
+EXPECTED_SHA256="78e6b7dd25189572428c605da781eeb6f1e8f747de16d7a36c465b805d9f704a"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -2208,15 +2208,24 @@ trust_caddy_ca() {
         return 0
     fi
 
-    # Detect the active TLS mode from the running Caddyfile
-    local caddyfile
-    caddyfile="$(docker compose "${COMPOSE_ENV_ARGS[@]}" exec -T caddy cat /etc/caddy/Caddyfile 2>/dev/null || true)"
+    # Detect the active TLS mode. task #187: this used to `cat` the running
+    # Caddyfile and regex-match a literal `tls internal`/`tls /certs/...`/
+    # `tls user@host` line -- but the Caddyfile itself only ever contains
+    # the UNEXPANDED `tls {$CADDY_TLS_MODE_ARGS:internal}` placeholder on
+    # disk (Caddy substitutes its own `{$VAR:default}` syntax internally at
+    # config-parse time, it never rewrites the file), so every regex missed
+    # on every install regardless of the actual mode. Read the same
+    # CADDY_TLS_MODE_ARGS value install-config.env/.env actually set
+    # instead of trying to out-guess Caddy's templating from the raw file.
+    local tls_mode_args
+    tls_mode_args="$(grep -h '^CADDY_TLS_MODE_ARGS=' install-config.env .env 2>/dev/null | tail -1 | cut -d= -f2-)"
+    tls_mode_args="${tls_mode_args:-internal}"
     local tls_mode="unknown"
-    if echo "$caddyfile" | grep -qE '^\s*tls\s+internal\s*$'; then
+    if [ "$tls_mode_args" = "internal" ]; then
         tls_mode="internal"
-    elif echo "$caddyfile" | grep -qE '^\s*tls\s+/certs/\S+\.pem\s+\S+'; then
+    elif echo "$tls_mode_args" | grep -qE '^/certs/\S+\.(crt|pem)\s+/certs/\S+\.(key|pem)$'; then
         tls_mode="file"
-    elif echo "$caddyfile" | grep -qE '^\s*tls\s+[a-zA-Z0-9._+-]+@\S+'; then
+    elif echo "$tls_mode_args" | grep -qE '^[a-zA-Z0-9._+-]+@\S+'; then
         tls_mode="letsencrypt"
     fi
 

@@ -472,7 +472,28 @@ Write-Host "  Updating CodeRaft..."
 # The in-memory script keeps running with its OLD logic after we overwrite
 # the file on disk. Without re-exec, the freshly downloaded fixes would only
 # take effect on the NEXT run. CODERAFT_UPDATE_REEXEC guards against loops.
-if (-not $env:CODERAFT_UPDATE_REEXEC) {
+#
+# BUG (2026-08-10, found live on Liam's machine — the 2026-08-07 fix below
+# only covered HALF the leak): $env:CODERAFT_UPDATE_REEXEC is process-wide
+# state that outlives this one invocation — it lives in the PARENT
+# PowerShell session's own environment block, not some scope tied to the
+# child re-exec. The 2026-08-07 fix (see the Remove-Item further down)
+# only clears it on the path where a refresh actually happened and this
+# block re-exec'd a child — but if the CHILD errors out before reaching
+# that cleanup, or if some earlier run set it and this run's refresh check
+# never got that far, the flag stays stuck set FOREVER in that interactive
+# window. Every subsequent `.\update.ps1` call in the SAME window then
+# silently skips this entire self-update check — running whatever stale
+# on-disk copy happens to exist, potentially for days, with no visible
+# symptom other than old bugs (like the sops.exe System32 path fixed
+# 2026-08-07) mysteriously still reproducing after being "already fixed".
+# Fix: consume the flag the INSTANT we see it, unconditionally, before any
+# other logic — so it can never leak into a later, unrelated invocation.
+$IsReexecChild = [bool]$env:CODERAFT_UPDATE_REEXEC
+if ($IsReexecChild) {
+    Remove-Item Env:\CODERAFT_UPDATE_REEXEC -ErrorAction SilentlyContinue
+}
+if (-not $IsReexecChild) {
     Write-Host "  Checking for script updates..."
     $refreshed = $false
     foreach ($name in @("update.ps1", "rollback.ps1")) {
