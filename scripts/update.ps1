@@ -234,6 +234,66 @@ function Remove-FromMainEnv($Key) {
 }
 $ComposeEnvArgs = @("--env-file", $INSTALL_CONFIG_PATH, "--env-file", (Join-Path $INSTALL_DIR ".env"))
 
+# ── Ensure .env is present + fresh before ANY docker compose call ─────────
+# BUG (found live 2026-08-04, Liam's Windows deployment): $ComposeEnvArgs
+# above needs a real `.env` file to exist — but the "Banking-grade
+# plaintext purge" step further down in this script (and dashboard-api's
+# own task #148 hardening) can both legitimately have already REMOVED that
+# file by the time any docker compose command runs: the purge's whole job
+# is to delete it once .env.enc is confirmed authoritative. Every
+# `${POSTGRES_PASSWORD}`/`${REDIS_PASSWORD}`/etc. reference then silently
+# resolves to an empty string (redis's `--requirepass ${REDIS_PASSWORD}
+# --maxmemory 128mb` collapses into one malformed argument and refuses to
+# start).
+#
+# 2026-08-10 (found live, second incident): this used to be a single call
+# placed right before "Downloading new images" — but the EARLIER "Checking
+# compose integrity" step (`docker compose ps`, further down) ALSO needs a
+# working .env, and ran before that single call ever fired. With .env
+# missing, `docker compose ps` failed, which the integrity check
+# misdiagnosed as a corrupted docker-compose.override.yml and "self-healed"
+# by deleting a perfectly fine override file — then failed again for the
+# same underlying reason (still no .env), reporting "self-heal failed" and
+# aborting the whole update. Fix: call this before EVERY docker compose
+# call in the script, starting with the very first one — never assume a
+# plaintext copy is still lying around from an earlier step, and never
+# assume this is the only place that needs one.
+function Repair-EnvFile {
+    $envPlain = Join-Path $INSTALL_DIR ".env"
+    $envEnc   = Join-Path $INSTALL_DIR ".env.enc"
+    if (-not (Test-Path $envEnc)) { return }
+    $ageKey = if ($env:SOPS_AGE_KEY_FILE) { $env:SOPS_AGE_KEY_FILE } else { Join-Path $INSTALL_DIR ".coderaft-age.key" }
+    if (-not (Test-Path $ageKey) -and (Test-Path "C:\ProgramData\coderaft\age.key")) {
+        $ageKey = "C:\ProgramData\coderaft\age.key"
+    }
+    # Get-Command only finds `sops` on PATH. The "sops-finalize" step
+    # elsewhere in this script deliberately downloads sops.exe into
+    # $INSTALL_DIR instead of PATH (writing to a PATH location like
+    # System32 needs admin elevation a normal session doesn't have) — check
+    # there too, or a sops.exe that was just used successfully one step
+    # earlier gets reported as "unavailable" here.
+    $sopsCmd = Get-Command sops -ErrorAction SilentlyContinue
+    $sopsPath = if ($sopsCmd) { $sopsCmd.Path } else { $null }
+    if (-not $sopsPath) {
+        $sopsLocal = Join-Path $INSTALL_DIR "sops.exe"
+        if (Test-Path $sopsLocal) { $sopsPath = $sopsLocal }
+    }
+    if ((Test-Path $ageKey) -and $sopsPath) {
+        $env:SOPS_AGE_KEY_FILE = $ageKey
+        $decrypted = & $sopsPath --decrypt --input-type dotenv --output-type dotenv $envEnc 2>$null
+        if ($decrypted) {
+            [System.IO.File]::WriteAllText($envPlain, (($decrypted -join "`n") + "`n"), [System.Text.UTF8Encoding]::new($false))
+            Write-Host "  ✓ .env refreshed from .env.enc (ensures docker compose sees real secrets)"
+        } elseif (-not (Test-Path $envPlain)) {
+            Write-Host "  [!] sops decrypt of .env.enc returned empty and no .env exists — docker compose calls below will likely fail." -ForegroundColor Yellow
+        }
+    } elseif (-not (Test-Path $envPlain)) {
+        Write-Host "  [!] .env is missing and .env.enc cannot be decrypted here (sops or age key unavailable) — docker compose calls below will likely fail." -ForegroundColor Yellow
+        Write-Host "      Install sops (https://github.com/getsops/sops) or restore $ageKey" -ForegroundColor Yellow
+    }
+}
+Repair-EnvFile
+
 # ── Windows Defender exclusion ───────────────────────────────────────────
 # `docker compose pull` writes fresh signed binaries into the install dir
 # on every update. Defender can quarantine a just-pulled executable mid-
@@ -3238,65 +3298,11 @@ foreach ($img in $ComposeImages) {
     }
 }
 
-# ── Ensure .env is present + fresh before ANY docker compose call below ───
-# BUG (found live 2026-08-04, Liam's Windows deployment): `$ComposeArgs`
-# above is just @("compose") — no --env-file — so `docker compose pull`/
-# `up` rely ENTIRELY on Docker Compose's own default auto-load of a plain
-# `.env` file in the current directory. But the "Banking-grade plaintext
-# purge" block earlier in this script (and dashboard-api's own task #148
-# hardening, which deletes its host-visible copy once its internal tmpfs
-# copy is authoritative) can both legitimately have already REMOVED that
-# file by the time we get here — the purge block's own job is exactly to
-# delete it once .env.enc is confirmed authoritative. Result: every
-# `${POSTGRES_PASSWORD}`/`${REDIS_PASSWORD}`/etc. reference below silently
-# resolves to an empty string, and redis's `--requirepass ${REDIS_PASSWORD}
-# --maxmemory 128mb` collapses into `--requirepass --maxmemory 128mb` —
-# redis reads that as ONE malformed directive and refuses to start
-# ("wrong number of arguments"). Confirmed live: this had never surfaced
-# before because dashboard-api's own crash-loop (missing vault-secret-
-# resolve.js in its Dockerfile, fixed 2026-08-04) meant .env.enc was never
-# reliably refreshed either, so the purge block's `if (Test-Path $envEnc)`
-# guard rarely fired. Fix: always regenerate a fresh, correct .env from
-# .env.enc right before the commands that need it — never trust that a
-# plaintext copy still happens to be lying around from an earlier step.
-$envPlainPreDeploy = Join-Path $INSTALL_DIR ".env"
-$envEncPreDeploy   = Join-Path $INSTALL_DIR ".env.enc"
-if (Test-Path $envEncPreDeploy) {
-    $ageKeyPreDeploy = if ($env:SOPS_AGE_KEY_FILE) { $env:SOPS_AGE_KEY_FILE } else { Join-Path $INSTALL_DIR ".coderaft-age.key" }
-    if (-not (Test-Path $ageKeyPreDeploy) -and (Test-Path "C:\ProgramData\coderaft\age.key")) {
-        $ageKeyPreDeploy = "C:\ProgramData\coderaft\age.key"
-    }
-    # 2026-08-10 (found live — broke Liam's Windows deployment outright):
-    # Get-Command only finds `sops` on PATH. But the "sops-finalize" block
-    # earlier in this same script (the one that just successfully purged
-    # .env moments before this runs) deliberately downloads sops.exe into
-    # $INSTALL_DIR instead of PATH — writing to a PATH-visible location
-    # like System32 needs admin elevation a normal session doesn't have
-    # (see that block's own 2026-08-07 fix comment). Get-Command here never
-    # looks there, so this block always reported "sops unavailable" even
-    # immediately after that same sops.exe was used successfully one step
-    # earlier — leaving .env deleted with no way to regenerate it, and
-    # every subsequent `docker compose pull`/`up` failing outright.
-    $sopsPreDeployCmd = Get-Command sops -ErrorAction SilentlyContinue
-    $sopsPreDeployPath = if ($sopsPreDeployCmd) { $sopsPreDeployCmd.Path } else { $null }
-    if (-not $sopsPreDeployPath) {
-        $sopsLocalCandidate = Join-Path $INSTALL_DIR "sops.exe"
-        if (Test-Path $sopsLocalCandidate) { $sopsPreDeployPath = $sopsLocalCandidate }
-    }
-    if ((Test-Path $ageKeyPreDeploy) -and $sopsPreDeployPath) {
-        $env:SOPS_AGE_KEY_FILE = $ageKeyPreDeploy
-        $decryptedPreDeploy = & $sopsPreDeployPath --decrypt --input-type dotenv --output-type dotenv $envEncPreDeploy 2>$null
-        if ($decryptedPreDeploy) {
-            [System.IO.File]::WriteAllText($envPlainPreDeploy, (($decryptedPreDeploy -join "`n") + "`n"), [System.Text.UTF8Encoding]::new($false))
-            Write-Host "  ✓ .env refreshed from .env.enc (ensures docker compose sees real secrets)"
-        } elseif (-not (Test-Path $envPlainPreDeploy)) {
-            Write-Host "  [!] sops decrypt of .env.enc returned empty and no .env exists — docker compose calls below will likely fail." -ForegroundColor Yellow
-        }
-    } elseif (-not (Test-Path $envPlainPreDeploy)) {
-        Write-Host "  [!] .env is missing and .env.enc cannot be decrypted here (sops or age key unavailable) — docker compose calls below will likely fail." -ForegroundColor Yellow
-        Write-Host "      Install sops (https://github.com/getsops/sops) or restore $ageKeyPreDeploy" -ForegroundColor Yellow
-    }
-}
+# Re-check right before the pull too — defense in depth, never assume the
+# early call at the top of the script is the only thing that could have
+# changed .env's presence in between (e.g. the banking-grade purge step
+# above runs between the two calls).
+Repair-EnvFile
 
 Write-Host ""
 Write-Host "  Downloading new images..."
