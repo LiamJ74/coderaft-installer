@@ -3266,10 +3266,26 @@ if (Test-Path $envEncPreDeploy) {
     if (-not (Test-Path $ageKeyPreDeploy) -and (Test-Path "C:\ProgramData\coderaft\age.key")) {
         $ageKeyPreDeploy = "C:\ProgramData\coderaft\age.key"
     }
+    # 2026-08-10 (found live — broke Liam's Windows deployment outright):
+    # Get-Command only finds `sops` on PATH. But the "sops-finalize" block
+    # earlier in this same script (the one that just successfully purged
+    # .env moments before this runs) deliberately downloads sops.exe into
+    # $INSTALL_DIR instead of PATH — writing to a PATH-visible location
+    # like System32 needs admin elevation a normal session doesn't have
+    # (see that block's own 2026-08-07 fix comment). Get-Command here never
+    # looks there, so this block always reported "sops unavailable" even
+    # immediately after that same sops.exe was used successfully one step
+    # earlier — leaving .env deleted with no way to regenerate it, and
+    # every subsequent `docker compose pull`/`up` failing outright.
     $sopsPreDeployCmd = Get-Command sops -ErrorAction SilentlyContinue
-    if ((Test-Path $ageKeyPreDeploy) -and $sopsPreDeployCmd) {
+    $sopsPreDeployPath = if ($sopsPreDeployCmd) { $sopsPreDeployCmd.Path } else { $null }
+    if (-not $sopsPreDeployPath) {
+        $sopsLocalCandidate = Join-Path $INSTALL_DIR "sops.exe"
+        if (Test-Path $sopsLocalCandidate) { $sopsPreDeployPath = $sopsLocalCandidate }
+    }
+    if ((Test-Path $ageKeyPreDeploy) -and $sopsPreDeployPath) {
         $env:SOPS_AGE_KEY_FILE = $ageKeyPreDeploy
-        $decryptedPreDeploy = & $sopsPreDeployCmd.Path --decrypt --input-type dotenv --output-type dotenv $envEncPreDeploy 2>$null
+        $decryptedPreDeploy = & $sopsPreDeployPath --decrypt --input-type dotenv --output-type dotenv $envEncPreDeploy 2>$null
         if ($decryptedPreDeploy) {
             [System.IO.File]::WriteAllText($envPlainPreDeploy, (($decryptedPreDeploy -join "`n") + "`n"), [System.Text.UTF8Encoding]::new($false))
             Write-Host "  ✓ .env refreshed from .env.enc (ensures docker compose sees real secrets)"
