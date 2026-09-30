@@ -48,7 +48,7 @@ $ErrorActionPreference = 'Stop'
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.ps1/install.ps1.sha256 at all — today it still
 # proxies the legacy `coderaft-installer` repo.
-$CoderaftExpectedSha256 = "a68d915573b1c2c48ad7d8d9315447986b9a06ff8a0184c5eb7bd09334b56fe8"
+$CoderaftExpectedSha256 = "78b0e8b7ab7dfbaab3f76feda30db4d7508b9bcf8157e52da4dbcb69ca67fa14"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -392,6 +392,95 @@ function Get-InstallConfigVar($Key) {
     return $null
 }
 
+# ── LAN IP auto-detection (RELAY_ADVERTISE_HOST — FalconOne Remote Assist) ──
+# Root cause fixed live on Liam's machine, 2026-08-12 (see commit 471f0b7 and
+# the RELAY_ADVERTISE_HOST comment in dashboard-api/server.js's
+# "falconone-relay" service block): the relay's raw TCP ports (21116/21117)
+# are published directly on 0.0.0.0 — NEVER proxied through Caddy — so the
+# Windows RustDesk-compatible agent dials this host's OWN address directly.
+# Left unset, the relay falls back to its Docker container ID, which no
+# external agent can ever resolve. Liam explicitly refused a "just edit your
+# .env" fix — this must be auto-detected/self-healed by the installer/updater,
+# exactly like HOST_PROJECT_DIR/CODERAFT_HOST_OS/CODERAFT_HOST_ARCH already are.
+#
+# Get-NetIPConfiguration reports one entry per network adapter together with
+# its default gateway (if any). Only the adapter Windows actually uses to
+# reach the internet/router carries a non-null IPv4DefaultGateway — Docker
+# Desktop's internal NAT adapter, WSL's vEthernet, and disconnected/virtual
+# adapters never do — so filtering on it is the idiomatic way to find "the"
+# LAN-facing adapter without an explicit deny-list of adapter name patterns.
+# On a multi-homed machine (e.g. Ethernet + Wi-Fi both up with a gateway),
+# the adapter with the lowest InterfaceMetric — the one Windows itself
+# prefers for outbound traffic — is picked first.
+function Get-LanIPAddress {
+    try {
+        $configs = @(Get-NetIPConfiguration -ErrorAction Stop | Where-Object {
+            $_.IPv4DefaultGateway -and $_.NetAdapter -and $_.NetAdapter.Status -eq "Up" -and $_.IPv4Address
+        })
+        if ($configs.Count -gt 0) {
+            $ordered = $configs | Sort-Object -Property @{ Expression = {
+                if ($_.NetIPv4Interface) { $_.NetIPv4Interface.InterfaceMetric } else { 9999 }
+            } }
+            foreach ($cfg in $ordered) {
+                $ip = ($cfg.IPv4Address | Select-Object -First 1).IPAddress
+                if ($ip -and $ip -notlike "169.254.*") { return $ip }
+            }
+        }
+    } catch { }
+    # Fallback (older PowerShell/Server Core without Get-NetIPConfiguration):
+    # Get-NetIPAddress directly, filtered to DHCP/Manual IPv4 addresses on
+    # non-loopback/non-virtual interfaces, picked by lowest InterfaceMetric.
+    try {
+        $addrs = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object {
+            $_.IPAddress -notlike "169.254.*" -and $_.IPAddress -ne "127.0.0.1" -and
+            $_.PrefixOrigin -in @("Dhcp", "Manual") -and
+            $_.InterfaceAlias -notmatch "Loopback|vEthernet|Docker|WSL|Virtual|VPN|TAP|Tailscale|ZeroTier"
+        } | Sort-Object -Property InterfaceMetric)
+        if ($addrs.Count -gt 0) { return $addrs[0].IPAddress }
+    } catch { }
+    return $null
+}
+
+# ── Backup rotation (security hardening, 2026-07-31) — PowerShell parity ────
+# Every self-heal path below does Copy-Item $X "$X.bak-<timestamp>" before
+# touching $X (install-config.env, acl.yaml; update.ps1 also does this for
+# docker-compose.yml / docker-compose.override.yml). On a deployment that runs
+# unattended for months/years across many install/update runs, these
+# accumulate without bound. Keep only the $Keep most recent (default 5)
+# backups sharing $BasePath's name (any `.bak-*` suffix/tag counts against the
+# same budget); delete anything older. Safe/idempotent: a no-op when there are
+# $Keep or fewer, or none at all.
+#
+# Defined here (before Repair-InstallConfigCorruption below, which calls it)
+# because — unlike most scripting languages — PowerShell does NOT hoist
+# top-level `function` statements in a plain .ps1 script under the `irm | iex`
+# invocation this file documents at its own header: a function must already
+# have executed its `function Name {...}` statement before anything can call
+# it. Verified empirically in deploy/scripts/update.ps1 (a forward-reference
+# call throws "term is not recognized") — this definition was moved up here
+# (was previously further down, right before the postgres secret-file
+# self-heal block) to fix a real gap: Repair-InstallConfigCorruption's own
+# "$Path.bak-corrupt-$ts" backup never had a matching rotation call, unlike
+# every other self-heal backup site in this file and in update.ps1's own
+# Repair-InstallConfigCorruption — install-config.env.bak-corrupt-* could
+# accumulate one file per corrupted run with no cap.
+function Invoke-RotateBackups {
+    param(
+        [Parameter(Mandatory = $true)][string]$BasePath,
+        [int]$Keep = 5
+    )
+    $dir = Split-Path -Path $BasePath -Parent
+    if ([string]::IsNullOrEmpty($dir)) { $dir = "." }
+    $leaf = Split-Path -Path $BasePath -Leaf
+    $backups = Get-ChildItem -LiteralPath $dir -Filter "$leaf.bak-*" -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending
+    if ($backups -and $backups.Count -gt $Keep) {
+        $backups | Select-Object -Skip $Keep | ForEach-Object {
+            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 # ── Self-heal: repair an ALREADY-corrupted install-config.env ──────────────
 # Same repair logic as deploy/scripts/update.ps1's Repair-InstallConfigCorruption
 # — detects any physical line containing 2+ of our known "KEY=" markers (the
@@ -428,6 +517,7 @@ function Repair-InstallConfigCorruption {
     if (-not $corruptedFound) { return }
     $ts = Get-Date -Format "yyyyMMddTHHmmssZ"
     Copy-Item -LiteralPath $Path -Destination "$Path.bak-corrupt-$ts" -ErrorAction SilentlyContinue
+    Invoke-RotateBackups -BasePath $Path
     $newLines = @($clean.Keys | ForEach-Object { "$_=$($clean[$_])" })
     [System.IO.File]::WriteAllText($Path, (($newLines -join "`n") + "`n"), [System.Text.UTF8Encoding]::new($false))
     Write-Host "  ⚠ install-config.env was corrupted (concatenated values from a known PowerShell array/string bug, now fixed) — repaired automatically." -ForegroundColor Yellow
@@ -458,29 +548,53 @@ try {
         Remove-Item -Force -ErrorAction SilentlyContinue
 } catch { }
 
-# ── Backup rotation (security hardening, 2026-07-31) — PowerShell parity ────
-# Every self-heal path below does Copy-Item $X "$X.bak-<timestamp>" before
-# touching $X (acl.yaml; update.ps1 also does this for docker-compose.yml /
-# docker-compose.override.yml). On a deployment that runs unattended for
-# months/years across many install/update runs, these accumulate without
-# bound. Keep only the $Keep most recent (default 5) backups sharing
-# $BasePath's name (any `.bak-*` suffix/tag counts against the same budget);
-# delete anything older. Safe/idempotent: a no-op when there are $Keep or
-# fewer, or none at all.
-function Invoke-RotateBackups {
-    param(
-        [Parameter(Mandatory = $true)][string]$BasePath,
-        [int]$Keep = 5
-    )
-    $dir = Split-Path -Path $BasePath -Parent
-    if ([string]::IsNullOrEmpty($dir)) { $dir = "." }
-    $leaf = Split-Path -Path $BasePath -Leaf
-    $backups = Get-ChildItem -LiteralPath $dir -Filter "$leaf.bak-*" -File -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending
-    if ($backups -and $backups.Count -gt $Keep) {
-        $backups | Select-Object -Skip $Keep | ForEach-Object {
-            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
-        }
+# (Invoke-RotateBackups moved up above — right after Get-LanIPAddress, before
+# Repair-InstallConfigCorruption, which now also uses it — same reasoning as
+# the equivalent move already made in deploy/scripts/update.ps1.)
+
+# B-ENV-ACL (2026-08-12): natively-Windows NTFS ACL hardening for THIS .env —
+# the plaintext file at the project root that docker-compose actually reads
+# via `--env-file` when install.ps1/update.ps1 invoke `docker compose`
+# directly on the Windows host. This is a DIFFERENT file from dashboard-api's
+# own working .env (see server.js's EPHEMERAL_ENV_DIR comment, task #148):
+# that one lives on a container-internal tmpfs (`tmpfs: - /run/coderaft-env:
+# ...` on the dashboard-api service further down) and never touches the
+# Windows filesystem at all, so `mode: 0o600` there is real (POSIX, inside
+# the container's own Linux namespace) but irrelevant to NTFS. THIS .env
+# genuinely sits on NTFS and holds the same secrets in cleartext
+# (POSTGRES_PASSWORD, REDIS_PASSWORD, DASHBOARD_SECRET, ...) from the very
+# first `docker compose up` of a fresh install onward.
+#
+# Unlike secrets\postgres_password / secrets\redis_password / vault-keys\
+# age.key (which deliberately KEEP inherited Administrators/SYSTEM access —
+# see B-VAULT-ACL above — because Docker Desktop's 9P/plan9 file-sharing
+# bind-mounts THOSE files into a container under a different account context
+# and needs that inherited access to do so), .env is NEVER bind-mounted into
+# any container: `--env-file` is resolved CLIENT-SIDE by the docker compose
+# CLI process itself, running as the SAME Windows account that invoked this
+# script. So .env can be locked down harder with no Docker-side side effect:
+# disable inheritance entirely and grant FullControl to ONLY the current
+# user — matches the pattern update.ps1 already shipped for the same file
+# ("Banking-grade secret check", 2026-08-04), ported here so a FRESH install
+# gets the same protection immediately instead of being left on the parent
+# directory's inherited (potentially broader) ACL until the first
+# update.ps1 run. Best-effort: on failure (non-NTFS volume, restricted
+# account, ...) the file keeps whatever ACL it inherited from the parent
+# directory, same as before this hardening existed — never fatal.
+function Protect-EnvFileAcl {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+    try {
+        $acl = Get-Acl -LiteralPath $Path
+        $acl.SetAccessRuleProtection($true, $false)
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
+            "FullControl", "Allow")
+        $acl.ResetAccessRule($rule)
+        Set-Acl -LiteralPath $Path $acl -ErrorAction Stop
+    } catch {
+        Write-Host "  ⚠ Could not tighten NTFS ACL on $Path ($($_.Exception.Message.Trim()))." -ForegroundColor Yellow
+        Write-Host "    docker compose will still work; inherited ACL from the parent directory applies." -ForegroundColor Yellow
     }
 }
 
@@ -545,6 +659,7 @@ if ((Test-Path '.env') -and (Select-String -Path '.env' -Pattern '^POSTGRES_PASS
         Write-Host "  ⚠ Fixing UTF-8 BOM in .env..." -ForegroundColor Yellow
         $envContent = [System.Text.Encoding]::UTF8.GetString($envBytes, 3, $envBytes.Length - 3)
         [System.IO.File]::WriteAllText("$(Get-Location)\.env", $envContent, [System.Text.UTF8Encoding]::new($false))
+        Protect-EnvFileAcl "$(Get-Location)\.env"
     }
     # Existing install: HOST_PROJECT_DIR always (re)written to install-config.env
     # with the current install dir — the location may have changed since the
@@ -571,6 +686,7 @@ if ((Test-Path '.env') -and (Select-String -Path '.env' -Pattern '^POSTGRES_PASS
     $envLines = $envText -split "`r?`n" | Where-Object { $_ -notmatch '^(HOST_PROJECT_DIR|CODERAFT_HOST_OS|CODERAFT_HOST_ARCH)=' }
     $envText = (($envLines -join "`n").TrimEnd()) + "`n"
     [System.IO.File]::WriteAllText("$(Get-Location)\.env", $envText, [System.Text.UTF8Encoding]::new($false))
+    Protect-EnvFileAcl "$(Get-Location)\.env"
     Write-Host "  ✓ Existing config preserved (HOST_PROJECT_DIR refreshed)" -ForegroundColor Green
     # Task #148 Phase 3 (PowerShell parity): upgrade from a pre-#148 install
     # never had secrets\postgres_password — backfill it from the EXISTING
@@ -609,6 +725,7 @@ RAVENSCAN_CAPTURE_TOKEN=$(New-HexSecret 32)
 "@
     # Write without BOM — Docker Compose .env parser chokes on UTF-8 BOM
     [System.IO.File]::WriteAllText("$(Get-Location)\.env", $Env, [System.Text.UTF8Encoding]::new($false))
+    Protect-EnvFileAcl "$(Get-Location)\.env"
     # Task #148 Phase 3 (PowerShell parity): same value as .env's
     # POSTGRES_PASSWORD above, materialized as a standalone file for
     # postgres's `secrets:`/POSTGRES_PASSWORD_FILE — both must agree at the
@@ -629,6 +746,70 @@ CODERAFT_HOST_ARCH=$CoderaftArch
     [System.IO.File]::WriteAllText("$(Get-Location)\install-config.env", $ConfigEnv, [System.Text.UTF8Encoding]::new($false))
     Write-Host "  ✓ Secrets generated" -ForegroundColor Green
     Write-Host "  ✓ install-config.env generated" -ForegroundColor Green
+}
+
+# ── RELAY_ADVERTISE_HOST auto-detection (FalconOne Remote Assist relay) ────
+# See the Get-LanIPAddress header comment above for the full root-cause
+# writeup. Cascade, resolved once and stored in install-config.env (same
+# home as HOST_PROJECT_DIR/CODERAFT_HOST_OS/CODERAFT_HOST_ARCH — never .env,
+# this is public config, never a secret):
+#   0) A value already migrated/written to install-config.env on a previous
+#      run — including a manual correction — is NEVER touched again.
+#   1) A legacy RELAY_ADVERTISE_HOST left in .env by a manual edit (Liam was
+#      asked to do this once before this fix existed) is migrated as-is,
+#      then stripped from .env — install-config.env is authoritative.
+#   2) CODERAFT_HOSTNAME is configured in .env (Setup Wizard TLS step) and
+#      isn't just the internal LAN-only default "coderaft.local" — the
+#      operator already told the platform its externally-reachable name
+#      (wildcard/ACME mode), so reuse it.
+#   3) Otherwise, auto-detect this machine's own LAN IP (interface carrying
+#      the default route) — correct for the common case: a single Windows
+#      host on a LAN, the agent connects to it directly over that LAN.
+# NOTE: this auto-detection can be wrong on a multi-homed machine or a
+# deployment that WAN-port-forwards 21116-21117 to a different address than
+# the one detected here. In that case, a value set by hand directly in
+# install-config.env (RELAY_ADVERTISE_HOST=<host>:21117) ALWAYS wins over the
+# cascade above — see step 0 — but this is an escape hatch for an edge case,
+# never a prerequisite for a normal deployment to work.
+if (-not (Get-InstallConfigVar "RELAY_ADVERTISE_HOST")) {
+    $envPathForRelay = "$(Get-Location)\.env"
+    $legacyRelayHost = $null
+    if (Test-Path $envPathForRelay) {
+        $mLegacyRelay = Select-String -Path $envPathForRelay -Pattern '^RELAY_ADVERTISE_HOST=(.+)$' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($mLegacyRelay) { $legacyRelayHost = $mLegacyRelay.Matches.Groups[1].Value.Trim().Trim('"').Trim("'") }
+    }
+    if ($legacyRelayHost) {
+        Set-InstallConfigVar "RELAY_ADVERTISE_HOST" $legacyRelayHost
+        $envTextRelay = [System.IO.File]::ReadAllText($envPathForRelay, [System.Text.UTF8Encoding]::new($false))
+        $envLinesRelay = $envTextRelay -split "`r?`n" | Where-Object { $_ -notmatch '^RELAY_ADVERTISE_HOST=' }
+        [System.IO.File]::WriteAllText($envPathForRelay, ((($envLinesRelay -join "`n").TrimEnd()) + "`n"), [System.Text.UTF8Encoding]::new($false))
+        Protect-EnvFileAcl $envPathForRelay
+        Write-Host "  ✓ RELAY_ADVERTISE_HOST migré .env → install-config.env ($legacyRelayHost)" -ForegroundColor Green
+    } else {
+        $relayHost = $null
+        $relayReason = $null
+        $coderaftHostnameValue = $null
+        if (Test-Path $envPathForRelay) {
+            $mHostname = Select-String -Path $envPathForRelay -Pattern '^CODERAFT_HOSTNAME=(.+)$' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($mHostname) { $coderaftHostnameValue = $mHostname.Matches.Groups[1].Value.Trim().Trim('"').Trim("'") }
+        }
+        if ($coderaftHostnameValue -and $coderaftHostnameValue -notin @("coderaft.local", "localhost", "")) {
+            $relayHost = $coderaftHostnameValue
+            $relayReason = "CODERAFT_HOSTNAME configuré ($coderaftHostnameValue) — nom externe défini via le Setup Wizard"
+        } else {
+            $lanIp = Get-LanIPAddress
+            if ($lanIp) {
+                $relayHost = $lanIp
+                $relayReason = "IP LAN auto-détectée de cette machine ($lanIp) — aucun CODERAFT_HOSTNAME externe configuré"
+            }
+        }
+        if ($relayHost) {
+            Set-InstallConfigVar "RELAY_ADVERTISE_HOST" "${relayHost}:21117"
+            Write-Host "  ✓ RELAY_ADVERTISE_HOST auto-détecté : ${relayHost}:21117 ($relayReason)" -ForegroundColor Green
+        } else {
+            Write-Host "  ⚠ RELAY_ADVERTISE_HOST n'a pas pu être auto-détecté (aucune IP LAN trouvée) — FalconOne Remote Assist restera injoignable tant qu'une valeur n'est pas ajoutée manuellement à install-config.env (RELAY_ADVERTISE_HOST=<host>:21117)." -ForegroundColor Yellow
+        }
+    }
 }
 
 # Every `docker compose` invocation from here on must read BOTH files.
@@ -991,7 +1172,7 @@ clients:
 
   - name: entraguard
     cert_san: "entraguard.coderaft.local"
-    permissions: ["read:azure_*","read:license_key","read:entraguard_*","read:platform/identity/oidc"]
+    permissions: ["read:azure_*","read:license_key","read:entraguard_*","read:platform/identity/oidc","read:platform/identity/graph-tools","write:platform/identity/graph-tools","read:credentials/","read:tenant/"]
 
   - name: ravenscan
     cert_san: "ravenscan.coderaft.local"
@@ -1003,7 +1184,7 @@ clients:
 
   - name: falconone
     cert_san: "falconone.coderaft.local"
-    permissions: ["read:license_key","read:falconone_*","read:platform/identity/oidc","sign:falconone_agent_cert","read:falconone/nvd_api_key","read:falconone/audit_hmac_key","write:falconone/audit_hmac_key","read:falconone/pki/agents-ca/cert","read:pki/falconone-agents-ca*","write:pki/falconone-agents-ca*","read:falconone/scripts_ca*","write:falconone/scripts_ca*"]
+    permissions: ["read:license_key","read:falconone_*","read:platform/identity/oidc","read:platform/identity/graph-tools","sign:falconone_agent_cert","read:falconone/nvd_api_key","read:falconone/audit_hmac_key","write:falconone/audit_hmac_key","read:falconone/pki/agents-ca/cert","read:pki/falconone-agents-ca*","write:pki/falconone-agents-ca*","read:falconone/scripts_ca*","write:falconone/scripts_ca*"]
 
   - name: cve-proxy
     cert_san: "cve-proxy.coderaft.local"
@@ -1013,77 +1194,64 @@ clients:
     Write-Host "  ✓ Vault mTLS PKI generated (CA + server cert + 6 client certs)" -ForegroundColor Green
 }
 
-# ── FalconOne agents mTLS PKI (#170) ─────────────────────────────────────────
-# Distinct CA/leaf from the vault client PKI above: falconone-tls\agents-ca.crt
-# is the pool of ClientCAs falconone-api trusts for inbound agent mTLS, and
-# falconone-tls\server.crt is the leaf falconone-api presents on :8443 to its
-# own Windows agents. Bug #170: server.crt's SAN only ever had
-# [localhost, falconone-api] — remote agents connecting via
-# https://<public-hostname>:8443/agent/v1 failed hostname verification.
-# Self-healing: the CA is preserved if it already exists (regenerating it
-# would break trust for any agent already enrolled); only the leaf is
-# regenerated, and only when it's missing the "coderaft.local" SAN.
+# ── FalconOne agents mTLS PKI (#170, #174, #226) ─────────────────────────────
+# Historically (#170) this function ALSO generated a private, self-signed
+# CA + server leaf under falconone-tls\ as the :8443 agent listener's trust
+# chain. Task #174 moved that trust chain to the Coderaft Vault instead
+# (buildAgentTLSFromVault, cmd/falconone-api/main.go: fetches the Vault's
+# falconone-agents-ca and mints the :8443 server leaf from that SAME CA)
+# whenever Vault is reachable — the normal case — so this installer-generated
+# file was never actually part of a successful mTLS handshake once #174
+# shipped; main.go's preferred path never reads it.
+#
+# Worse, its mere presence on disk caused a real incident: task #223 found
+# the deployment-bundle builder (internal/experience/bundle.go) was still
+# unconditionally pinning THIS file's CA into every new agent's
+# server-ca.pem while the :8443 listener actually presented a Vault-signed
+# leaf — fresh enrolment failed with "x509: certificate signed by unknown
+# authority", live-reported by an operator 2026-08-11 (root-caused + fixed
+# in bundle.go, commit 3f60303). The installer CA looks legitimate (it's a
+# real, validly-formed 10-year CA) but corresponds to nothing any agent
+# actually trusts — exactly the kind of on-disk artifact that keeps
+# resurfacing as a source of confusion in any code path that falls back to
+# reading it.
+#
+# #226 fix: stop generating it, here and in install.sh / update.sh /
+# update.ps1. main.go's buildAgentTLS keeps its Path B fallback (reads
+# cfg.AgentServerCrt/Key/AgentsCA from disk when Vault is unreachable at
+# boot) UNCHANGED — that stays available for an operator who deliberately
+# places override material at those paths — but it is no longer fed
+# automatically by this installer. Net effect: if Vault is down at first
+# boot and nobody has manually provided override files, falconone-api now
+# fails closed (refuses to start rather than serve a TLS trust chain that
+# matches no real agent) instead of degrading silently. See buildAgentTLS's
+# own doc comment in main.go for that tradeoff.
+#
+# Any file left over from a pre-#226 install/update is backed up (not just
+# deleted — recoverable, same convention as the acl.yaml self-heals below)
+# and removed here too, so upgrading an EXISTING deployment also closes the
+# hole. This is safe: as explained above, that file was never what a
+# successfully-registered agent actually trusts once Vault has ever been
+# reachable, so removing it cannot break a live, working handshake — it can
+# only change what happens on a FUTURE boot where Vault is unreachable, from
+# "silently wrong trust" to "fail closed" (or "trust the manual override",
+# if one is present). No more Docker/alpine/openssl dependency either.
 function Invoke-FalconOneTlsBootstrap {
     param([Parameter(Mandatory = $true)][string]$InstallDir)
 
     $foTlsDir = Join-Path $InstallDir "falconone-tls"
     New-Item -ItemType Directory -Force -Path $foTlsDir | Out-Null
 
-    $foSanList = [System.Collections.Generic.List[string]]::new()
-    foreach ($s in @("DNS:localhost", "DNS:falconone-api", "DNS:coderaft.local")) { $foSanList.Add($s) }
-    if ($env:COMPUTERNAME) { $foSanList.Add("DNS:$($env:COMPUTERNAME)") }
-    if ($env:CODERAFT_EXTRA_HOSTS) {
-        foreach ($h in ($env:CODERAFT_EXTRA_HOSTS -split ",")) {
-            $trimmed = $h.Trim()
-            if ($trimmed) { $foSanList.Add("DNS:$trimmed") }
+    $ts = Get-Date -Format "yyyyMMddHHmmss"
+    foreach ($f in @("agents-ca.crt", "agents-ca.key", "agents-ca.srl", "server.crt", "server.key")) {
+        $p = Join-Path $foTlsDir $f
+        if (Test-Path -LiteralPath $p -PathType Leaf) {
+            Copy-Item -LiteralPath $p -Destination "$p.bak-$ts" -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+            Invoke-RotateBackups -BasePath $p
         }
     }
-    $foSanList.Add("IP:127.0.0.1")
-    $foSanString = (($foSanList | Select-Object -Unique) -join ",")
-
-    $foScript = @'
-set -e
-apk add --no-cache openssl >/dev/null
-cd /work
-if [ ! -f agents-ca.crt ]; then
-    openssl req -x509 -newkey rsa:4096 -days 3650 -nodes -sha256 \
-        -keyout agents-ca.key -out agents-ca.crt \
-        -subj "/CN=falconone-agents-ca" \
-        -addext "basicConstraints=critical,CA:TRUE" 2>/dev/null
-fi
-NEED_REGEN=1
-if [ -f server.crt ] && openssl x509 -in server.crt -noout -text 2>/dev/null | grep -q "coderaft.local"; then
-    NEED_REGEN=0
-fi
-if [ "$NEED_REGEN" = "1" ]; then
-    openssl req -newkey rsa:2048 -nodes -sha256 \
-        -keyout server.key -out server.csr \
-        -subj "/CN=falconone-agents" 2>/dev/null
-    cat > /tmp/server.ext <<EOF
-subjectAltName=__FO_SAN_LIST__
-basicConstraints=CA:FALSE
-EOF
-    openssl x509 -req -days 3650 -sha256 \
-        -in server.csr -CA agents-ca.crt -CAkey agents-ca.key -CAcreateserial \
-        -out server.crt -extfile /tmp/server.ext 2>/dev/null
-    rm -f server.csr /tmp/server.ext
-fi
-chmod 644 *.crt *.key 2>/dev/null || true
-'@
-    $foScript = $foScript.Replace("__FO_SAN_LIST__", $foSanString)
-    $foScriptFile = Join-Path $env:TEMP "coderaft-fo-tls-$(Get-Random).sh"
-    $foScriptLF = $foScript -replace "`r`n", "`n"
-    [System.IO.File]::WriteAllText($foScriptFile, $foScriptLF, [System.Text.UTF8Encoding]::new($false))
-    $absFoTlsDir = (Resolve-Path -LiteralPath $foTlsDir).Path
-
-    Start-Process -FilePath "docker" -ArgumentList @(
-        "run", "--rm",
-        "-v", "${foScriptFile}:/script.sh:ro",
-        "-v", "${absFoTlsDir}:/work",
-        "alpine:3.20", "sh", "/script.sh"
-    ) -NoNewWindow -Wait -ErrorAction SilentlyContinue | Out-Null
-    Remove-Item -Path $foScriptFile -ErrorAction SilentlyContinue
-    Write-DetailLog "FalconOne agents PKI written (SAN: $foSanString)"
+    Write-DetailLog "FalconOne agent TLS: no installer-generated PKI - trust sourced from Vault at boot (#226)"
 }
 
 # ── ACL self-heal: falconone entry/permissions (#172) ────────────────────────
@@ -1108,6 +1276,7 @@ function Invoke-FalconOneAclSelfHeal {
         "read:license_key",
         "read:falconone_*",
         "read:platform/identity/oidc",
+        "read:platform/identity/graph-tools",
         "sign:falconone_agent_cert",
         "read:falconone/nvd_api_key",
         "read:falconone/audit_hmac_key",
@@ -1138,6 +1307,7 @@ function Invoke-FalconOneAclSelfHeal {
       - "read:license_key"
       - "read:falconone_*"
       - "read:platform/identity/oidc"
+      - "read:platform/identity/graph-tools"
       - "sign:falconone_agent_cert"
       - "read:falconone/nvd_api_key"
       - "read:falconone/audit_hmac_key"
@@ -1386,11 +1556,11 @@ $chmodExtra
 
 Invoke-VaultBootstrap
 
-# ── FalconOne mTLS PKI + ACL self-heal (#170 / #172) ─────────────────────────
+# ── FalconOne mTLS PKI + ACL self-heal (#170 / #172 / #226) ──────────────────
 # Always run, independent of Invoke-VaultBootstrap's internal "already
 # exists — skipping" guards, so a re-run of this installer on an existing
-# install still gets the extended-SAN falconone-tls cert and any missing
-# ACL permissions healed. (2026-08-05) Console only gets one concise phase
+# install still gets the legacy-PKI cleanup (#226) and any missing ACL
+# permissions healed. (2026-08-05) Console only gets one concise phase
 # line — per-product ACL/PKI/cert self-heal detail goes to $INSTALL_LOG via
 # Write-DetailLog instead (see the log-file setup near the top of this script).
 Write-Host "  Checking vault ACL / PKI provisioning..."
@@ -1426,6 +1596,7 @@ foreach ($kv in @(
     }
 }
 [System.IO.File]::WriteAllText("$(Get-Location)\.env", $envText, [System.Text.UTF8Encoding]::new($false))
+Protect-EnvFileAcl "$(Get-Location)\.env"
 
 # Init DB
 [System.IO.File]::WriteAllText("$(Get-Location)\init-db.sql", '-- Product databases are created by the dashboard on demand', [System.Text.UTF8Encoding]::new($false))
@@ -1833,6 +2004,63 @@ services:
     mem_reservation: 64m
     cpus: 1
     restart: unless-stopped
+
+  # ── self-update-runner ──────────────────────────────────────────────────
+  # Root cause fix (2026-08-13, incident live chez Liam): dashboard-api's own
+  # self-update (`docker compose up -d --force-recreate --no-deps
+  # dashboard-api`) kills the very process issuing that command — Docker/runc
+  # tears down the WHOLE cgroup on container stop (not just PID 1), so the
+  # `docker compose` CLI child spawned by dashboard-api dies mid-sequence,
+  # before it can start the replacement container. This companion, one-off
+  # service runs the SAME pull + force-recreate + healthcheck step for
+  # dashboard-api from a SEPARATE container (different cgroup, unaffected by
+  # dashboard-api's own teardown) — see dashboard-api/routes/platform.js's
+  # delegateSelfUpdate() and dashboard-api/scripts/self-update-runner.js for
+  # the full mechanism.
+  #
+  # `profiles: [self-update-runner]`: never started by a normal `docker
+  # compose up -d` (this installer, a plain restart, update.ps1/update.sh's
+  # own reconcile pass, etc. carry no trace of it) — invoked EXCLUSIVELY via
+  # `docker compose --profile self-update-runner run -d --rm --no-deps
+  # self-update-runner`, emitted by dashboard-api itself right before its own
+  # turn in the update loop, which then returns immediately (full hand-off).
+  #
+  # Same image as dashboard-api (just a different entrypoint) — no separate
+  # build/pull surface to maintain in lockstep. DATABASE_URL / DOCKER_HOST /
+  # CONTAINER_COMPOSE_DIR / the `/host-compose` bind mirror the dashboard-api
+  # service above exactly: this companion calls the identical runCompose()
+  # helper against the identical compose project. `dashboard_data:/data:ro`
+  # is READ-ONLY — this companion only READS the Slack/Teams webhook secrets
+  # from dashboard-api's own on-disk vault (vault.enc under /data, see
+  # vault.js) to send the final update notification; it never writes.
+  #
+  # `networks:`: unlike dashboard-api, this service has no HTTP listener of
+  # its own and never talks to coderaft-vault (its "vault" access is the
+  # local /data:ro file, not the mTLS coderaft-vault container) — it only
+  # needs coderaft-backend (to resolve `postgres`; pg_hba.conf rejects any
+  # peer outside this network's pinned subnet, see the postgres service
+  # below) and docker-proxy-net (to reach `docker-proxy` for DOCKER_HOST).
+  # dashboard-api itself joins both of those networks too, so the healthcheck
+  # HTTP call to `dashboard-api:3001` (see SERVICE_HEALTH_URLS in
+  # routes/platform.js) resolves without any additional network.
+  self-update-runner:
+    image: ghcr.io/liamj74/coderaft-dashboard-api:latest
+    entrypoint: ["node", "scripts/self-update-runner.js"]
+    profiles: ["self-update-runner"]
+    networks:
+      - docker-proxy-net
+      - coderaft-backend
+    environment:
+      - DATABASE_URL=postgres://coderaft:${POSTGRES_PASSWORD}@postgres:5432/coderaft
+      - DOCKER_HOST=tcp://docker-proxy:2375
+      - CONTAINER_COMPOSE_DIR=/host-compose
+      - COMPOSE_PROJECT_NAME=coderaft
+    volumes:
+      - .:/host-compose
+      - dashboard_data:/data:ro
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    restart: "no"
 
   postgres:
     image: postgres:16-alpine
@@ -2243,10 +2471,19 @@ function Install-CaddyRootCA {
 }
 
 # ── hosts file entries ──────────────────────────────────────────────────────
+# Only coderaft.local needs to resolve: Caddy's platform site block matches
+# `coderaft.local, *.coderaft.local` and reverse-proxies everything to the
+# same unified dashboard container (see the Caddyfile generation further
+# down) — there is no per-product vhost routing. The former
+# entraguard/ravenscan/redfox subdomains in this entry were a leftover from
+# before the platform-only unification and are unrelated to the *.coderaft.local
+# names used internally as mTLS client-cert SANs between containers — neither
+# needs a Windows hosts entry. Removed 2026-09-15 (was actively confusing a
+# real user, cf STATUS.md).
 function Ensure-HostsEntry {
     $hostsFile = "$env:WINDIR\System32\drivers\etc\hosts"
     $marker    = "# coderaft-platform"
-    $entry     = "127.0.0.1 coderaft.local entraguard.coderaft.local ravenscan.coderaft.local redfox.coderaft.local $marker"
+    $entry     = "127.0.0.1 coderaft.local $marker"
 
     if (Test-Path $hostsFile) {
         $existing = Get-Content $hostsFile -ErrorAction SilentlyContinue
@@ -2330,7 +2567,15 @@ for ($i = 0; $i -lt 30; $i++) {
     Start-Sleep -Seconds 2
 }
 docker compose --env-file install-config.env --env-file .env up -d
-Write-Host "  Updated! Dashboard: http://localhost:3000"
+$dashboardHostname = "coderaft.local"
+if (Test-Path ".env") {
+    $mDashboardHostname = Select-String -Path ".env" -Pattern '^CODERAFT_HOSTNAME=(.+)$' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($mDashboardHostname) {
+        $configuredHostname = $mDashboardHostname.Matches.Groups[1].Value.Trim().Trim('"').Trim("'")
+        if ($configuredHostname -and $configuredHostname -ne "localhost") { $dashboardHostname = $configuredHostname }
+    }
+}
+Write-Host "  Updated! Dashboard: https://$dashboardHostname"
 '@ -Encoding UTF8
 }
 
@@ -2341,6 +2586,24 @@ try {
     Set-Content -Path 'rollback.ps1' -Value @'
 Write-Host "rollback.ps1 placeholder — fetch the real one from https://install.coderaft.io/rollback.ps1"
 Write-Host "or run: irm https://install.coderaft.io/rollback.ps1 -OutFile rollback.ps1"
+exit 1
+'@ -Encoding UTF8
+}
+
+# check-caddy-cert.ps1 (2026-08-13): standalone daily Caddy TLS certificate
+# watchdog, registered as a Windows Scheduled Task further below. See that
+# script's own header for the full incident writeup — closes the gap
+# where an install that never runs update.ps1 again (the common case for
+# a "set and forget" customer deployment) would otherwise silently hit an
+# expired Caddy certificate with nobody around to run
+# `docker compose restart caddy`.
+try {
+    $c = Invoke-WebRequest -Uri "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/check-caddy-cert.ps1" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+    [System.IO.File]::WriteAllText("$PWD\check-caddy-cert.ps1", $c.Content, [System.Text.Encoding]::UTF8)
+} catch {
+    Set-Content -Path 'check-caddy-cert.ps1' -Value @'
+Write-Host "check-caddy-cert.ps1 placeholder — fetch the real one from https://install.coderaft.io/check-caddy-cert.ps1"
+Write-Host "or run: irm https://install.coderaft.io/check-caddy-cert.ps1 -OutFile check-caddy-cert.ps1"
 exit 1
 '@ -Encoding UTF8
 }
@@ -2863,6 +3126,20 @@ Start-Sleep -Seconds 10
 # Skip flag retained for documentation; no-op now.
 if ($env:SKIP_NATIVE_CAPTURE -eq "1") {
     Write-Host "  ⓘ Capture daemon install skipped (SKIP_NATIVE_CAPTURE=1)"
+}
+
+# ── Caddy cert watchdog Scheduled Task registration (2026-08-13) ─────────
+# Idempotent (check-caddy-cert.ps1's own Register-CaddyCertWatchdogTask
+# checks Get-ScheduledTask first and only refreshes the action if the task
+# already exists), so re-running install.ps1 never duplicates it.
+# Non-fatal: any failure (locked-down Task Scheduler, restrictive GPO)
+# just logs a warning telling the operator how to add it manually.
+Write-Host ""
+Write-Host "  Registering the daily Caddy certificate watchdog..."
+try {
+    & "$AbsoluteInstallDir\check-caddy-cert.ps1" -RegisterTask
+} catch {
+    Write-Host "  [warn] Could not register the Caddy cert watchdog scheduled task: $($_.Exception.Message)" -ForegroundColor Yellow
 }
 
 $DashboardUrl = "http://localhost:3000"

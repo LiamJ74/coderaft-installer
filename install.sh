@@ -49,7 +49,7 @@ set -e
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.sh/install.sh.sha256 at all — today it still proxies
 # the legacy `coderaft-installer` repo.
-EXPECTED_SHA256="78e6b7dd25189572428c605da781eeb6f1e8f747de16d7a36c465b805d9f704a"
+EXPECTED_SHA256="6e46340add132f029372b90729b65e714b3e0529e3f86702a1057184d4b00a5a"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -232,7 +232,9 @@ ensure_age_binary() {
     AGE_OS="${CODERAFT_OS/macos/darwin}"
     AGE_TMP="$(mktemp -d)"
     trap 'rm -rf "$AGE_TMP"' EXIT
-    curl -fsSL "https://github.com/FiloSottile/age/releases/download/${AGE_VERSION}/age-${AGE_VERSION}-${AGE_OS}-${CODERAFT_ARCH}.tar.gz" \
+    # --max-time 60: mirrors install.ps1's Invoke-WebRequest -TimeoutSec 60 for
+    # this same age release download.
+    curl -fsSL --max-time 60 "https://github.com/FiloSottile/age/releases/download/${AGE_VERSION}/age-${AGE_VERSION}-${AGE_OS}-${CODERAFT_ARCH}.tar.gz" \
         -o "${AGE_TMP}/age.tar.gz" 2>/dev/null || return 1
     tar -xzf "${AGE_TMP}/age.tar.gz" -C "${AGE_TMP}" 2>/dev/null
     sudo install -m 755 "${AGE_TMP}/age/age-keygen" /usr/local/bin/age-keygen 2>/dev/null \
@@ -287,6 +289,42 @@ setup_age_key || true
 
 # Generate secrets on first install
 gen_hex() { openssl rand -hex "$1" 2>/dev/null || head -c "$1" /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+
+# ── LAN IP auto-detection (RELAY_ADVERTISE_HOST — FalconOne Remote Assist) ──
+# See the matching PowerShell parity comment in deploy/install.ps1's
+# Get-LanIPAddress for the full root-cause writeup (commit 471f0b7 +
+# dashboard-api/server.js's "falconone-relay" service block). Linux/macOS
+# parity for the RELAY_ADVERTISE_HOST cascade further down this file.
+#
+# `ip route get` performs a route LOOKUP only (no packet ever sent) and
+# reports the source IP the kernel would use to reach a public address —
+# i.e. the LAN-facing IP of whichever interface carries the default route.
+# This naturally skips docker0/veth/br-* bridges, which are never on the
+# default route. macOS has no `ip` by default (no iproute2), so `route get`
+# resolves the outbound interface first, then `ipconfig getifaddr` reads
+# its IPv4 address.
+get_lan_ip() {
+    local ip=""
+    case "$(uname -s)" in
+        Linux)
+            if command -v ip >/dev/null 2>&1; then
+                ip=$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)
+            fi
+            if [ -z "$ip" ] && command -v hostname >/dev/null 2>&1; then
+                # Fallback for minimal images without iproute2.
+                ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+            fi
+            ;;
+        Darwin)
+            local iface
+            iface=$(route -n get 1.1.1.1 2>/dev/null | awk '/interface:/{print $2}')
+            if [ -n "$iface" ]; then
+                ip=$(ipconfig getifaddr "$iface" 2>/dev/null)
+            fi
+            ;;
+    esac
+    printf '%s' "$ip"
+}
 
 ABSOLUTE_INSTALL_DIR="$(pwd)"
 
@@ -429,6 +467,57 @@ CONFIGFILE
     echo "  ✓ install-config.env generated"
 fi
 
+# ── RELAY_ADVERTISE_HOST auto-detection (FalconOne Remote Assist relay) ────
+# See get_lan_ip's header comment above for the full root-cause writeup.
+# Cascade, resolved once and stored in install-config.env (same home as
+# HOST_PROJECT_DIR/CODERAFT_HOST_OS/CODERAFT_HOST_ARCH — never .env, this is
+# public config, never a secret):
+#   0) A value already migrated/written to install-config.env on a previous
+#      run — including a manual correction — is NEVER touched again.
+#   1) A legacy RELAY_ADVERTISE_HOST left in .env by a manual edit is
+#      migrated as-is, then stripped from .env — install-config.env is
+#      authoritative.
+#   2) CODERAFT_HOSTNAME configured in .env (Setup Wizard TLS step) and not
+#      just the internal LAN-only default "coderaft.local" → reuse it, the
+#      operator already told the platform its externally-reachable name.
+#   3) Otherwise, auto-detect this machine's own LAN IP (interface carrying
+#      the default route) — correct for the common case.
+# NOTE: this auto-detection can be wrong on a multi-homed machine or a
+# deployment that WAN-port-forwards 21116-21117 to a different address than
+# the one detected here. In that case, a value set by hand directly in
+# install-config.env (RELAY_ADVERTISE_HOST=<host>:21117) ALWAYS wins over the
+# cascade above — see step 0 — but this is an escape hatch, never a
+# prerequisite for a normal deployment to work.
+if ! grep -q '^RELAY_ADVERTISE_HOST=' install-config.env 2>/dev/null; then
+    LEGACY_RELAY_HOST=""
+    if [ -f .env ] && grep -qE '^RELAY_ADVERTISE_HOST=' .env 2>/dev/null; then
+        LEGACY_RELAY_HOST="$(grep -E '^RELAY_ADVERTISE_HOST=' .env | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | xargs)"
+    fi
+    if [ -n "$LEGACY_RELAY_HOST" ]; then
+        upsert_install_config RELAY_ADVERTISE_HOST "$LEGACY_RELAY_HOST"
+        grep -vE '^RELAY_ADVERTISE_HOST=' .env > .env.tmp && mv .env.tmp .env
+        chmod 600 .env
+        echo "  ✓ RELAY_ADVERTISE_HOST migré .env → install-config.env ($LEGACY_RELAY_HOST)"
+    else
+        RELAY_HOSTNAME_VAL=""
+        if [ -f .env ] && grep -qE '^CODERAFT_HOSTNAME=' .env 2>/dev/null; then
+            RELAY_HOSTNAME_VAL="$(grep -E '^CODERAFT_HOSTNAME=' .env | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | xargs)"
+        fi
+        if [ -n "$RELAY_HOSTNAME_VAL" ] && [ "$RELAY_HOSTNAME_VAL" != "coderaft.local" ] && [ "$RELAY_HOSTNAME_VAL" != "localhost" ]; then
+            upsert_install_config RELAY_ADVERTISE_HOST "${RELAY_HOSTNAME_VAL}:21117"
+            echo "  ✓ RELAY_ADVERTISE_HOST auto-détecté : ${RELAY_HOSTNAME_VAL}:21117 (CODERAFT_HOSTNAME configuré — nom externe défini via le Setup Wizard)"
+        else
+            RELAY_LAN_IP="$(get_lan_ip)"
+            if [ -n "$RELAY_LAN_IP" ]; then
+                upsert_install_config RELAY_ADVERTISE_HOST "${RELAY_LAN_IP}:21117"
+                echo "  ✓ RELAY_ADVERTISE_HOST auto-détecté : ${RELAY_LAN_IP}:21117 (IP LAN auto-détectée de cette machine — aucun CODERAFT_HOSTNAME externe configuré)"
+            else
+                echo "  ⚠ RELAY_ADVERTISE_HOST n'a pas pu être auto-détecté (aucune IP LAN trouvée) — FalconOne Remote Assist restera injoignable tant qu'une valeur n'est pas ajoutée manuellement à install-config.env (RELAY_ADVERTISE_HOST=<host>:21117)."
+            fi
+        fi
+    fi
+fi
+
 # Every `docker compose` invocation from here on must read BOTH files —
 # install-config.env (plaintext config) first, then .env (secrets) so a
 # stray key collision (should never happen, see #150 var lists) resolves in
@@ -463,7 +552,11 @@ encrypt_env_to_enc() {
         # Try to install sops on the fly; non-fatal.
         SOPS_VERSION="v3.8.1"
         SOPS_OS="${CODERAFT_OS/macos/darwin}"
-        curl -fsSL "https://github.com/getsops/sops/releases/download/${SOPS_VERSION}/sops-${SOPS_VERSION}.${SOPS_OS}.${CODERAFT_ARCH}" \
+        # --max-time 60: no direct install.ps1 equivalent (the Windows install
+        # path doesn't fetch a standalone sops binary), so by analogy with the
+        # sibling age release download above (same file, same GitHub-release
+        # binary category).
+        curl -fsSL --max-time 60 "https://github.com/getsops/sops/releases/download/${SOPS_VERSION}/sops-${SOPS_VERSION}.${SOPS_OS}.${CODERAFT_ARCH}" \
             -o /tmp/sops-coderaft 2>/dev/null || return 1
         sudo install -m 755 /tmp/sops-coderaft /usr/local/bin/sops 2>/dev/null \
             || install -m 755 /tmp/sops-coderaft "$HOME/.local/bin/sops" 2>/dev/null \
@@ -755,7 +848,7 @@ clients:
 
   - name: entraguard
     cert_san: "entraguard.coderaft.local"
-    permissions: ["read:azure_*","read:license_key","read:entraguard_*","read:platform/identity/oidc"]
+    permissions: ["read:azure_*","read:license_key","read:entraguard_*","read:platform/identity/oidc","read:platform/identity/graph-tools","write:platform/identity/graph-tools","read:credentials/","read:tenant/"]
 
   - name: ravenscan
     cert_san: "ravenscan.coderaft.local"
@@ -767,7 +860,7 @@ clients:
 
   - name: falconone
     cert_san: "falconone.coderaft.local"
-    permissions: ["read:license_key","read:falconone_*","read:platform/identity/oidc","sign:falconone_agent_cert","read:falconone/nvd_api_key","read:falconone/audit_hmac_key","write:falconone/audit_hmac_key","read:falconone/pki/agents-ca/cert","read:pki/falconone-agents-ca*","write:pki/falconone-agents-ca*","read:falconone/scripts_ca*","write:falconone/scripts_ca*"]
+    permissions: ["read:license_key","read:falconone_*","read:platform/identity/oidc","read:platform/identity/graph-tools","sign:falconone_agent_cert","read:falconone/nvd_api_key","read:falconone/audit_hmac_key","write:falconone/audit_hmac_key","read:falconone/pki/agents-ca/cert","read:pki/falconone-agents-ca*","write:pki/falconone-agents-ca*","read:falconone/scripts_ca*","write:falconone/scripts_ca*"]
 
   - name: cve-proxy
     cert_san: "cve-proxy.coderaft.local"
@@ -804,94 +897,64 @@ _vault_client_cert() {
     fi
 }
 
-# ── FalconOne agents mTLS PKI (#170) ─────────────────────────────────────────
-# Distinct CA/leaf from the vault client PKI above: falconone-tls/agents-ca.crt
-# is the pool of ClientCAs falconone-api trusts for inbound agent mTLS, and
-# falconone-tls/server.crt is the leaf falconone-api presents on :8443 to its
-# own Windows agents. Bug #170: server.crt's SAN only ever had
-# [localhost, falconone-api] — remote agents connecting via
-# https://<public-hostname>:8443/agent/v1 failed hostname verification.
-# Self-healing: the CA is preserved if it already exists (regenerating it
-# would break trust for any agent already enrolled); only the leaf is
-# regenerated, and only when it's missing the "coderaft.local" SAN.
+# ── FalconOne agents mTLS PKI (#170, #174, #226) ─────────────────────────────
+# Historically (#170) this function ALSO generated a private, self-signed
+# CA + server leaf under falconone-tls/ as the :8443 agent listener's trust
+# chain. Task #174 moved that trust chain to the Coderaft Vault instead
+# (buildAgentTLSFromVault, cmd/falconone-api/main.go: fetches the Vault's
+# falconone-agents-ca and mints the :8443 server leaf from that SAME CA)
+# whenever Vault is reachable — the normal case — so this installer-generated
+# file was never actually part of a successful mTLS handshake once #174
+# shipped; main.go's preferred path never reads it.
+#
+# Worse, its mere presence on disk caused a real incident: task #223 found
+# the deployment-bundle builder (internal/experience/bundle.go) was still
+# unconditionally pinning THIS file's CA into every new agent's
+# server-ca.pem while the :8443 listener actually presented a Vault-signed
+# leaf — fresh enrolment failed with "x509: certificate signed by unknown
+# authority", live-reported by an operator 2026-08-11 (root-caused + fixed
+# in bundle.go, commit 3f60303). The installer CA looks legitimate (it's a
+# real, validly-formed 10-year CA) but corresponds to nothing any agent
+# actually trusts — exactly the kind of on-disk artifact that keeps
+# resurfacing as a source of confusion in any code path that falls back to
+# reading it.
+#
+# #226 fix: stop generating it, here and in install.ps1 / update.sh /
+# update.ps1. main.go's buildAgentTLS keeps its Path B fallback (reads
+# cfg.AgentServerCrt/Key/AgentsCA from disk when Vault is unreachable at
+# boot) UNCHANGED — that stays available for an operator who deliberately
+# places override material at those paths — but it is no longer fed
+# automatically by this installer. Net effect: if Vault is down at first
+# boot and nobody has manually provided override files, falconone-api now
+# fails closed (refuses to start rather than serve a TLS trust chain that
+# matches no real agent) instead of degrading silently. See buildAgentTLS's
+# own doc comment in main.go for that tradeoff.
+#
+# Any file left over from a pre-#226 install/update is backed up (not just
+# deleted — recoverable, same convention as the acl.yaml self-heals below)
+# and removed here too, so upgrading an EXISTING deployment also closes the
+# hole. This is safe: as explained above, that file was never what a
+# successfully-registered agent actually trusts once Vault has ever been
+# reachable, so removing it cannot break a live, working handshake — it can
+# only change what happens on a FUTURE boot where Vault is unreachable, from
+# "silently wrong trust" to "fail closed" (or "trust the manual override",
+# if one is present).
 _falconone_tls_bootstrap() {
     local install_dir="${1:?install_dir required}"
     local fo_tls_dir="${install_dir}/falconone-tls"
     mkdir -p "$fo_tls_dir"
     chmod 755 "$fo_tls_dir"
 
-    local fo_sans="DNS:localhost,DNS:falconone-api,DNS:coderaft.local"
-    local fo_hostname
-    fo_hostname="$(hostname 2>/dev/null || true)"
-    [ -n "$fo_hostname" ] && fo_sans="${fo_sans},DNS:${fo_hostname}"
-    if [ -n "${CODERAFT_EXTRA_HOSTS:-}" ]; then
-        local _h _extra_hosts
-        IFS=',' read -ra _extra_hosts <<< "$CODERAFT_EXTRA_HOSTS"
-        for _h in "${_extra_hosts[@]}"; do
-            _h="$(echo "$_h" | xargs)"
-            [ -n "$_h" ] && fo_sans="${fo_sans},DNS:${_h}"
-        done
-    fi
-    fo_sans="${fo_sans},IP:127.0.0.1"
-
-    if command -v openssl &>/dev/null; then
-        if [ ! -f "${fo_tls_dir}/agents-ca.crt" ]; then
-            openssl req -x509 -newkey rsa:4096 -days 3650 -nodes -sha256 \
-                -keyout "${fo_tls_dir}/agents-ca.key" -out "${fo_tls_dir}/agents-ca.crt" \
-                -subj "/CN=falconone-agents-ca" \
-                -addext "basicConstraints=critical,CA:TRUE" 2>/dev/null
+    local f ts
+    ts="$(date +%Y%m%d%H%M%S)"
+    for f in agents-ca.crt agents-ca.key agents-ca.srl server.crt server.key; do
+        if [ -f "${fo_tls_dir}/${f}" ]; then
+            cp "${fo_tls_dir}/${f}" "${fo_tls_dir}/${f}.bak-${ts}"
+            rm -f "${fo_tls_dir}/${f}"
+            _rotate_backups "${fo_tls_dir}/${f}"
         fi
-        local need_regen=1
-        if [ -f "${fo_tls_dir}/server.crt" ] && openssl x509 -in "${fo_tls_dir}/server.crt" -noout -text 2>/dev/null | grep -q "coderaft.local"; then
-            need_regen=0
-        fi
-        if [ "$need_regen" = "1" ]; then
-            openssl req -newkey rsa:2048 -nodes -sha256 \
-                -keyout "${fo_tls_dir}/server.key" -out "${fo_tls_dir}/server.csr" \
-                -subj "/CN=falconone-agents" 2>/dev/null
-            openssl x509 -req -days 3650 -sha256 \
-                -in "${fo_tls_dir}/server.csr" \
-                -CA "${fo_tls_dir}/agents-ca.crt" -CAkey "${fo_tls_dir}/agents-ca.key" -CAcreateserial \
-                -out "${fo_tls_dir}/server.crt" \
-                -extfile <(printf "subjectAltName=%s\nbasicConstraints=CA:FALSE" "$fo_sans") 2>/dev/null
-            rm -f "${fo_tls_dir}/server.csr"
-        fi
-        chmod 644 "${fo_tls_dir}"/*.crt "${fo_tls_dir}"/*.key 2>/dev/null || true
-    else
-        local abs_fo_tls_dir fo_script_file
-        abs_fo_tls_dir="$(cd "$fo_tls_dir" && pwd)"
-        fo_script_file="$(mktemp)"
-        cat > "$fo_script_file" <<'FOSCRIPT'
-set -e
-apk add --no-cache openssl >/dev/null
-cd /work
-if [ ! -f agents-ca.crt ]; then
-    openssl req -x509 -newkey rsa:4096 -days 3650 -nodes -sha256 \
-        -keyout agents-ca.key -out agents-ca.crt \
-        -subj "/CN=falconone-agents-ca" \
-        -addext "basicConstraints=critical,CA:TRUE" 2>/dev/null
-fi
-NEED_REGEN=1
-if [ -f server.crt ] && openssl x509 -in server.crt -noout -text 2>/dev/null | grep -q "coderaft.local"; then
-    NEED_REGEN=0
-fi
-if [ "$NEED_REGEN" = "1" ]; then
-    openssl req -newkey rsa:2048 -nodes -sha256 \
-        -keyout server.key -out server.csr \
-        -subj "/CN=falconone-agents" 2>/dev/null
-    printf "subjectAltName=__FO_SAN_LIST__\nbasicConstraints=CA:FALSE" > /tmp/server.ext
-    openssl x509 -req -days 3650 -sha256 \
-        -in server.csr -CA agents-ca.crt -CAkey agents-ca.key -CAcreateserial \
-        -out server.crt -extfile /tmp/server.ext 2>/dev/null
-    rm -f server.csr /tmp/server.ext
-fi
-chmod 644 *.crt *.key 2>/dev/null || true
-FOSCRIPT
-        sed -i.tmp "s/__FO_SAN_LIST__/${fo_sans}/" "$fo_script_file" && rm -f "${fo_script_file}.tmp"
-        docker run --rm -v "${fo_script_file}:/script.sh:ro" -v "${abs_fo_tls_dir}:/work" alpine:3.20 sh /script.sh 2>&1
-        rm -f "$fo_script_file"
-    fi
-    echo "  ✓ FalconOne agents PKI written (SAN: ${fo_sans})"
+    done
+    echo "  ✓ FalconOne agent TLS: no installer-generated PKI — trust sourced from Vault at boot (#226)"
 }
 
 # ── Backup rotation (security hardening, 2026-07-31) ─────────────────────────
@@ -934,6 +997,7 @@ _falconone_acl_selfheal() {
         "read:license_key"
         "read:falconone_*"
         "read:platform/identity/oidc"
+        "read:platform/identity/graph-tools"
         "sign:falconone_agent_cert"
         "read:falconone/nvd_api_key"
         "read:falconone/audit_hmac_key"
@@ -959,6 +1023,7 @@ _falconone_acl_selfheal() {
       - "read:license_key"
       - "read:falconone_*"
       - "read:platform/identity/oidc"
+      - "read:platform/identity/graph-tools"
       - "sign:falconone_agent_cert"
       - "read:falconone/nvd_api_key"
       - "read:falconone/audit_hmac_key"
@@ -1298,11 +1363,11 @@ _vault_client_cert_selfheal() {
 
 vault_bootstrap
 
-# ── FalconOne mTLS PKI + ACL self-heal (#170 / #172) ─────────────────────────
+# ── FalconOne mTLS PKI + ACL self-heal (#170 / #172 / #226) ──────────────────
 # Always run, independent of vault_bootstrap's internal "already exists —
 # skipping" guards, so a re-run of this installer on an existing install
-# still gets the extended-SAN falconone-tls cert and any missing ACL
-# permissions healed.
+# still gets the legacy-PKI cleanup (#226) and any missing ACL permissions
+# healed.
 _falconone_tls_bootstrap "$PWD"
 _falconone_acl_selfheal "vault-config/acl.yaml"
 
@@ -1881,6 +1946,63 @@ services:
     cpus: 1
     restart: unless-stopped
 
+  # ── self-update-runner ──────────────────────────────────────────────────
+  # Root cause fix (2026-08-13, incident live chez Liam): dashboard-api's own
+  # self-update (`docker compose up -d --force-recreate --no-deps
+  # dashboard-api`) kills the very process issuing that command — Docker/runc
+  # tears down the WHOLE cgroup on container stop (not just PID 1), so the
+  # `docker compose` CLI child spawned by dashboard-api dies mid-sequence,
+  # before it can start the replacement container. This companion, one-off
+  # service runs the SAME pull + force-recreate + healthcheck step for
+  # dashboard-api from a SEPARATE container (different cgroup, unaffected by
+  # dashboard-api's own teardown) — see dashboard-api/routes/platform.js's
+  # delegateSelfUpdate() and dashboard-api/scripts/self-update-runner.js for
+  # the full mechanism.
+  #
+  # `profiles: [self-update-runner]`: never started by a normal `docker
+  # compose up -d` (this installer, a plain restart, update.ps1/update.sh's
+  # own reconcile pass, etc. carry no trace of it) — invoked EXCLUSIVELY via
+  # `docker compose --profile self-update-runner run -d --rm --no-deps
+  # self-update-runner`, emitted by dashboard-api itself right before its own
+  # turn in the update loop, which then returns immediately (full hand-off).
+  #
+  # Same image as dashboard-api (just a different entrypoint) — no separate
+  # build/pull surface to maintain in lockstep. DATABASE_URL / DOCKER_HOST /
+  # CONTAINER_COMPOSE_DIR / the `/host-compose` bind mirror the dashboard-api
+  # service above exactly: this companion calls the identical runCompose()
+  # helper against the identical compose project. `dashboard_data:/data:ro`
+  # is READ-ONLY — this companion only READS the Slack/Teams webhook secrets
+  # from dashboard-api's own on-disk vault (vault.enc under /data, see
+  # vault.js) to send the final update notification; it never writes.
+  #
+  # `networks:`: unlike dashboard-api, this service has no HTTP listener of
+  # its own and never talks to coderaft-vault (its "vault" access is the
+  # local /data:ro file, not the mTLS coderaft-vault container) — it only
+  # needs coderaft-backend (to resolve `postgres`; pg_hba.conf rejects any
+  # peer outside this network's pinned subnet, see the postgres service
+  # below) and docker-proxy-net (to reach `docker-proxy` for DOCKER_HOST).
+  # dashboard-api itself joins both of those networks too, so the healthcheck
+  # HTTP call to `dashboard-api:3001` (see SERVICE_HEALTH_URLS in
+  # routes/platform.js) resolves without any additional network.
+  self-update-runner:
+    image: ghcr.io/liamj74/coderaft-dashboard-api:latest
+    entrypoint: ["node", "scripts/self-update-runner.js"]
+    profiles: ["self-update-runner"]
+    networks:
+      - docker-proxy-net
+      - coderaft-backend
+    environment:
+      - DATABASE_URL=postgres://coderaft:${POSTGRES_PASSWORD}@postgres:5432/coderaft
+      - DOCKER_HOST=tcp://docker-proxy:2375
+      - CONTAINER_COMPOSE_DIR=/host-compose
+      - COMPOSE_PROJECT_NAME=coderaft
+    volumes:
+      - .:/host-compose
+      - dashboard_data:/data:ro
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    restart: "no"
+
   postgres:
     image: postgres:16-alpine
     environment:
@@ -2365,7 +2487,9 @@ docker compose --env-file install-config.env --env-file .env down
 echo "  Done."
 EOF
 
-curl -fsSL "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/update.sh" -o update.sh 2>/dev/null || cat > update.sh << 'EOF'
+# --max-time 5: mirrors install.ps1's Invoke-WebRequest -TimeoutSec 5 for this
+# same fetch (best-effort; falls back to the bundled placeholder below).
+curl -fsSL --max-time 5 "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/update.sh" -o update.sh 2>/dev/null || cat > update.sh << 'EOF'
 #!/bin/bash
 echo "Updating CodeRaft..."
 docker compose --env-file install-config.env --env-file .env pull && docker compose --env-file install-config.env --env-file .env up -d --force-recreate --remove-orphans
@@ -2386,14 +2510,31 @@ docker compose --env-file install-config.env --env-file .env up -d
 echo "  Updated! Dashboard: http://localhost:3000"
 EOF
 
-curl -fsSL "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/rollback.sh" -o rollback.sh 2>/dev/null || cat > rollback.sh << 'EOF'
+# --max-time 5: mirrors install.ps1's Invoke-WebRequest -TimeoutSec 5 for this
+# same fetch (best-effort; falls back to the bundled placeholder below).
+curl -fsSL --max-time 5 "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/rollback.sh" -o rollback.sh 2>/dev/null || cat > rollback.sh << 'EOF'
 #!/bin/bash
 echo "rollback.sh placeholder — fetch the real one from https://install.coderaft.io/rollback"
 echo "or run: curl -fsSL https://install.coderaft.io/rollback -o rollback.sh && chmod +x rollback.sh"
 exit 1
 EOF
 
-chmod +x start.sh stop.sh update.sh rollback.sh
+# check-caddy-cert.sh (2026-08-13): standalone daily Caddy TLS certificate
+# watchdog, registered as a cron job further below. See that script's own
+# header for the full incident writeup — closes the gap where an install
+# that never runs update.sh again (the common case for a "set and forget"
+# customer deployment) would otherwise silently hit an expired Caddy
+# certificate with nobody around to run `docker compose restart caddy`.
+# --max-time 5: mirrors install.ps1's Invoke-WebRequest -TimeoutSec 5 for this
+# same fetch (best-effort; falls back to the bundled placeholder below).
+curl -fsSL --max-time 5 "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/check-caddy-cert.sh" -o check-caddy-cert.sh 2>/dev/null || cat > check-caddy-cert.sh << 'EOF'
+#!/bin/bash
+echo "check-caddy-cert.sh placeholder — fetch the real one from https://install.coderaft.io/check-caddy-cert.sh"
+echo "or run: curl -fsSL https://install.coderaft.io/check-caddy-cert.sh -o check-caddy-cert.sh && chmod +x check-caddy-cert.sh"
+exit 1
+EOF
+
+chmod +x start.sh stop.sh update.sh rollback.sh check-caddy-cert.sh
 
 # ── Pull & Start ─────────────────────────────────────────────────────────────
 
@@ -2486,7 +2627,9 @@ vault_check_seal_state() {
             "--cert" "/tls/dashboard-api-client.crt"
             "--key"  "/tls/dashboard-api-client.key"
             "--cacert" "/tls/client-ca.crt"
-            "-sS" "-X" "$method"
+            # -m 10: local vault sidecar call, same 10s budget as the
+            # equivalent helpers in update.sh (_vault_curl_live/_vault_curl_update).
+            "-sS" "-m" "10" "-X" "$method"
             "https://coderaft-vault:8200${path}"
         )
         if [ -n "$body" ]; then
@@ -2616,7 +2759,9 @@ vault_seed_bootstrap_secrets() {
             "--cert" "/tls/dashboard-api-client.crt"
             "--key"  "/tls/dashboard-api-client.key"
             "--cacert" "/tls/client-ca.crt"
-            "-sS" "-X" "$method"
+            # -m 10: local vault sidecar call, same 10s budget as the
+            # equivalent helpers in update.sh (_vault_curl_live/_vault_curl_update).
+            "-sS" "-m" "10" "-X" "$method"
             "https://coderaft-vault:8200${path}"
         )
         if [ -n "$body" ]; then
@@ -2801,6 +2946,15 @@ fi
 if [ "${SKIP_NATIVE_CAPTURE:-0}" = "1" ]; then
     echo "  ⓘ Capture daemon install skipped (SKIP_NATIVE_CAPTURE=1)"
 fi
+
+# ── Caddy cert watchdog cron registration (2026-08-13) ────────────────────
+# Idempotent (check-caddy-cert.sh's own register_cron_task strips any
+# previous copy of the line before re-adding it), so re-running install.sh
+# never duplicates the entry. Non-fatal: a host without crontab just gets
+# a warning telling the operator to run the check manually.
+echo ""
+echo "  Registering the daily Caddy certificate watchdog..."
+bash ./check-caddy-cert.sh --register-task || true
 
 DASHBOARD_URL="http://localhost:3000"
 if grep -q "coderaft.local" /etc/hosts 2>/dev/null; then

@@ -159,7 +159,10 @@ if [ -n "$PRODUCT_SLUG" ]; then
         exit 1
     fi
 
-    RESP=$(curl -fsS -X POST "$DASHBOARD_API/api/dashboard/products/$PRODUCT_SLUG/update" \
+    # --max-time 30: mirrors update.ps1's Invoke-RestMethod -TimeoutSec 30 for
+    # this same "start update" POST (dashboard-api accepts the request fast;
+    # the actual backup/pull/recreate runs async and is polled below).
+    RESP=$(curl -fsS --max-time 30 -X POST "$DASHBOARD_API/api/dashboard/products/$PRODUCT_SLUG/update" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $ADMIN_TOKEN" \
         -d '{"backup_data":true}' 2>&1) || {
@@ -175,7 +178,10 @@ if [ -n "$PRODUCT_SLUG" ]; then
     LAST_PHASE=""
     for _i in $(seq 1 200); do   # 200 × 3s = 10 min max
         sleep 3
-        BODY=$(curl -fsS "$DASHBOARD_API/api/dashboard/products/$PRODUCT_SLUG/update-status" \
+        # --max-time 10: mirrors update.ps1's Invoke-RestMethod -TimeoutSec 10
+        # for this same status-poll GET (short local call, retried every 3s
+        # by the surrounding bounded loop anyway).
+        BODY=$(curl -fsS --max-time 10 "$DASHBOARD_API/api/dashboard/products/$PRODUCT_SLUG/update-status" \
             -H "Authorization: Bearer $ADMIN_TOKEN" 2>/dev/null) || continue
         STATUS=$(printf '%s' "$BODY" | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
         PHASE=$(printf '%s' "$BODY" | grep -o '"phase":"[^"]*"' | head -1 | cut -d'"' -f4)
@@ -230,12 +236,21 @@ if [ -z "$DOCKER_DEFAULT_PLATFORM" ]; then
     esac
 fi
 
-# ── Self-update both update.sh and rollback.sh (with re-exec) ──────────────
+# ── Self-update update.sh, rollback.sh and check-caddy-cert.sh (re-exec) ──
+# check-caddy-cert.sh (2026-08-13) added to this list so existing installs
+# (pre-dating that script) bootstrap it here on their very first update.sh
+# run after the feature ships — the file simply doesn't exist yet on disk,
+# so the cmp below always "changes" and it gets written + chmod +x like
+# any other refresh. The cron registration further down (--register-task)
+# is what then actually wires it into cron for that existing install.
 if [ -z "$CODERAFT_UPDATE_REEXEC" ]; then
     echo "  Checking for script updates..."
     REFRESHED=0
-    for name in update.sh rollback.sh; do
-        LATEST=$(curl -fsSL "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/$name" 2>/dev/null)
+    for name in update.sh rollback.sh check-caddy-cert.sh; do
+        # --max-time 5: mirrors update.ps1's Invoke-WebRequest -TimeoutSec 5 for
+        # this same self-update fetch (best-effort; falls back to the local
+        # copy silently on any failure, so a fast timeout is safe).
+        LATEST=$(curl -fsSL --max-time 5 "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/$name" 2>/dev/null)
         if [ -n "$LATEST" ] && [ ${#LATEST} -gt 50 ]; then
             echo "$LATEST" > "$name.tmp"
             if ! cmp -s "$name" "$name.tmp" 2>/dev/null; then
@@ -286,6 +301,44 @@ strip_from_main_env() {
         grep -vE "^${key}=" "$env_path" > "${env_path}.tmp" && mv "${env_path}.tmp" "$env_path"
         chmod 600 "$env_path" 2>/dev/null || true
     fi
+}
+
+# ── LAN IP auto-detection (RELAY_ADVERTISE_HOST — FalconOne Remote Assist) ──
+# Root cause fixed live on Liam's machine, 2026-08-12 (commit 471f0b7 +
+# the RELAY_ADVERTISE_HOST comment in dashboard-api/server.js's
+# "falconone-relay" service block): the relay's raw TCP ports (21116/21117)
+# are published directly on 0.0.0.0 — NEVER proxied through Caddy — so the
+# agent dials this host's OWN address directly. Left unset, the relay falls
+# back to its Docker container ID, which no external agent can ever resolve.
+# Mirrors deploy/install.sh's get_lan_ip 1:1 — keep both in sync.
+#
+# `ip route get` performs a route LOOKUP only (no packet ever sent) and
+# reports the source IP the kernel would use to reach a public address —
+# i.e. the LAN-facing IP of whichever interface carries the default route.
+# This naturally skips docker0/veth/br-* bridges, which are never on the
+# default route. macOS has no `ip` by default (no iproute2), so `route get`
+# resolves the outbound interface first, then `ipconfig getifaddr` reads
+# its IPv4 address.
+get_lan_ip() {
+    local ip=""
+    case "$(uname -s)" in
+        Linux)
+            if command -v ip >/dev/null 2>&1; then
+                ip=$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)
+            fi
+            if [ -z "$ip" ] && command -v hostname >/dev/null 2>&1; then
+                ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+            fi
+            ;;
+        Darwin)
+            local iface
+            iface=$(route -n get 1.1.1.1 2>/dev/null | awk '/interface:/{print $2}')
+            if [ -n "$iface" ]; then
+                ip=$(ipconfig getifaddr "$iface" 2>/dev/null)
+            fi
+            ;;
+    esac
+    printf '%s' "$ip"
 }
 
 # ── Backup rotation (security hardening, 2026-07-31) ─────────────────────────
@@ -400,6 +453,55 @@ if ! grep -qE '^\s*CODERAFT_HOST_ARCH\s*=' "$INSTALL_CONFIG_PATH" 2>/dev/null; t
 fi
 strip_from_main_env "CODERAFT_HOST_ARCH"
 
+# ── Self-heal RELAY_ADVERTISE_HOST in install-config.env (FalconOne Remote
+# Assist relay unreachable — see get_lan_ip's header comment above for the
+# full root-cause writeup). This is a BRAND NEW compose variable (introduced
+# alongside this very fix) so it is absent on every existing install — this
+# block is what actually fixes an existing deployment on its next update, no
+# manual .env edit required. Cascade, same as install.sh's equivalent
+# first-install block (keep both in sync):
+#   0) A value already present here (auto-detected previously, or a manual
+#      correction) is NEVER touched again.
+#   1) A legacy RELAY_ADVERTISE_HOST left in .env (a manual edit made before
+#      this fix existed) is migrated as-is, then stripped from .env.
+#   2) CODERAFT_HOSTNAME configured in .env (Setup Wizard TLS step) and not
+#      just the internal LAN-only default "coderaft.local" → reuse it.
+#   3) Otherwise, auto-detect this machine's own LAN IP (interface carrying
+#      the default route) — correct for the common case.
+# A value set by hand directly in install-config.env
+# (RELAY_ADVERTISE_HOST=<host>:21117) ALWAYS wins over this cascade (step 0)
+# — needed on a multi-homed machine or a deployment that WAN-port-forwards
+# 21116-21117 to a different address than the one auto-detected here — but
+# it is an escape hatch for that edge case, never a prerequisite.
+if ! grep -qE '^\s*RELAY_ADVERTISE_HOST\s*=' "$INSTALL_CONFIG_PATH" 2>/dev/null; then
+    LEGACY_RELAY_HOST=""
+    if [ -f "$ENV_PATH_HO" ] && grep -qE '^\s*RELAY_ADVERTISE_HOST\s*=' "$ENV_PATH_HO"; then
+        LEGACY_RELAY_HOST=$(grep -E '^\s*RELAY_ADVERTISE_HOST\s*=' "$ENV_PATH_HO" | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | xargs)
+    fi
+    if [ -n "$LEGACY_RELAY_HOST" ]; then
+        upsert_install_config RELAY_ADVERTISE_HOST "$LEGACY_RELAY_HOST"
+        strip_from_main_env "RELAY_ADVERTISE_HOST"
+        echo "  ✓ RELAY_ADVERTISE_HOST migré .env → install-config.env ($LEGACY_RELAY_HOST)"
+    else
+        RELAY_HOSTNAME_VAL=""
+        if [ -f "$ENV_PATH_HO" ] && grep -qE '^\s*CODERAFT_HOSTNAME\s*=' "$ENV_PATH_HO"; then
+            RELAY_HOSTNAME_VAL=$(grep -E '^\s*CODERAFT_HOSTNAME\s*=' "$ENV_PATH_HO" | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | xargs)
+        fi
+        if [ -n "$RELAY_HOSTNAME_VAL" ] && [ "$RELAY_HOSTNAME_VAL" != "coderaft.local" ] && [ "$RELAY_HOSTNAME_VAL" != "localhost" ]; then
+            upsert_install_config RELAY_ADVERTISE_HOST "${RELAY_HOSTNAME_VAL}:21117"
+            echo "  ✓ RELAY_ADVERTISE_HOST auto-détecté : ${RELAY_HOSTNAME_VAL}:21117 (CODERAFT_HOSTNAME configuré — nom externe défini via le Setup Wizard)"
+        else
+            RELAY_LAN_IP=$(get_lan_ip)
+            if [ -n "$RELAY_LAN_IP" ]; then
+                upsert_install_config RELAY_ADVERTISE_HOST "${RELAY_LAN_IP}:21117"
+                echo "  ✓ RELAY_ADVERTISE_HOST auto-détecté : ${RELAY_LAN_IP}:21117 (IP LAN auto-détectée de cette machine — aucun CODERAFT_HOSTNAME externe configuré)"
+            else
+                echo "  ⚠ RELAY_ADVERTISE_HOST n'a pas pu être auto-détecté (aucune IP LAN trouvée) — FalconOne Remote Assist restera injoignable tant qu'une valeur n'est pas ajoutée manuellement à install-config.env (RELAY_ADVERTISE_HOST=<host>:21117)."
+            fi
+        fi
+    fi
+fi
+
 # ── Self-heal: docker-compose.yml drift (B24 — depends_on coderaft-vault) ──
 # Les installs antérieures déclaraient coderaft-vault avec
 # `condition: service_healthy`. Le healthcheck binary est buggé → vault
@@ -483,6 +585,96 @@ CVEPROXYBLOCK
         { print }
     ' "$COMPOSE_PATH" > "$COMPOSE_PATH.tmp" && mv "$COMPOSE_PATH.tmp" "$COMPOSE_PATH"
     echo "  ✓ Self-heal docker-compose.yml — coderaft-cve-proxy service added"
+fi
+
+# ── Self-heal: docker-compose.yml missing self-update-runner service ──────
+# Root cause fix (2026-08-13, incident live chez Liam): dashboard-api's own
+# self-update (`docker compose up -d --force-recreate --no-deps
+# dashboard-api`) kills the very process issuing that command — Docker/runc
+# tears down the WHOLE cgroup on container stop, not just PID 1 — so the
+# `docker compose` CLI child dies mid-sequence, before it can start the
+# replacement container (confirmed live via `docker compose ps -a`: a
+# temp-named container stuck in "Created", the old one "Exited (137)",
+# dashboard-api down over an hour undetected). This companion, one-off
+# service (self-update-runner, same image as dashboard-api, different
+# entrypoint) runs that pull+force-recreate+healthcheck step from a SEPARATE
+# container instead — see dashboard-api/routes/platform.js's
+# delegateSelfUpdate() and dashboard-api/scripts/self-update-runner.js.
+# `profiles: [self-update-runner]` keeps it from ever being started by a
+# normal `docker compose up -d` — only `--profile self-update-runner run -d
+# --rm --no-deps self-update-runner`, emitted by dashboard-api itself,
+# starts it. This is an install-existing gap, not a new-install one — an
+# install provisioned before 2026-08-13 has no trace of this service until
+# this self-heal (or a fresh install.sh run) adds it. Same detection +
+# insertion-before-`postgres:` approach as the coderaft-cve-proxy self-heal
+# immediately above.
+if [ -f "$COMPOSE_PATH" ] && ! grep -qE '^[[:space:]]*self-update-runner:[[:space:]]*$' "$COMPOSE_PATH" \
+   && grep -qE '^[[:space:]]*postgres:[[:space:]]*$' "$COMPOSE_PATH"; then
+    cp "$COMPOSE_PATH" "$SELF_HEAL_BACKUP_DIR/$(basename "$COMPOSE_PATH").bak-selfupdaterunner-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    _rotate_backups "$SELF_HEAL_BACKUP_DIR/$(basename "$COMPOSE_PATH")"
+    # NOTE: the block is staged to a temp FILE (not a shell variable passed via
+    # `awk -v`) — confirmed live on macOS's stock /usr/bin/awk (the "one true
+    # awk"/BWK awk, not gawk) that `-v var="<multi-line string>"` throws
+    # "awk: newline in string" and aborts, silently leaving the compose file
+    # untouched (the `awk ... && mv` guard then skips the mv, but the
+    # unconditional "✓ ... added" echo below would otherwise still print,
+    # masking the failure). Reading the block with `getline` from a file
+    # avoids this entirely and works identically on gawk/mawk/BWK awk.
+    _selfupdaterunner_blockfile="$(mktemp "${TMPDIR:-/tmp}/coderaft-selfupdaterunner-block.XXXXXX")"
+    cat <<'SELFUPDATERUNNERBLOCK' > "$_selfupdaterunner_blockfile"
+  # ── self-update-runner ───────────────────────────────────────────────────
+  # Root cause fix (2026-08-13, incident live chez Liam): companion, one-off
+  # container for dashboard-api's own self-update — see
+  # dashboard-api/routes/platform.js's delegateSelfUpdate() and
+  # dashboard-api/scripts/self-update-runner.js for the full mechanism.
+  # profiles: [self-update-runner] keeps a normal docker compose up -d from
+  # ever starting it — only --profile self-update-runner run -d --rm
+  # --no-deps self-update-runner, emitted by dashboard-api itself, does.
+  # Same image as dashboard-api (different entrypoint only). DATABASE_URL /
+  # DOCKER_HOST / CONTAINER_COMPOSE_DIR / the /host-compose bind mirror the
+  # dashboard-api service above exactly — same runCompose() helper, same
+  # compose project. dashboard_data:/data:ro is READ-ONLY: this companion
+  # only reads the Slack/Teams webhook secrets from dashboard-api's own
+  # on-disk vault (vault.enc under /data) to send the final update
+  # notification, never writes. networks: needs only coderaft-backend (to
+  # resolve postgres — pg_hba.conf rejects any peer outside this network's
+  # pinned subnet) and docker-proxy-net (to reach docker-proxy for
+  # DOCKER_HOST); dashboard-api joins both too, so the healthcheck HTTP call
+  # to dashboard-api:3001 resolves without any additional network.
+  self-update-runner:
+    image: ghcr.io/liamj74/coderaft-dashboard-api:latest
+    entrypoint: ["node", "scripts/self-update-runner.js"]
+    profiles: ["self-update-runner"]
+    networks:
+      - docker-proxy-net
+      - coderaft-backend
+    environment:
+      - DATABASE_URL=postgres://coderaft:${POSTGRES_PASSWORD}@postgres:5432/coderaft
+      - DOCKER_HOST=tcp://docker-proxy:2375
+      - CONTAINER_COMPOSE_DIR=/host-compose
+      - COMPOSE_PROJECT_NAME=coderaft
+    volumes:
+      - .:/host-compose
+      - dashboard_data:/data:ro
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    restart: "no"
+
+SELFUPDATERUNNERBLOCK
+    if awk -v blockfile="$_selfupdaterunner_blockfile" '
+        /^[[:space:]]*postgres:[[:space:]]*$/ && !done {
+            while ((getline line < blockfile) > 0) print line
+            close(blockfile)
+            done = 1
+        }
+        { print }
+    ' "$COMPOSE_PATH" > "$COMPOSE_PATH.tmp" && mv "$COMPOSE_PATH.tmp" "$COMPOSE_PATH"; then
+        echo "  ✓ Self-heal docker-compose.yml — self-update-runner service added"
+    else
+        echo "  ⚠ Self-heal docker-compose.yml — self-update-runner insertion failed (awk/mv error), compose file left unchanged" >&2
+        rm -f "$COMPOSE_PATH.tmp"
+    fi
+    rm -f "$_selfupdaterunner_blockfile"
 fi
 
 # ── Self-heal: dashboard-api tmpfs for the ephemeral working .env (#148) ──
@@ -707,99 +899,174 @@ else
     echo "  ✓ compose OK"
 fi
 
-# ── FalconOne agents mTLS PKI (#170) ─────────────────────────────────────────
-# Distinct CA/leaf from the vault client PKI: falconone-tls/agents-ca.crt is
-# the pool of ClientCAs falconone-api trusts for inbound agent mTLS, and
-# falconone-tls/server.crt is the leaf falconone-api presents on :8443 to its
-# own Windows agents. Bug #170: server.crt's SAN only ever had
-# [localhost, falconone-api] — remote agents connecting via
-# https://<public-hostname>:8443/agent/v1 failed hostname verification.
-# Self-healing: the CA is preserved if it already exists (regenerating it
-# would break trust for any agent already enrolled); only the leaf is
-# regenerated, and only when it's missing the "coderaft.local" SAN.
+# ── FalconOne agents mTLS PKI (#170, #174, #226) ─────────────────────────────
+# Historically (#170) this function ALSO generated a private, self-signed
+# CA + server leaf under falconone-tls/ as the :8443 agent listener's trust
+# chain. Task #174 moved that trust chain to the Coderaft Vault instead
+# (buildAgentTLSFromVault, cmd/falconone-api/main.go: fetches the Vault's
+# falconone-agents-ca and mints the :8443 server leaf from that SAME CA)
+# whenever Vault is reachable — the normal case — so this installer-generated
+# file was never actually part of a successful mTLS handshake once #174
+# shipped; main.go's preferred path never reads it.
+#
+# Worse, its mere presence on disk caused a real incident: task #223 found
+# the deployment-bundle builder (internal/experience/bundle.go) was still
+# unconditionally pinning THIS file's CA into every new agent's
+# server-ca.pem while the :8443 listener actually presented a Vault-signed
+# leaf — fresh enrolment failed with "x509: certificate signed by unknown
+# authority", live-reported by an operator 2026-08-11 (root-caused + fixed
+# in bundle.go, commit 3f60303). The installer CA looks legitimate (it's a
+# real, validly-formed 10-year CA) but corresponds to nothing any agent
+# actually trusts — exactly the kind of on-disk artifact that keeps
+# resurfacing as a source of confusion in any code path that falls back to
+# reading it.
+#
+# #226 fix: stop generating it, here and in install.sh / install.ps1 /
+# update.ps1. main.go's buildAgentTLS keeps its Path B fallback (reads
+# cfg.AgentServerCrt/Key/AgentsCA from disk when Vault is unreachable at
+# boot) UNCHANGED — that stays available for an operator who deliberately
+# places override material at those paths — but it is no longer fed
+# automatically by this installer. Net effect: if Vault is down at first
+# boot and nobody has manually provided override files, falconone-api now
+# fails closed (refuses to start rather than serve a TLS trust chain that
+# matches no real agent) instead of degrading silently. See buildAgentTLS's
+# own doc comment in main.go for that tradeoff.
+#
+# Any file left over from a pre-#226 install/update is backed up (into
+# SELF_HEAL_BACKUP_DIR, same convention as the acl.yaml self-heals below —
+# recoverable, not just deleted) and removed here too, so upgrading an
+# EXISTING deployment also closes the hole. This is safe: as explained
+# above, that file was never what a successfully-registered agent actually
+# trusts once Vault has ever been reachable, so removing it cannot break a
+# live, working handshake — it can only change what happens on a FUTURE
+# boot where Vault is unreachable, from "silently wrong trust" to "fail
+# closed" (or "trust the manual override", if one is present).
 #
 # Defined here (and called both inside the one-time migration block below
 # AND unconditionally after it) because the migration block only ever runs
 # ONCE per install — already-migrated installs would otherwise never get
-# this SAN fix or a falconone-tls dir that didn't exist on an older version.
+# this self-heal.
 _falconone_tls_bootstrap() {
     local install_dir="${1:?install_dir required}"
     local fo_tls_dir="${install_dir}/falconone-tls"
     mkdir -p "$fo_tls_dir"
     chmod 755 "$fo_tls_dir"
 
-    local fo_sans="DNS:localhost,DNS:falconone-api,DNS:coderaft.local"
-    local fo_hostname
-    fo_hostname="$(hostname 2>/dev/null || true)"
-    [ -n "$fo_hostname" ] && fo_sans="${fo_sans},DNS:${fo_hostname}"
-    if [ -n "${CODERAFT_EXTRA_HOSTS:-}" ]; then
-        local _h _extra_hosts
-        IFS=',' read -ra _extra_hosts <<< "$CODERAFT_EXTRA_HOSTS"
-        for _h in "${_extra_hosts[@]}"; do
-            _h="$(echo "$_h" | xargs)"
-            [ -n "$_h" ] && fo_sans="${fo_sans},DNS:${_h}"
-        done
-    fi
-    fo_sans="${fo_sans},IP:127.0.0.1"
+    local f ts
+    ts="$(date +%Y%m%d%H%M%S)"
+    for f in agents-ca.crt agents-ca.key agents-ca.srl server.crt server.key; do
+        if [ -f "${fo_tls_dir}/${f}" ]; then
+            cp "${fo_tls_dir}/${f}" "${SELF_HEAL_BACKUP_DIR}/${f}.bak-${ts}" 2>/dev/null || true
+            rm -f "${fo_tls_dir}/${f}"
+            _rotate_backups "${SELF_HEAL_BACKUP_DIR}/${f}"
+        fi
+    done
+    echo "  ✓ FalconOne agent TLS: no installer-generated PKI — trust sourced from Vault at boot (#226)"
+}
 
-    if command -v openssl &>/dev/null; then
-        if [ ! -f "${fo_tls_dir}/agents-ca.crt" ]; then
-            openssl req -x509 -newkey rsa:4096 -days 3650 -nodes -sha256 \
-                -keyout "${fo_tls_dir}/agents-ca.key" -out "${fo_tls_dir}/agents-ca.crt" \
-                -subj "/CN=falconone-agents-ca" \
-                -addext "basicConstraints=critical,CA:TRUE" 2>/dev/null
-        fi
-        local need_regen=1
-        if [ -f "${fo_tls_dir}/server.crt" ] && openssl x509 -in "${fo_tls_dir}/server.crt" -noout -text 2>/dev/null | grep -q "coderaft.local"; then
-            need_regen=0
-        fi
-        if [ "$need_regen" = "1" ]; then
-            openssl req -newkey rsa:2048 -nodes -sha256 \
-                -keyout "${fo_tls_dir}/server.key" -out "${fo_tls_dir}/server.csr" \
-                -subj "/CN=falconone-agents" 2>/dev/null
-            openssl x509 -req -days 3650 -sha256 \
-                -in "${fo_tls_dir}/server.csr" \
-                -CA "${fo_tls_dir}/agents-ca.crt" -CAkey "${fo_tls_dir}/agents-ca.key" -CAcreateserial \
-                -out "${fo_tls_dir}/server.crt" \
-                -extfile <(printf "subjectAltName=%s\nbasicConstraints=CA:FALSE" "$fo_sans") 2>/dev/null
-            rm -f "${fo_tls_dir}/server.csr"
-        fi
-        chmod 644 "${fo_tls_dir}"/*.crt "${fo_tls_dir}"/*.key 2>/dev/null || true
-    else
-        local abs_fo_tls_dir fo_script_file
-        abs_fo_tls_dir="$(cd "$fo_tls_dir" && pwd)"
-        fo_script_file="$(mktemp)"
-        cat > "$fo_script_file" <<'FOSCRIPT'
-set -e
-apk add --no-cache openssl >/dev/null
-cd /work
-if [ ! -f agents-ca.crt ]; then
-    openssl req -x509 -newkey rsa:4096 -days 3650 -nodes -sha256 \
-        -keyout agents-ca.key -out agents-ca.crt \
-        -subj "/CN=falconone-agents-ca" \
-        -addext "basicConstraints=critical,CA:TRUE" 2>/dev/null
-fi
-NEED_REGEN=1
-if [ -f server.crt ] && openssl x509 -in server.crt -noout -text 2>/dev/null | grep -q "coderaft.local"; then
-    NEED_REGEN=0
-fi
-if [ "$NEED_REGEN" = "1" ]; then
-    openssl req -newkey rsa:2048 -nodes -sha256 \
-        -keyout server.key -out server.csr \
-        -subj "/CN=falconone-agents" 2>/dev/null
-    printf "subjectAltName=__FO_SAN_LIST__\nbasicConstraints=CA:FALSE" > /tmp/server.ext
-    openssl x509 -req -days 3650 -sha256 \
-        -in server.csr -CA agents-ca.crt -CAkey agents-ca.key -CAcreateserial \
-        -out server.crt -extfile /tmp/server.ext 2>/dev/null
-    rm -f server.csr /tmp/server.ext
-fi
-chmod 644 *.crt *.key 2>/dev/null || true
-FOSCRIPT
-        sed -i.tmp "s/__FO_SAN_LIST__/${fo_sans}/" "$fo_script_file" && rm -f "${fo_script_file}.tmp"
-        docker run --rm -v "${fo_script_file}:/script.sh:ro" -v "${abs_fo_tls_dir}:/work" alpine:3.20 sh /script.sh 2>&1
-        rm -f "$fo_script_file"
+# ── ACL self-heal: entraguard entry/permissions (found live 2026-09-15) ──────
+# entraguard (WolfGuard) is the ONE client allowed to WRITE the shared Graph
+# app credential (platform/identity/graph-tools) — every other product only
+# reads it. That write/read pair, plus read:credentials/ and read:tenant/,
+# were added to the canonical coderaft-vault acl.yaml over time, but unlike
+# falconone/mantisstrike/redfox below, entraguard never got a self-heal
+# function of its own (it's the oldest, foundational client — present since
+# before this self-heal pattern existed — so nothing ever caught it up).
+# Result: any already-bootstrapped vault keeps entraguard on its original,
+# narrower permission set forever, and WolfGuard's mirror write 403s on
+# every save ("graph-tools mirror: Vault denied the write — check the
+# 'write:platform/identity/graph-tools' ACL grant for entraguard" in its own
+# logs) — which starves every OTHER product of the shared Graph credential
+# too, since none of them can ever read what WolfGuard could never write.
+# Same additive-only, idempotent merge-into-existing-entry pattern as
+# _falconone_acl_selfheal below.
+_entraguard_acl_selfheal() {
+    local acl_path="$1"
+
+    if [ ! -f "$acl_path" ]; then
+        echo "  [install] ACL self-heal: $acl_path not found — skipping (vault not provisioned yet)"
+        return 0
     fi
-    echo "  ✓ FalconOne agents PKI written (SAN: ${fo_sans})"
+
+    local required_perms=(
+        "read:azure_*"
+        "read:entraguard_*"
+        "read:platform/identity/oidc"
+        "read:platform/identity/graph-tools"
+        "write:platform/identity/graph-tools"
+        "read:credentials/"
+        "read:tenant/"
+    )
+
+    local ts
+    ts="$(date -u +"%Y%m%dT%H%M%SZ")"
+
+    if ! grep -qE '^[[:space:]]*-[[:space:]]*name:[[:space:]]*entraguard[[:space:]]*$' "$acl_path"; then
+        cp "$acl_path" "$SELF_HEAL_BACKUP_DIR/$(basename "$acl_path").bak-${ts}"
+        _rotate_backups "$SELF_HEAL_BACKUP_DIR/$(basename "$acl_path")"
+        cat >> "$acl_path" <<'ENTRAGUARDACL'
+
+  - name: entraguard
+    cert_san: "entraguard.coderaft.local"
+    permissions:
+      - "read:azure_*"
+      - "read:entraguard_*"
+      - "read:platform/identity/oidc"
+      - "read:platform/identity/graph-tools"
+      - "write:platform/identity/graph-tools"
+      - "read:credentials/"
+      - "read:tenant/"
+ENTRAGUARDACL
+        echo "  [install] Self-heal ACL: entraguard permissions updated (+${#required_perms[@]} added, entry created)"
+        return 0
+    fi
+
+    local start_line end_line
+    start_line=$(grep -nE '^[[:space:]]*-[[:space:]]*name:[[:space:]]*entraguard[[:space:]]*$' "$acl_path" | head -1 | cut -d: -f1)
+    end_line=$(awk -v s="$start_line" 'NR>s && /^[[:space:]]*-[[:space:]]*name:/{print NR; exit}' "$acl_path")
+    if [ -z "$end_line" ]; then
+        end_line=$(( $(wc -l < "$acl_path") + 1 ))
+    fi
+
+    local block
+    block=$(sed -n "${start_line},$((end_line - 1))p" "$acl_path")
+
+    local missing=()
+    local p
+    for p in "${required_perms[@]}"; do
+        if ! grep -qF "\"${p}\"" <<< "$block"; then
+            missing+=("$p")
+        fi
+    done
+
+    if [ "${#missing[@]}" -eq 0 ]; then
+        echo "  [install] ACL entraguard already up-to-date"
+        return 0
+    fi
+
+    cp "$acl_path" "${acl_path}.bak-${ts}"
+    _rotate_backups "$acl_path"
+
+    if grep -qE '^[[:space:]]*permissions:[[:space:]]*\[.*\][[:space:]]*$' <<< "$block"; then
+        local additions=""
+        for p in "${missing[@]}"; do additions="${additions},\"${p}\""; done
+        awk -v s="$start_line" -v e="$end_line" -v add="$additions" '
+            NR>=s && NR<e && /^[[:space:]]*permissions:[[:space:]]*\[.*\][[:space:]]*$/ {
+                sub(/\][[:space:]]*$/, add "]")
+            }
+            { print }
+        ' "$acl_path" > "${acl_path}.tmp" && mv "${acl_path}.tmp" "$acl_path"
+    else
+        local addition_block=""
+        for p in "${missing[@]}"; do addition_block="${addition_block}      - \"${p}\""$'\n'; done
+        local insert_line=$(( end_line - 1 ))
+        awk -v ins="$insert_line" -v add="$addition_block" '
+            { print }
+            NR==ins { printf "%s", add }
+        ' "$acl_path" > "${acl_path}.tmp" && mv "${acl_path}.tmp" "$acl_path"
+    fi
+
+    echo "  [install] Self-heal ACL: entraguard permissions updated (+${#missing[@]} added)"
 }
 
 # ── ACL self-heal: falconone entry/permissions (#172) ────────────────────────
@@ -824,6 +1091,7 @@ _falconone_acl_selfheal() {
         "read:license_key"
         "read:falconone_*"
         "read:platform/identity/oidc"
+        "read:platform/identity/graph-tools"
         "sign:falconone_agent_cert"
         "read:falconone/nvd_api_key"
         "read:falconone/audit_hmac_key"
@@ -849,6 +1117,7 @@ _falconone_acl_selfheal() {
       - "read:license_key"
       - "read:falconone_*"
       - "read:platform/identity/oidc"
+      - "read:platform/identity/graph-tools"
       - "sign:falconone_agent_cert"
       - "read:falconone/nvd_api_key"
       - "read:falconone/audit_hmac_key"
@@ -1611,7 +1880,11 @@ VAULTOVERRIDE
             "--cert" "/tls/dashboard-api-client.crt"
             "--key"  "/tls/dashboard-api-client.key"
             "--cacert" "/tls/client-ca.crt"
-            "-sS" "-X" "$method"
+            # -m 10: mirrors the sibling _vault_curl_live() helper above (same
+            # local vault sidecar call, same 10s budget) — this one was
+            # missing it, letting a hung TLS handshake block the 20-attempt
+            # reachability loop below indefinitely instead of retrying.
+            "-sS" "-m" "10" "-X" "$method"
             "https://coderaft-vault:8200${path}"
         )
         if [ -n "$body" ]; then
@@ -1912,9 +2185,9 @@ SCRIPT
     fi
     [ -f "certs/falconone-signal-server.key" ] || touch "certs/falconone-signal-server.key"
 
-    # FalconOne agents mTLS PKI (falconone-tls/) — bug #170. See
-    # _falconone_tls_bootstrap definition above for the extended-SAN +
-    # self-heal logic (this call covers first-time provisioning; the
+    # FalconOne agents mTLS PKI (falconone-tls/) — #170/#174/#226. See
+    # _falconone_tls_bootstrap definition above for why this no longer
+    # generates a cert (this call covers first-time provisioning; the
     # unconditional call after this migration block covers already-migrated
     # installs).
     _falconone_tls_bootstrap "${INSTALL_DIR}"
@@ -1945,7 +2218,7 @@ clients:
     permissions: ["*"]
   - name: entraguard
     cert_san: "entraguard.coderaft.local"
-    permissions: ["read:azure_*","read:license_key","read:entraguard_*","read:platform/identity/oidc"]
+    permissions: ["read:azure_*","read:license_key","read:entraguard_*","read:platform/identity/oidc","read:platform/identity/graph-tools","write:platform/identity/graph-tools","read:credentials/","read:tenant/"]
   - name: ravenscan
     cert_san: "ravenscan.coderaft.local"
     permissions: ["read:ravenscan_*","read:neo4j_*","read:license_key","read:platform/identity/oidc"]
@@ -1962,15 +2235,29 @@ ACLEOF
     chmod 600 vault-config/acl.yaml
 }
 
-# ── FalconOne mTLS PKI + ACL self-heal (#170 / #172) ─────────────────────────
+# ── entraguard ACL self-heal (found live 2026-09-15) ─────────────────────────
+# Runs first, before falconone/mantisstrike/redfox below: entraguard is the
+# ONLY client that can WRITE platform/identity/graph-tools (see
+# _entraguard_acl_selfheal's own header comment) — every other product just
+# reads what it wrote. Healing entraguard's grant first means a subsequent
+# WolfGuard credential save can populate the shared secret in the same
+# update run that unblocks it, rather than requiring a second run.
+_entraguard_acl_selfheal "${INSTALL_DIR}/vault-config/acl.yaml"
+_vault_acl_live_selfheal "entraguard" "entraguard.coderaft.local" \
+    "read:azure_*" "read:entraguard_*" "read:platform/identity/oidc" \
+    "read:platform/identity/graph-tools" "write:platform/identity/graph-tools" \
+    "read:credentials/" "read:tenant/"
+
+# ── FalconOne mTLS PKI + ACL self-heal (#170 / #172 / #226) ──────────────────
 # Runs unconditionally on EVERY update, independent of the one-time vault
 # migration gate above, so already-migrated installs (_VAULT_NEEDS_MIGRATION
-# = 0) still get the extended-SAN falconone-tls cert and any missing ACL
+# = 0) still get the legacy-PKI cleanup (#226) and any missing ACL
 # permissions healed.
 _falconone_tls_bootstrap "${INSTALL_DIR}"
 _falconone_acl_selfheal "${INSTALL_DIR}/vault-config/acl.yaml"
 _vault_acl_live_selfheal "falconone" "falconone.coderaft.local" \
     "read:license_key" "read:falconone_*" "read:platform/identity/oidc" \
+    "read:platform/identity/graph-tools" \
     "sign:falconone_agent_cert" "read:falconone/nvd_api_key" \
     "read:falconone/audit_hmac_key" "write:falconone/audit_hmac_key" \
     "read:falconone/pki/agents-ca/cert" "read:pki/falconone-agents-ca*" \
@@ -2157,7 +2444,10 @@ _find_age_cli() {
     esac
     local tmp
     tmp="$(mktemp -d)" || return 1
-    if ! curl -fsSL "https://github.com/FiloSottile/age/releases/download/${age_version}/age-${age_version}-${age_os}-${age_arch}.tar.gz" \
+    # --max-time 60: mirrors update.ps1's Invoke-WebRequest -TimeoutSec 60 for
+    # this same age release download (small binary release tarball, but be
+    # generous for slow links since this only runs once to bootstrap the key).
+    if ! curl -fsSL --max-time 60 "https://github.com/FiloSottile/age/releases/download/${age_version}/age-${age_version}-${age_os}-${age_arch}.tar.gz" \
         -o "${tmp}/age.tar.gz" 2>/dev/null; then
         rm -rf "$tmp"
         return 1
@@ -2279,7 +2569,9 @@ fi
 # ── Capture recovery snapshot via dashboard-api ───────────────────────────
 echo "  Capturing recovery snapshot..."
 if [ -n "$ADMIN_TOKEN" ]; then
-    curl -fsS -X POST "$DASHBOARD_API/api/dashboard/recovery/snapshots" \
+    # --max-time 10: mirrors update.ps1's Invoke-RestMethod -TimeoutSec 10 for
+    # this same pre-update snapshot POST.
+    curl -fsS --max-time 10 -X POST "$DASHBOARD_API/api/dashboard/recovery/snapshots" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $ADMIN_TOKEN" \
         -d '{"reason":"pre-update"}' > /dev/null \
@@ -2406,6 +2698,139 @@ renew_local_https() {
 
 renew_local_https || true
 
+# ── PROACTIVE Caddy TLS certificate expiry detection (2026-08-13) ────────
+# INCIDENT: Liam locked out of his own platform with net::ERR_CERT_DATE_INVALID
+# after ~4 weeks of continuous `caddy` container uptime, with update.ps1/.sh
+# never run in that whole window. ROOT CAUSE, confirmed by code inspection
+# (not a guess) — see the matching, longer comment in update.ps1 for the
+# full reasoning:
+#   - Caddy's `tls internal` issuer defaults to a 12-HOUR leaf certificate
+#     lifetime. Nothing in this repo overrides it (the Caddyfile template's
+#     `tls {$CADDY_TLS_MODE_ARGS:internal}` line resolves to Caddy's
+#     hardcoded default, not a custom `issuer internal { lifetime ... }`).
+#   - `caddy_data`/`caddy_config` are genuine top-level named Docker volumes
+#     — confirmed these SURVIVE `docker compose up -d --force-recreate`, so
+#     the "volume wiped every update" theory does not hold. Consistent with
+#     that, the reported error was CERT_DATE_INVALID, not
+#     CERT_AUTHORITY_INVALID — the imported root CA stayed trusted; only
+#     the leaf certificate's background renewal silently stopped keeping up
+#     during the weeks this deployment went without an update run.
+#   - `admin off` in the Caddyfile means zero external visibility into
+#     Caddy's managed-certificate state, so this went unnoticed until it
+#     hard-blocked access.
+# The exact internal trigger for the renewal loop stalling could not be
+# conclusively reproduced from static analysis alone (would need Caddy's
+# own historical logs from the incident window). This fix does not depend
+# on knowing that trigger: it detects the ACTUAL served certificate's
+# expiry from OUTSIDE the container (openssl s_client, already a soft
+# dependency elsewhere in this script — see the existing
+# `command -v openssl` guards) and forces `docker compose restart caddy`
+# whenever it is already expired or within $warn_days days of expiring. A
+# plain restart is sufficient: Caddy's startup path re-checks every managed
+# cert's real NotAfter against its renewal window and reissues immediately
+# from the still-trusted, still-persistent internal CA.
+#
+# SCOPE (documented, not silently dropped): this closes the gap for any
+# install where update.sh actually runs, on demand or periodically. It does
+# NOT add an update-independent trigger (e.g. a cron job, or a Docker
+# HEALTHCHECK on the caddy service that also inspects cert expiry from
+# inside the container) — flagged as a recommended follow-up rather than
+# attempted here (caddy:2-alpine has no verified bundled cert-inspection
+# tooling; adding any would need its own Dockerfile change + rollout).
+get_caddy_cert_days_remaining() {
+    local sni="${1:-coderaft.local}"
+    # This openssl build's s_client has no -connect_timeout (verified: not
+    # listed in `openssl s_client -help`, only DTLS's unrelated -timeout) —
+    # bound the connect+handshake with `timeout`/`gtimeout` if either is on
+    # PATH, otherwise skip the bound entirely rather than add a hard new
+    # binary dependency (same soft-dependency philosophy already used for
+    # the `command -v openssl` / `command -v mkcert` guards elsewhere in
+    # this script). A hang here is only possible against a genuinely wedged
+    # Caddy (open port, no completed handshake) — a closed port (the
+    # common case when caddy isn't up yet) fails near-instantly regardless.
+    local timeout_bin=""
+    if command -v timeout &>/dev/null; then
+        timeout_bin="timeout 6"
+    elif command -v gtimeout &>/dev/null; then
+        timeout_bin="gtimeout 6"
+    fi
+    local end_date=""
+    end_date=$($timeout_bin openssl s_client -connect 127.0.0.1:443 -servername "$sni" </dev/null 2>/dev/null \
+        | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2) || true
+    if [ -z "$end_date" ]; then
+        return 1
+    fi
+    local end_epoch=""
+    end_epoch=$(date -d "$end_date" +%s 2>/dev/null) || true
+    if [ -z "$end_epoch" ]; then
+        # BSD/macOS date fallback — openssl enddate format e.g. "Aug 13 12:00:00 2026 GMT"
+        end_epoch=$(date -j -f "%b %d %T %Y %Z" "$end_date" +%s 2>/dev/null) || true
+    fi
+    if [ -z "$end_epoch" ]; then
+        return 1
+    fi
+    local now_epoch
+    now_epoch=$(date +%s)
+    echo $(( (end_epoch - now_epoch) / 86400 ))
+    return 0
+}
+
+test_caddy_cert_expiry_and_self_heal() {
+    local phase="${1:-pre-update}"
+    local warn_days=14
+    local hostname_for_check="coderaft.local"
+    if [ -f "${INSTALL_DIR}/.env" ] && grep -qE '^\s*CODERAFT_HOSTNAME\s*=' "${INSTALL_DIR}/.env"; then
+        local candidate=""
+        candidate=$(grep -E '^\s*CODERAFT_HOSTNAME\s*=' "${INSTALL_DIR}/.env" | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | xargs) || true
+        [ -n "$candidate" ] && hostname_for_check="$candidate"
+    fi
+    echo "  Checking Caddy TLS certificate expiry (${phase}, host=${hostname_for_check})..."
+    if ! command -v openssl &>/dev/null; then
+        echo "  [warn] openssl not found on this host — cannot check Caddy certificate expiry, skipping."
+        return 0
+    fi
+    local days=""
+    days=$(get_caddy_cert_days_remaining "$hostname_for_check") || true
+    if [ -z "$days" ]; then
+        echo "  [warn] Could not check Caddy certificate (not reachable on 127.0.0.1:443 yet, or TLS handshake failed) — skipping."
+        return 0
+    fi
+    if [ "$days" -le "$warn_days" ]; then
+        if [ "$days" -lt 0 ]; then
+            echo "  [warn] Certificat Caddy EXPIRÉ depuis $(( -1 * days )) jour(s) — redémarrage préventif du service caddy."
+        else
+            echo "  [warn] Certificat Caddy expirant dans ${days} jour(s) — redémarrage préventif du service caddy."
+        fi
+        docker compose "${COMPOSE_ARGS[@]}" restart caddy >/dev/null 2>&1 || true
+        sleep 3
+        local days_after=""
+        days_after=$(get_caddy_cert_days_remaining "$hostname_for_check") || true
+        if [ -n "$days_after" ] && [ "$days_after" -gt "$days" ]; then
+            echo "  Caddy redémarré — certificat désormais valide ${days_after} jour(s)."
+        else
+            echo "  [warn] Redémarrage effectué mais l'expiration ne semble pas avoir progressé (valeur relue: ${days_after:-inconnue}). Vérifier: docker compose logs caddy"
+        fi
+    else
+        echo "  Certificat Caddy valide encore ${days} jour(s)."
+    fi
+    return 0
+}
+
+test_caddy_cert_expiry_and_self_heal "pre-update" || true
+
+# ── Caddy cert watchdog cron self-heal (2026-08-13) ───────────────────────
+# The check above only ever runs when update.sh itself is invoked. Any
+# EXISTING install (this one, right now, mid-update) never re-runs
+# install.sh, so it would otherwise never receive the standalone daily
+# watchdog at all. check-caddy-cert.sh was just (re)fetched by the
+# self-update block above — its own --register-task is idempotent (strips
+# any previous cron line for this script before re-adding), so calling it
+# on every update.sh run is safe and never duplicates the entry. Non-fatal:
+# a host without crontab just logs a warning.
+if [ -x "$INSTALL_DIR/check-caddy-cert.sh" ]; then
+    bash "$INSTALL_DIR/check-caddy-cert.sh" --register-task || true
+fi
+
 # ── AGGRESSIVE Docker image cache invalidation ────────────────────────────
 # Docker Desktop multi-arch bug: when a new manifest list is pushed to GHCR,
 # `docker pull` may report "Image is up to date" even though the local and
@@ -2456,7 +2881,9 @@ HEALTH_URL="$DASHBOARD_API/api/health"
 for i in $(seq 1 "$HEALTHCHECK_RETRIES"); do
     # -sS without -f: capture the HTTP code even on 4xx/5xx instead of an
     # exit code !=0 which would concatenate "0" (gave "5020" instead of "502").
-    HTTP_CODE=$(curl -sS -o /dev/null -w "%{http_code}" "$HEALTH_URL" 2>/dev/null || echo "000")
+    # --max-time 5: mirrors update.ps1's Invoke-WebRequest -TimeoutSec 5 for
+    # this same post-update health probe (retried by the loop above).
+    HTTP_CODE=$(curl -sS --max-time 5 -o /dev/null -w "%{http_code}" "$HEALTH_URL" 2>/dev/null || echo "000")
     if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 500 ]; then
         echo "  Dashboard API healthy (HTTP $HTTP_CODE) after ${i} attempt(s)."
         HEALTH_OK=0
@@ -2471,7 +2898,14 @@ if [ "$HEALTH_OK" -ne 0 ]; then
     echo "  ERROR: healthcheck failed after $HEALTHCHECK_RETRIES attempts."
     echo "  Triggering automatic rollback..."
     if [ -x "./rollback.sh" ]; then
-        bash ./rollback.sh
+        # Root cause fix (2026-09, live incident): ADMIN_TOKEN was resolved
+        # above (discover_admin_token) into this script's own shell variable
+        # but never exported, so this child `bash` process previously started
+        # with an empty environment and rollback.sh failed immediately with
+        # "ADMIN_TOKEN required" — the "automatic" rollback could never
+        # actually run unattended. Pass it through explicitly (rollback.sh
+        # also has its own auto-discovery fallback now, independent of this).
+        ADMIN_TOKEN="$ADMIN_TOKEN" bash ./rollback.sh
     else
         echo "  rollback.sh not found. Manual rollback required."
         echo "  Command: docker compose down && docker compose up -d"
@@ -2551,9 +2985,21 @@ else
     fi
 fi
 
+# ── Post-update Caddy TLS certificate expiry re-check (2026-08-13) ───────
+# Confirms the pre-update pass (or the --force-recreate of caddy that just
+# happened as part of this same update, which self-heals renewal on its own
+# as a side effect) actually left a healthy certificate behind. Catches the
+# rarer case where a restart alone doesn't fix it (e.g. a genuinely
+# corrupted caddy_data volume) so it surfaces here in the update log
+# instead of staying silent until a browser hits ERR_CERT_DATE_INVALID.
+echo ""
+test_caddy_cert_expiry_and_self_heal "post-update" || true
+
 # ── Post-update notification ──────────────────────────────────────────────
 if [ -n "$ADMIN_TOKEN" ]; then
-    curl -fsS -X POST "$DASHBOARD_API/api/platform/update/notify" \
+    # --max-time 5: mirrors update.ps1's Invoke-RestMethod -TimeoutSec 5 for
+    # this same best-effort post-update notification.
+    curl -fsS --max-time 5 -X POST "$DASHBOARD_API/api/platform/update/notify" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $ADMIN_TOKEN" \
         -d '{"status":"done","source":"update.sh"}' > /dev/null 2>&1 || true
