@@ -3664,12 +3664,34 @@ function Test-CaddyCertExpiryAndSelfHeal {
     $CaddyCertWarnDays = 14
     $hostnameForCheck = "coderaft.local"
     $envPathForCert = Join-Path $INSTALL_DIR ".env"
+    $tlsModeArgs = "internal"
     if (Test-Path $envPathForCert) {
         $envTextCert = [System.IO.File]::ReadAllText($envPathForCert, [System.Text.UTF8Encoding]::new($false))
         if ($envTextCert -match '(?m)^\s*CODERAFT_HOSTNAME\s*=(.+)$') {
             $candidate = $Matches[1].Trim().Trim('"').Trim("'")
             if ($candidate) { $hostnameForCheck = $candidate }
         }
+        if ($envTextCert -match '(?m)^\s*CADDY_TLS_MODE_ARGS\s*=(.+)$') {
+            $modeCandidate = $Matches[1].Trim().Trim('"').Trim("'")
+            if ($modeCandidate) { $tlsModeArgs = $modeCandidate }
+        }
+    }
+    # FIXED 2026-10-02: the day-threshold check below is meaningless for Caddy's
+    # own `tls internal` issuer (the default, and what every fresh install
+    # uses unless the Setup Wizard's TLS step was changed to file/ACME) — its
+    # leaf certs are DELIBERATELY short-lived (confirmed live: 12-hour total
+    # validity window, notBefore→notAfter) and Caddy's own background
+    # certificate maintenance renews them continuously on its own, with zero
+    # human/script intervention ever needed. `$days` is computed via
+    # [Math]::Ceiling() on a day granularity, so a 12h-lifetime cert ALWAYS
+    # reads as "≤1 day remaining" at every single check, every single
+    # update — a permanent false positive, not a real signal, for this mode.
+    # Only run the real check (and the restart self-heal, which DOES make
+    # sense for a long-lived file/ACME cert that's actually stuck) when the
+    # configured mode is anything other than the internal-CA default.
+    if ($tlsModeArgs -eq "internal") {
+        Write-Host "  Caddy TLS mode: internal CA (self-renewing ~12h leaf certs, no action ever needed) — skipping day-based expiry check."
+        return
     }
     Write-Host "  Checking Caddy TLS certificate expiry ($Phase, host=$hostnameForCheck)..."
     $days = Get-CaddyCertDaysRemaining -SniName $hostnameForCheck

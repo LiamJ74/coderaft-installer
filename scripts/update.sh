@@ -2786,10 +2786,27 @@ test_caddy_cert_expiry_and_self_heal() {
     local phase="${1:-pre-update}"
     local warn_days=14
     local hostname_for_check="coderaft.local"
+    local tls_mode_args="internal"
     if [ -f "${INSTALL_DIR}/.env" ] && grep -qE '^\s*CODERAFT_HOSTNAME\s*=' "${INSTALL_DIR}/.env"; then
         local candidate=""
         candidate=$(grep -E '^\s*CODERAFT_HOSTNAME\s*=' "${INSTALL_DIR}/.env" | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | xargs) || true
         [ -n "$candidate" ] && hostname_for_check="$candidate"
+    fi
+    if [ -f "${INSTALL_DIR}/.env" ] && grep -qE '^\s*CADDY_TLS_MODE_ARGS\s*=' "${INSTALL_DIR}/.env"; then
+        local mode_candidate=""
+        mode_candidate=$(grep -E '^\s*CADDY_TLS_MODE_ARGS\s*=' "${INSTALL_DIR}/.env" | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | xargs) || true
+        [ -n "$mode_candidate" ] && tls_mode_args="$mode_candidate"
+    fi
+    # FIXED 2026-10-02: see update.ps1's sibling function for the full
+    # explanation — Caddy's `tls internal` issuer (the default) uses
+    # deliberately short-lived leaf certs (confirmed live: 12h total
+    # validity) that it renews entirely on its own; the day-granularity
+    # check below is a permanent false positive for this mode, not a real
+    # signal. Only run it for file/ACME modes, where a stuck/near-expiry
+    # cert is a genuine, actionable problem.
+    if [ "$tls_mode_args" = "internal" ]; then
+        echo "  Caddy TLS mode: internal CA (self-renewing ~12h leaf certs, no action ever needed) — skipping day-based expiry check."
+        return 0
     fi
     echo "  Checking Caddy TLS certificate expiry (${phase}, host=${hostname_for_check})..."
     if ! command -v openssl &>/dev/null; then
