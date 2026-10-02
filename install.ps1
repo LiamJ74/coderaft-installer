@@ -48,7 +48,7 @@ $ErrorActionPreference = 'Stop'
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.ps1/install.ps1.sha256 at all — today it still
 # proxies the legacy `coderaft-installer` repo.
-$CoderaftExpectedSha256 = "eec9934c97ed5df8861e0a11431280fbd2eddc3ab1192608f89fdcceb0bdc49b"
+$CoderaftExpectedSha256 = "8ed76a0fa71ad00d9f2b712780010da1dc04a74185cf1ae06f84590bfd1d6f9d"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -1172,7 +1172,7 @@ clients:
 
   - name: entraguard
     cert_san: "entraguard.coderaft.local"
-    permissions: ["read:azure_*","read:license_key","read:entraguard_*","read:platform/identity/oidc","read:platform/identity/graph-tools","write:platform/identity/graph-tools","read:credentials/","read:tenant/","read:m365dsc-exo-cert/*","write:m365dsc-exo-cert/*","delete:m365dsc-exo-cert/*"]
+    permissions: ["read:azure_*","read:license_key","read:entraguard_*","read:platform/identity/oidc","read:platform/identity/graph-tools","write:platform/identity/graph-tools","read:credentials/*","read:tenant/*","read:m365dsc-exo-cert/*","write:m365dsc-exo-cert/*","delete:m365dsc-exo-cert/*"]
 
   - name: ravenscan
     cert_san: "ravenscan.coderaft.local"
