@@ -1451,7 +1451,10 @@ function Invoke-EntraguardAclSelfHeal {
         "read:platform/identity/graph-tools",
         "write:platform/identity/graph-tools",
         "read:credentials/",
-        "read:tenant/"
+        "read:tenant/",
+        "read:m365dsc-exo-cert/*",
+        "write:m365dsc-exo-cert/*",
+        "delete:m365dsc-exo-cert/*"
     )
 
     $lines = @(Get-Content -LiteralPath $AclPath)
@@ -1478,6 +1481,9 @@ function Invoke-EntraguardAclSelfHeal {
       - "write:platform/identity/graph-tools"
       - "read:credentials/"
       - "read:tenant/"
+      - "read:m365dsc-exo-cert/*"
+      - "write:m365dsc-exo-cert/*"
+      - "delete:m365dsc-exo-cert/*"
 '@
         Add-Content -LiteralPath $AclPath -Value $newBlock
         Write-DetailLog "[install] Self-heal ACL: entraguard permissions updated (+$($requiredPerms.Count) added, entry created)"
@@ -2462,7 +2468,7 @@ clients:
     permissions: ["*"]
   - name: entraguard
     cert_san: "entraguard.coderaft.local"
-    permissions: ["read:azure_*","read:license_key","read:entraguard_*","read:platform/identity/oidc","read:platform/identity/graph-tools","write:platform/identity/graph-tools","read:credentials/","read:tenant/"]
+    permissions: ["read:azure_*","read:license_key","read:entraguard_*","read:platform/identity/oidc","read:platform/identity/graph-tools","write:platform/identity/graph-tools","read:credentials/","read:tenant/","read:m365dsc-exo-cert/*","write:m365dsc-exo-cert/*","delete:m365dsc-exo-cert/*"]
   - name: ravenscan
     cert_san: "ravenscan.coderaft.local"
     permissions: ["read:ravenscan_*","read:neo4j_*","read:license_key","read:platform/identity/oidc"]
@@ -2988,7 +2994,8 @@ Invoke-EntraguardAclSelfHeal -AclPath (Join-Path $INSTALL_DIR "vault-config\acl.
 Invoke-VaultAclLiveSelfHeal -InstallDir $INSTALL_DIR -Name "entraguard" -San "entraguard.coderaft.local" -Permissions @(
     "read:azure_*", "read:entraguard_*", "read:platform/identity/oidc",
     "read:platform/identity/graph-tools", "write:platform/identity/graph-tools",
-    "read:credentials/", "read:tenant/"
+    "read:credentials/", "read:tenant/",
+    "read:m365dsc-exo-cert/*", "write:m365dsc-exo-cert/*", "delete:m365dsc-exo-cert/*"
 )
 Invoke-FalconOneTlsBootstrap -InstallDir $INSTALL_DIR
 Invoke-FalconOneAclSelfHeal -AclPath (Join-Path $INSTALL_DIR "vault-config\acl.yaml")

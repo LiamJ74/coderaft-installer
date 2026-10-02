@@ -996,6 +996,9 @@ _entraguard_acl_selfheal() {
         "write:platform/identity/graph-tools"
         "read:credentials/"
         "read:tenant/"
+        "read:m365dsc-exo-cert/*"
+        "write:m365dsc-exo-cert/*"
+        "delete:m365dsc-exo-cert/*"
     )
 
     local ts
@@ -1016,6 +1019,9 @@ _entraguard_acl_selfheal() {
       - "write:platform/identity/graph-tools"
       - "read:credentials/"
       - "read:tenant/"
+      - "read:m365dsc-exo-cert/*"
+      - "write:m365dsc-exo-cert/*"
+      - "delete:m365dsc-exo-cert/*"
 ENTRAGUARDACL
         echo "  [install] Self-heal ACL: entraguard permissions updated (+${#required_perms[@]} added, entry created)"
         return 0
@@ -2218,7 +2224,7 @@ clients:
     permissions: ["*"]
   - name: entraguard
     cert_san: "entraguard.coderaft.local"
-    permissions: ["read:azure_*","read:license_key","read:entraguard_*","read:platform/identity/oidc","read:platform/identity/graph-tools","write:platform/identity/graph-tools","read:credentials/","read:tenant/"]
+    permissions: ["read:azure_*","read:license_key","read:entraguard_*","read:platform/identity/oidc","read:platform/identity/graph-tools","write:platform/identity/graph-tools","read:credentials/","read:tenant/","read:m365dsc-exo-cert/*","write:m365dsc-exo-cert/*","delete:m365dsc-exo-cert/*"]
   - name: ravenscan
     cert_san: "ravenscan.coderaft.local"
     permissions: ["read:ravenscan_*","read:neo4j_*","read:license_key","read:platform/identity/oidc"]
@@ -2246,7 +2252,8 @@ _entraguard_acl_selfheal "${INSTALL_DIR}/vault-config/acl.yaml"
 _vault_acl_live_selfheal "entraguard" "entraguard.coderaft.local" \
     "read:azure_*" "read:entraguard_*" "read:platform/identity/oidc" \
     "read:platform/identity/graph-tools" "write:platform/identity/graph-tools" \
-    "read:credentials/" "read:tenant/"
+    "read:credentials/" "read:tenant/" \
+    "read:m365dsc-exo-cert/*" "write:m365dsc-exo-cert/*" "delete:m365dsc-exo-cert/*"
 
 # ── FalconOne mTLS PKI + ACL self-heal (#170 / #172 / #226) ──────────────────
 # Runs unconditionally on EVERY update, independent of the one-time vault
