@@ -48,7 +48,7 @@ $ErrorActionPreference = 'Stop'
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.ps1/install.ps1.sha256 at all — today it still
 # proxies the legacy `coderaft-installer` repo.
-$CoderaftExpectedSha256 = "8ac051f4ef83a74b33dabd08cd312d8a01dc270763cefbf5ad3a94aee72f6a49"
+$CoderaftExpectedSha256 = "a578abbe3121085b3fa962bb4af754d7a1d054ca8750c2c2ce288173d895a6f0"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -2255,6 +2255,60 @@ secrets:
 $Compose = $Compose.Replace(
     "      - ./caddy_certs:/certs:ro`n      - ./Caddyfile:/etc/caddy/Caddyfile:ro",
     "      - type: bind`n        source: $AbsoluteInstallDir\caddy_certs`n        target: /certs`n        read_only: true`n      - type: bind`n        source: $AbsoluteInstallDir\Caddyfile`n        target: /etc/caddy/Caddyfile`n        read_only: true"
+)
+
+# B-WINPATH-FULL (2026-10-23 incident): the exact same /app/C:\... mis-
+# resolution recurs for EVERY other short-form relative bind mount (and
+# `secrets:` `file:`) still left in this compose after the Caddy-only fix
+# above — not a caddy-specific bug. ANY `docker compose` invocation from
+# inside the Linux dashboard-api container (runCompose() in
+# routes/platform.js, reloadCaddy() in lib/caddy.js, the product-deploy
+# path — all of them share the same `--project-directory $AbsoluteInstallDir`
+# call) hits the identical root cause: the Linux compose binary's POSIX-only
+# absolute-path check doesn't recognize a Windows drive-letter path, so it
+# resolves any remaining `./xxx` against its own `/app` cwd instead —
+# producing paths like `/app/C:\Users\...\secrets\redis_password` (the
+# error seen live). Fixing every remaining relative source the same way:
+# long-form bind syntax with a pre-resolved absolute $AbsoluteInstallDir
+# source (a secret's `file:` just takes the absolute string directly — no
+# short/long form to convert there).
+#
+# `.:/host-compose` appears twice (dashboard-api AND self-update-runner,
+# identical short-form text) — one `.Replace()` fixes both since .NET's
+# String.Replace() replaces every occurrence. It's the project root itself
+# and stays read-write (no `read_only:`), per the comments on both services
+# about dashboard-api writing docker-compose.override.yml there.
+$Compose = $Compose.Replace(
+    "      - .:/host-compose",
+    "      - type: bind`n        source: $AbsoluteInstallDir`n        target: /host-compose"
+)
+$Compose = $Compose.Replace(
+    "      - ./.coderaft-age.key:/keys/age.key:ro",
+    "      - type: bind`n        source: $AbsoluteInstallDir\.coderaft-age.key`n        target: /keys/age.key`n        read_only: true"
+)
+$Compose = $Compose.Replace(
+    "      - ./vault-tls/client-ca.crt:/vault-tls/client-ca.crt:ro`n      - ./vault-tls/dashboard-api-client.crt:/vault-tls/dashboard-api-client.crt:ro`n      - ./vault-tls/dashboard-api-client.key:/vault-tls/dashboard-api-client.key:ro",
+    "      - type: bind`n        source: $AbsoluteInstallDir\vault-tls\client-ca.crt`n        target: /vault-tls/client-ca.crt`n        read_only: true`n      - type: bind`n        source: $AbsoluteInstallDir\vault-tls\dashboard-api-client.crt`n        target: /vault-tls/dashboard-api-client.crt`n        read_only: true`n      - type: bind`n        source: $AbsoluteInstallDir\vault-tls\dashboard-api-client.key`n        target: /vault-tls/dashboard-api-client.key`n        read_only: true"
+)
+$Compose = $Compose.Replace(
+    "      - ./vault-keys:/keys:ro`n      - ./vault-tls:/tls:ro`n      - ./vault-config:/etc/coderaft-vault:ro",
+    "      - type: bind`n        source: $AbsoluteInstallDir\vault-keys`n        target: /keys`n        read_only: true`n      - type: bind`n        source: $AbsoluteInstallDir\vault-tls`n        target: /tls`n        read_only: true`n      - type: bind`n        source: $AbsoluteInstallDir\vault-config`n        target: /etc/coderaft-vault`n        read_only: true"
+)
+$Compose = $Compose.Replace(
+    "      - ./vault-tls/client-ca.crt:/vault-tls/client-ca.crt:ro`n      - ./vault-tls/cve-proxy-client.crt:/vault-tls/cve-proxy-client.crt:ro`n      - ./vault-tls/cve-proxy-client.key:/vault-tls/cve-proxy-client.key:ro",
+    "      - type: bind`n        source: $AbsoluteInstallDir\vault-tls\client-ca.crt`n        target: /vault-tls/client-ca.crt`n        read_only: true`n      - type: bind`n        source: $AbsoluteInstallDir\vault-tls\cve-proxy-client.crt`n        target: /vault-tls/cve-proxy-client.crt`n        read_only: true`n      - type: bind`n        source: $AbsoluteInstallDir\vault-tls\cve-proxy-client.key`n        target: /vault-tls/cve-proxy-client.key`n        read_only: true"
+)
+$Compose = $Compose.Replace(
+    "      - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro",
+    "      - type: bind`n        source: $AbsoluteInstallDir\postgres\pg_hba.conf`n        target: /etc/postgresql/pg_hba.conf`n        read_only: true"
+)
+$Compose = $Compose.Replace(
+    "    file: ./secrets/postgres_password",
+    "    file: $AbsoluteInstallDir\secrets\postgres_password"
+)
+$Compose = $Compose.Replace(
+    "    file: ./secrets/redis_password",
+    "    file: $AbsoluteInstallDir\secrets\redis_password"
 )
 [System.IO.File]::WriteAllText("$(Get-Location)\docker-compose.yml", $Compose, [System.Text.UTF8Encoding]::new($false))
 

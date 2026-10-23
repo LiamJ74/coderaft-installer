@@ -1337,10 +1337,53 @@ if (-not $composeOK) {
             try { $psHealProc.Kill() } catch {}
         }
         Remove-Item -Path $psHealOut,$psHealErr -ErrorAction SilentlyContinue
+
+        # B27 (2026-10-23): a single `docker compose ps` run right after
+        # restarting 3 containers can hiccup transiently (Docker Desktop
+        # still settling, or a race with another `.env` rewrite elsewhere in
+        # this script) and return a non-zero exit code even though the stack
+        # is actually healthy — confirmed in prod: dashboard-api's own logs
+        # at the exact moment of the reported failure showed a clean boot
+        # and the "override.yml refreshed for products:" line (i.e.
+        # $healRefreshed was already $true), and a manual `docker compose
+        # ps` run seconds later showed all containers Up/healthy. When
+        # $healRefreshed is true we already have the strong, specific
+        # signal that dashboard-api's own self-heal worked, so retry this
+        # generic check a couple of times before trusting a single bad exit
+        # code from it.
+        if ($psHealProc.ExitCode -ne 0 -and $healRefreshed) {
+            for ($healPsRetry = 0; $healPsRetry -lt 2 -and $psHealProc.ExitCode -ne 0; $healPsRetry++) {
+                Start-Sleep -Seconds 5
+                $psHealOut = Join-Path $env:TEMP "coderaft-psheal-out-$(Get-Random).log"
+                $psHealErr = Join-Path $env:TEMP "coderaft-psheal-err-$(Get-Random).log"
+                $psHealProc = Start-Process -FilePath "docker" -ArgumentList (@("compose") + $ComposeEnvArgs + @("ps")) `
+                    -NoNewWindow -PassThru `
+                    -RedirectStandardOutput $psHealOut `
+                    -RedirectStandardError  $psHealErr `
+                    -ErrorAction SilentlyContinue
+                if ($psHealProc -and -not $psHealProc.WaitForExit(60000)) {   # 60s
+                    Write-Host "  ⚠  Docker command timed out after 60s: docker compose ps" -ForegroundColor Yellow
+                    try { $psHealProc.Kill() } catch {}
+                }
+                Remove-Item -Path $psHealOut,$psHealErr -ErrorAction SilentlyContinue
+            }
+        }
+
         if ($psHealProc.ExitCode -eq 0 -and $healRefreshed) {
             Write-Host "    ✓ compose repaired"
         } elseif ($psHealProc.ExitCode -eq 0) {
             Write-Host "    ⚠  compose command succeeded but dashboard-api's self-heal wasn't confirmed — verify manually: docker compose logs dashboard-api" -ForegroundColor Yellow
+        } elseif ($healRefreshed) {
+            # Still failing after retries, but dashboard-api itself already
+            # confirmed a clean override regen via its own logs — that is
+            # the authoritative, specific signal for this self-heal path. A
+            # `docker compose ps` that won't succeed at this point is almost
+            # certainly failing for a reason unrelated to the override
+            # (Docker Desktop CLI hiccup, local resource contention):
+            # aborting the rest of the update wouldn't fix that unrelated
+            # problem, it would just leave the operator's licensed products
+            # un-updated for no benefit. Warn and keep going.
+            Write-Host "    ⚠  compose repaired (dashboard-api confirmed via logs) but 'docker compose ps' is still failing — continuing anyway; verify manually: docker compose ps" -ForegroundColor Yellow
         } else {
             Write-Host "  ERROR: self-heal failed. Inspect docker-compose.override.yml manually."
             return  # not 'exit' — irm|iex runs this in the caller's own scope, so exit would close their whole shell
