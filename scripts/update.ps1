@@ -2384,18 +2384,26 @@ if ($vaultNeedsMigration) {
         Write-Host "  ✓ Vault age key already exists — reusing"
     }
 
-    # ── 4c.2 mTLS PKI + config.yaml + acl.yaml (ALWAYS — idempotent) ──────
-    # These artefacts cost <1s to regenerate and are always overwritten so a
-    # half-bootstrapped vault from a previous failed run is healed on next try.
-    # PKI generation runs inside a one-shot alpine container (always has openssl
-    # baked in) — no host dependency on openssl/Git for Windows.
-    Write-Host "  Bootstrapping vault TLS PKI + config (via alpine container)..."
+    # ── 4c.2 mTLS PKI (ONCE — rotating the CA while an already-running
+    # vault keeps serving its OLD server cert would leave the freshly
+    # overwritten client-ca.crt unable to validate that cert: every TLS
+    # handshake to an otherwise-healthy vault fails. Incident 2026-10-23.) +
+    # config.yaml + acl.yaml (ALWAYS — static content, <1s, safe to
+    # overwrite every run so a half-bootstrapped vault heals on next try).
     $tlsDir = Join-Path $INSTALL_DIR "vault-tls"
     $cfgDir = Join-Path $INSTALL_DIR "vault-config"
 
-    # Single shell script run inside alpine that produces all certs at once.
-    # Uses /work as the bind-mounted vault-tls directory.
-    $opensslScript = @'
+    if (-not (Test-Path (Join-Path $tlsDir "client-ca.crt"))) {
+        # ponytail: doesn't detect a PARTIALLY-bootstrapped vault-tls (e.g.
+        # CA present but a client cert missing because a product was added
+        # since the last fresh bootstrap) — same known limitation as the
+        # $vaultAgeKey guard above. Out of scope here.
+        $vaultFreshBootstrap = $true
+        Write-Host "  Bootstrapping vault TLS PKI (via alpine container)..."
+
+        # Single shell script run inside alpine that produces all certs at once.
+        # Uses /work as the bind-mounted vault-tls directory.
+        $opensslScript = @'
 set -e
 apk add --no-cache openssl >/dev/null
 cd /work
@@ -2447,47 +2455,50 @@ chmod 600 *.key 2>/dev/null || true
 chmod 644 falconone-client.key falconone-client.crt 2>/dev/null || true
 chmod 644 cve-proxy-client.key cve-proxy-client.crt 2>/dev/null || true
 '@
-    # Bind-mount tlsDir into the alpine container at /work and run the script.
-    # Use --user to keep file ownership readable on Linux hosts; on Windows/Mac
-    # Docker Desktop handles UID translation transparently.
-    $absTlsDir = (Resolve-Path -LiteralPath $tlsDir).Path
-    # B20 (2026-06-08): `$opensslScript | & docker run --rm -i ... 2>&1` pipes
-    # stdin AND surfaces docker stderr as NativeCommandError in PS 5.1.
-    # Write the script to a temp file, mount it, run sh against it.
-    $opensslScriptFile2 = Join-Path $env:TEMP "coderaft-openssl2-$(Get-Random).sh"
-    $opensslScriptLF2 = $opensslScript -replace "`r`n", "`n"
-    [System.IO.File]::WriteAllText($opensslScriptFile2, $opensslScriptLF2, [System.Text.UTF8Encoding]::new($false))
+        # Bind-mount tlsDir into the alpine container at /work and run the script.
+        # Use --user to keep file ownership readable on Linux hosts; on Windows/Mac
+        # Docker Desktop handles UID translation transparently.
+        $absTlsDir = (Resolve-Path -LiteralPath $tlsDir).Path
+        # B20 (2026-06-08): `$opensslScript | & docker run --rm -i ... 2>&1` pipes
+        # stdin AND surfaces docker stderr as NativeCommandError in PS 5.1.
+        # Write the script to a temp file, mount it, run sh against it.
+        $opensslScriptFile2 = Join-Path $env:TEMP "coderaft-openssl2-$(Get-Random).sh"
+        $opensslScriptLF2 = $opensslScript -replace "`r`n", "`n"
+        [System.IO.File]::WriteAllText($opensslScriptFile2, $opensslScriptLF2, [System.Text.UTF8Encoding]::new($false))
 
-    # Pre-pull alpine silently
-    $mPullOut = Join-Path $env:TEMP "coderaft-mpull-out-$(Get-Random).log"
-    $mPullErr = Join-Path $env:TEMP "coderaft-mpull-err-$(Get-Random).log"
-    Start-Process -FilePath "docker" -ArgumentList @("pull","alpine:3.20") `
-        -NoNewWindow -Wait `
-        -RedirectStandardOutput $mPullOut `
-        -RedirectStandardError  $mPullErr `
-        -ErrorAction SilentlyContinue | Out-Null
-    Remove-Item -Path $mPullOut,$mPullErr -ErrorAction SilentlyContinue
+        # Pre-pull alpine silently
+        $mPullOut = Join-Path $env:TEMP "coderaft-mpull-out-$(Get-Random).log"
+        $mPullErr = Join-Path $env:TEMP "coderaft-mpull-err-$(Get-Random).log"
+        Start-Process -FilePath "docker" -ArgumentList @("pull","alpine:3.20") `
+            -NoNewWindow -Wait `
+            -RedirectStandardOutput $mPullOut `
+            -RedirectStandardError  $mPullErr `
+            -ErrorAction SilentlyContinue | Out-Null
+        Remove-Item -Path $mPullOut,$mPullErr -ErrorAction SilentlyContinue
 
-    $mRunOut = Join-Path $env:TEMP "coderaft-mrun-out-$(Get-Random).log"
-    $mRunErr = Join-Path $env:TEMP "coderaft-mrun-err-$(Get-Random).log"
-    $mRunProc = Start-Process -FilePath "docker" -ArgumentList @(
-        "run","--rm",
-        "-v","${opensslScriptFile2}:/script.sh:ro",
-        "-v","${absTlsDir}:/work",
-        "alpine:3.20","sh","/script.sh"
-    ) -NoNewWindow -Wait -PassThru `
-        -RedirectStandardOutput $mRunOut `
-        -RedirectStandardError  $mRunErr `
-        -ErrorAction Stop
-    if (Test-Path $mRunOut) {
-        $mRunContent = Get-Content $mRunOut -ErrorAction SilentlyContinue
-        if ($mRunContent) {
-            $mRunContent | Tee-Object -FilePath $migrationLog -Append | Out-Host
+        $mRunOut = Join-Path $env:TEMP "coderaft-mrun-out-$(Get-Random).log"
+        $mRunErr = Join-Path $env:TEMP "coderaft-mrun-err-$(Get-Random).log"
+        $mRunProc = Start-Process -FilePath "docker" -ArgumentList @(
+            "run","--rm",
+            "-v","${opensslScriptFile2}:/script.sh:ro",
+            "-v","${absTlsDir}:/work",
+            "alpine:3.20","sh","/script.sh"
+        ) -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput $mRunOut `
+            -RedirectStandardError  $mRunErr `
+            -ErrorAction Stop
+        if (Test-Path $mRunOut) {
+            $mRunContent = Get-Content $mRunOut -ErrorAction SilentlyContinue
+            if ($mRunContent) {
+                $mRunContent | Tee-Object -FilePath $migrationLog -Append | Out-Host
+            }
         }
-    }
-    Remove-Item -Path $mRunOut,$mRunErr,$opensslScriptFile2 -ErrorAction SilentlyContinue
-    if (-not (Test-Path (Join-Path $tlsDir "vault.crt"))) {
-        Invoke-VaultMigrationRollback "openssl-in-alpine cert generation failed (see $migrationLog)"; return
+        Remove-Item -Path $mRunOut,$mRunErr,$opensslScriptFile2 -ErrorAction SilentlyContinue
+        if (-not (Test-Path (Join-Path $tlsDir "vault.crt"))) {
+            Invoke-VaultMigrationRollback "openssl-in-alpine cert generation failed (see $migrationLog)"; return
+        }
+    } else {
+        Write-Host "  ✓ Vault TLS PKI already exists — reusing"
     }
     $configYaml = @'
 server:
@@ -2833,6 +2844,15 @@ services:
         Start-Process @spArgs | Out-Null
         $body = ""
         if (Test-Path $curlOut) { $body = ((Get-Content $curlOut -ErrorAction SilentlyContinue) -join "") }
+        # 2026-10-23: curl's `-sS` prints errors (e.g. TLS handshake failures)
+        # to stderr only — a silent failure left $body empty and the caller's
+        # log line showed nothing after the arrow. Surface stderr in that case
+        # so the next anomaly is diagnosable without guessing.
+        if (-not $body) {
+            $errText = ""
+            if (Test-Path $curlErr) { $errText = ((Get-Content $curlErr -ErrorAction SilentlyContinue) -join " ").Trim() }
+            if ($errText) { $body = "[stderr] $errText" }
+        }
         Remove-Item -Path $curlOut,$curlErr -ErrorAction SilentlyContinue
         if ($bodyFile) { Remove-Item -Path $bodyFile -ErrorAction SilentlyContinue }
         return $body
