@@ -48,7 +48,7 @@ $ErrorActionPreference = 'Stop'
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.ps1/install.ps1.sha256 at all — today it still
 # proxies the legacy `coderaft-installer` repo.
-$CoderaftExpectedSha256 = "07199fad779247ac57774e98683d932a6103c5f19f849e5dc1d82af7a0b70005"
+$CoderaftExpectedSha256 = "8ac051f4ef83a74b33dabd08cd312d8a01dc270763cefbf5ad3a94aee72f6a49"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -613,14 +613,33 @@ function Write-PostgresSecretFile($PgPassword) {
     # No chmod on Windows — rely on the same ACL pattern as vault-keys\age.key
     # (B-VAULT-ACL): keep inheritance ON (Administrators/SYSTEM stay readable,
     # required for Docker Desktop's 9P/plan9 file sharing to bind-mount this
-    # into the postgres container) and explicitly add the current user Read.
+    # into the postgres container).
+    #
+    # BUG FIX (2026-10, confirmed live via Get-Acl on a user's Windows box):
+    # unlike age.key (read-only mount, written once by this elevated script
+    # and never touched again), this file gets RE-WRITTEN from inside a
+    # Linux container every time the Setup Wizard hits "Deploy"
+    # (dashboard-api's generateOverrideToDir() -> writeComposeSecretFile(),
+    # idempotent regeneration on every deploy/update, not just first boot —
+    # see dashboard-api/server.js). install.ps1 itself always runs elevated,
+    # so this script's own token carries BUILTIN\Administrators — but Docker
+    # Desktop/WSL2 reaches the Windows filesystem through the SAME user's
+    # NON-elevated token (classic UAC split-token: the filtered token for an
+    # admin account is only a member of BUILTIN\Users, not of
+    # BUILTIN\Administrators, even though the full token is). Granting that
+    # user only "Read" (as a prior version of this function did) let the
+    # FIRST write (by this elevated script) succeed but made every
+    # SUBSEQUENT write from the container fail with EACCES, surfaced to the
+    # Setup Wizard as a generic "Internal server error". Granting
+    # BUILTIN\Users "Modify" (not just Read) covers the non-elevated token
+    # directly, with no dependency on which specific account ends up
+    # running the installer.
     $secretPath = Join-Path (Get-Location) "secrets\postgres_password"
     [System.IO.File]::WriteAllText($secretPath, $PgPassword, [System.Text.UTF8Encoding]::new($false))
     try {
         $acl = Get-Acl $secretPath
         $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-            [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
-            "Read", "Allow")
+            "BUILTIN\Users", "Modify", "Allow")
         $acl.AddAccessRule($rule)
         Set-Acl $secretPath $acl -ErrorAction Stop
     } catch {
@@ -640,10 +659,14 @@ function Write-RedisSecretFile($RedisPassword) {
     $secretPath = Join-Path (Get-Location) "secrets\redis_password"
     [System.IO.File]::WriteAllText($secretPath, $RedisPassword, [System.Text.UTF8Encoding]::new($false))
     try {
+        # BUILTIN\Users Modify, not current-user Read — see
+        # Write-PostgresSecretFile's comment above for the full write-up
+        # (UAC split-token: Docker Desktop/WSL2 re-writes this file on every
+        # Setup Wizard "Deploy" using the non-elevated token, which is only
+        # a BUILTIN\Users member even for an admin account).
         $acl = Get-Acl $secretPath
         $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-            [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
-            "Read", "Allow")
+            "BUILTIN\Users", "Modify", "Allow")
         $acl.AddAccessRule($rule)
         Set-Acl $secretPath $acl -ErrorAction Stop
     } catch {
@@ -2216,6 +2239,23 @@ secrets:
   redis_password:
     file: ./secrets/redis_password
 '@
+# B-WINPATH (caddy internal-TLS reload): the caddy
+# service above declares ./caddy_certs and ./Caddyfile as short-form,
+# project-relative bind mounts. lib/caddy.js's reloadCaddy() recreates this
+# service via `docker compose --project-directory $AbsoluteInstallDir ...`
+# run from INSIDE the Linux dashboard-api container — its POSIX-only
+# "is this absolute?" check doesn't recognize a Windows drive-letter path, so
+# it treats --project-directory as relative to /app and resolves these mounts
+# against the bogus `/app/C:\...` join. Same root cause as the `secrets:`
+# file paths above and generateTlsComposeOverride() in server.js — the fix
+# there is the same here: pre-resolve to an ABSOLUTE host path in long-form
+# bind syntax (short-form `source:target:mode` also chokes on the drive
+# letter's extra colon). $AbsoluteInstallDir (set near the top of this
+# script) is already the resolved absolute install dir.
+$Compose = $Compose.Replace(
+    "      - ./caddy_certs:/certs:ro`n      - ./Caddyfile:/etc/caddy/Caddyfile:ro",
+    "      - type: bind`n        source: $AbsoluteInstallDir\caddy_certs`n        target: /certs`n        read_only: true`n      - type: bind`n        source: $AbsoluteInstallDir\Caddyfile`n        target: /etc/caddy/Caddyfile`n        read_only: true"
+)
 [System.IO.File]::WriteAllText("$(Get-Location)\docker-compose.yml", $Compose, [System.Text.UTF8Encoding]::new($false))
 
 # ── postgres\pg_hba.conf (F-025, 2026-07-31) — PowerShell parity with install.sh
