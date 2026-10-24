@@ -49,7 +49,7 @@ set -e
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.sh/install.sh.sha256 at all — today it still proxies
 # the legacy `coderaft-installer` repo.
-EXPECTED_SHA256="7a0118d2d3ea8f42ef70a7a14022ae7c7555ef1276c284462e69e8bf51d95b0a"
+EXPECTED_SHA256="74299331ed5b14d033536608a995be32856f9ad402b762499e30d513817d42d2"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -2802,6 +2802,89 @@ vault_seed_bootstrap_secrets() {
     return $seed_failed
 }
 
+# ── Named-volume ownership self-heal (2026-10-24, live incident chez Liam) ──
+# ROOT CAUSE: Setup Wizard POST /api/entraguard/setup/save-config failed on
+# Liam's production Windows machine with "Failed to save config: [Errno 13]
+# Permission denied: '/opt/app/dotenv/.env'". entraguard-api runs as non-root
+# uid 1001 (products/entraguard/backend/Dockerfile) under `read_only: true`
+# (F-011/F-014, 2026-07-31) — only the `entraguard_dotenv` named volume is
+# writable, and the container has no root-then-drop-privilege entrypoint able
+# to chown it itself. Confirmed live on a real local install:
+# coderaft_entraguard_dotenv sat at 0:0 (root) while the sibling
+# coderaft_entraguard_reports was correctly 1001:1001 — because
+# /opt/app/reports is mkdir'd + chowned in the Dockerfile (Docker then
+# propagates that ownership into a fresh, empty named volume on first mount)
+# and /opt/app/dotenv is NOT, so a freshly created (or otherwise
+# wrongly-owned — Docker Desktop/WSL2 has its own history of this) volume
+# there stays root-owned forever. Same risk class applies to every other
+# product running read_only + non-root with a named volume (Ravenscan,
+# RedFox, FalconOne, Neo4j) — this is a general recovery safety net, not an
+# entraguard-only patch.
+#
+# Fix: a disposable alpine:3.20 container (same image/pattern already used by
+# redfox-certs-init in dashboard-api/server.js) chowns each named volume to
+# its product's real runtime uid:gid before the containers that mount it
+# start. Idempotent (no-op on an already-correctly-owned volume) and safe on
+# a volume that doesn't exist yet (`docker run -v` auto-creates it empty).
+# Never aborts install/update on failure — this is a best-effort self-heal,
+# not a hardening gate.
+#
+# redfox_certs_secured is intentionally NOT listed — it already has its own
+# dedicated, more thorough init container (redfox-certs-init: copies + chowns
+# + chmods 0400/0444 per file type) that runs on every `compose up`.
+# mantisstrike/ospreygate are intentionally NOT listed — neither has
+# `read_only: true` yet (see their PRODUCT_SERVICES blocks in
+# dashboard-api/server.js), so this risk doesn't apply to them today.
+_product_volumes_selfheal() {
+    echo "  Checking named-volume ownership (non-root product containers)..."
+
+    # Same idiom as vault_seed_bootstrap_secrets() above: read the REAL
+    # compose project name off an already-running container's label rather
+    # than assume the install directory is literally named "coderaft" —
+    # falls back to "coderaft" (the documented default) when that container
+    # doesn't exist yet.
+    local project
+    project=$(docker inspect coderaft-coderaft-vault-1 \
+        --format '{{ index .Config.Labels "com.docker.compose.project" }}' 2>/dev/null || true)
+    [ -z "$project" ] && project="coderaft"
+
+    # Ravenscan's Dockerfile creates its runtime user with `adduser -S` (no
+    # explicit -u/-g) — the resulting uid:gid is whatever Alpine's
+    # system-user allocator assigned INSIDE THE ACTUAL IMAGE (100:101 as of
+    # 2026-10-24), not a value safe to hardcode here. Resolve it from the
+    # real, already-pulled image instead of guessing.
+    local ravenscan_uid ravenscan_gid
+    ravenscan_uid=$(docker run --rm --entrypoint id "ghcr.io/liamj74/ravenscan:latest" -u ravenscan 2>/dev/null)
+    ravenscan_gid=$(docker run --rm --entrypoint id "ghcr.io/liamj74/ravenscan:latest" -g ravenscan 2>/dev/null)
+
+    local fixups=(
+        "entraguard_dotenv:1001:1001"
+        "entraguard_reports:1001:1001"
+        "neo4j_data:7474:7474"
+        "redfox_data:65532:65532"
+        "falconone_data:65532:65532"
+        "falconone_recordings:65532:65532"
+    )
+    if [ -n "$ravenscan_uid" ] && [ -n "$ravenscan_gid" ]; then
+        fixups+=("ravenscan_data:${ravenscan_uid}:${ravenscan_gid}")
+    else
+        echo "  [warn] Could not resolve ravenscan's runtime uid/gid (image not pulled yet?) — skipping ravenscan_data this run."
+    fi
+
+    local entry vol uid_gid uid gid volume_name
+    for entry in "${fixups[@]}"; do
+        vol="${entry%%:*}"
+        uid_gid="${entry#*:}"
+        uid="${uid_gid%%:*}"
+        gid="${uid_gid#*:}"
+        volume_name="${project}_${vol}"
+        if ! docker run --rm -v "${volume_name}:/target" alpine:3.20 chown -R "${uid}:${gid}" /target >/dev/null 2>&1; then
+            echo "  [warn] Could not fix ownership on volume '${volume_name}' (target ${uid}:${gid}) — continuing. If a product later fails with a permission error, run manually:"
+            echo "         docker run --rm -v ${volume_name}:/target alpine:3.20 chown -R ${uid}:${gid} /target"
+        fi
+    done
+}
+
 if [ "${CODERAFT_TEST_MODE:-0}" = "1" ]; then
     echo ""
     echo "  [CODERAFT_TEST_MODE] Skipping docker compose pull and up"
@@ -2900,6 +2983,8 @@ else
         echo "  [warn] Timed out waiting for dashboard-api's override.yml self-heal log line."
         echo "  Expected on a brand-new install with no license activated yet — proceeding."
     fi
+
+    _product_volumes_selfheal
 
     echo ""
     echo "  Starting remaining services..."

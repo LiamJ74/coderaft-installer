@@ -3921,6 +3921,112 @@ if ($LASTEXITCODE -ne 0) {
     return  # not 'exit' — irm|iex runs this in the caller's own scope, so exit would close their whole shell
 }
 
+# ── Named-volume ownership self-heal (2026-10-24, live incident chez Liam) ──
+# ROOT CAUSE: Setup Wizard POST /api/entraguard/setup/save-config failed on
+# Liam's production Windows machine with "Failed to save config: [Errno 13]
+# Permission denied: '/opt/app/dotenv/.env'". entraguard-api runs as non-root
+# uid 1001 (products/entraguard/backend/Dockerfile) under `read_only: true`
+# (F-011/F-014, 2026-07-31) -- only the `entraguard_dotenv` named volume is
+# writable, and the container has no root-then-drop-privilege entrypoint able
+# to chown it itself. Confirmed live on a real local install:
+# coderaft_entraguard_dotenv sat at 0:0 (root) while the sibling
+# coderaft_entraguard_reports was correctly 1001:1001 -- because
+# /opt/app/reports is mkdir'd + chowned in the Dockerfile (Docker then
+# propagates that ownership into a fresh, empty named volume on first mount)
+# and /opt/app/dotenv is NOT, so a freshly created (or otherwise
+# wrongly-owned -- Docker Desktop/WSL2 has its own history of this) volume
+# there stays root-owned forever. Same risk class applies to every other
+# product running read_only + non-root with a named volume (Ravenscan,
+# RedFox, FalconOne, Neo4j) -- this is a general recovery safety net, not an
+# entraguard-only patch. Placed AFTER the pull above (not before) so
+# Ravenscan's uid:gid lookup below reads the freshly-pulled image, not a
+# stale local one.
+#
+# Fix: a disposable alpine:3.20 container (same image/pattern already used by
+# redfox-certs-init in dashboard-api/server.js) chowns each named volume to
+# its product's real runtime uid:gid before `--force-recreate` below restarts
+# the containers that mount it. Idempotent (no-op on an already-correctly-
+# owned volume) and safe on a volume that doesn't exist yet (`docker run -v`
+# auto-creates it empty). Never aborts the update on failure -- this is a
+# best-effort self-heal, not a hardening gate.
+#
+# All `docker` calls below go through Start-Process with separate
+# stdout/stderr temp files, NOT `& docker ... 2>$null` + `$LASTEXITCODE` --
+# see the B20 (2026-06-08/09) comments throughout this script: under
+# PowerShell 5.1 (the Windows default) with $ErrorActionPreference='Stop',
+# even `2>$null` does not reliably suppress a native command's stderr from
+# becoming a terminating NativeCommandError. Start-Process + redirected temp
+# files is the only approach already proven safe here.
+#
+# redfox_certs_secured is intentionally NOT listed -- it already has its own
+# dedicated, more thorough init container (redfox-certs-init: copies + chowns
+# + chmods 0400/0444 per file type) that runs on every `compose up`.
+# mantisstrike/ospreygate are intentionally NOT listed -- neither has
+# `read_only: true` yet (see their PRODUCT_SERVICES blocks in
+# dashboard-api/server.js), so this risk doesn't apply to them today.
+function Repair-ProductVolumeOwnership {
+    Write-Host "  Checking named-volume ownership (non-root product containers)..."
+
+    function Invoke-DockerRunChecked {
+        param([string[]]$Arguments)
+        $stdoutFile = Join-Path $env:TEMP "coderaft-volchown-out-$(Get-Random).log"
+        $stderrFile = Join-Path $env:TEMP "coderaft-volchown-err-$(Get-Random).log"
+        $proc = Start-Process -FilePath "docker" -ArgumentList $Arguments `
+            -NoNewWindow -PassThru `
+            -RedirectStandardOutput $stdoutFile `
+            -RedirectStandardError  $stderrFile `
+            -ErrorAction SilentlyContinue
+        if ($proc -and -not $proc.WaitForExit(60000)) {   # 60s
+            try { $proc.Kill() } catch {}
+        }
+        $stdout = Get-Content -Path $stdoutFile -Raw -ErrorAction SilentlyContinue
+        Remove-Item -Path $stdoutFile,$stderrFile -ErrorAction SilentlyContinue
+        $exitCode = if ($proc) { $proc.ExitCode } else { 1 }
+        [PSCustomObject]@{ ExitCode = $exitCode; Output = $(if ($stdout) { $stdout.Trim() } else { "" }) }
+    }
+
+    # Same idiom as Invoke-VaultAclLiveSelfHeal above: read the REAL compose
+    # project name off an already-running container's label rather than
+    # assume the install directory is literally named "coderaft" -- falls
+    # back to "coderaft" (the documented default) when that container
+    # doesn't exist yet.
+    $projResult = Invoke-DockerRunChecked -Arguments @("inspect", "coderaft-coderaft-vault-1", "--format", '{{ index .Config.Labels "com.docker.compose.project" }}')
+    $project = if ($projResult.ExitCode -eq 0 -and $projResult.Output) { $projResult.Output } else { "coderaft" }
+
+    # Ravenscan's Dockerfile creates its runtime user with `adduser -S` (no
+    # explicit -u/-g) -- the resulting uid:gid is whatever Alpine's
+    # system-user allocator assigned INSIDE THE ACTUAL IMAGE (100:101 as of
+    # 2026-10-24), not a value safe to hardcode here. Resolve it from the
+    # real, freshly-pulled image above instead of guessing.
+    $rsUidResult = Invoke-DockerRunChecked -Arguments @("run", "--rm", "--entrypoint", "id", "ghcr.io/liamj74/ravenscan:latest", "-u", "ravenscan")
+    $rsGidResult = Invoke-DockerRunChecked -Arguments @("run", "--rm", "--entrypoint", "id", "ghcr.io/liamj74/ravenscan:latest", "-g", "ravenscan")
+
+    $fixups = [ordered]@{
+        "entraguard_dotenv"    = "1001:1001"
+        "entraguard_reports"   = "1001:1001"
+        "neo4j_data"           = "7474:7474"
+        "redfox_data"          = "65532:65532"
+        "falconone_data"       = "65532:65532"
+        "falconone_recordings" = "65532:65532"
+    }
+    if ($rsUidResult.ExitCode -eq 0 -and $rsUidResult.Output -and $rsGidResult.ExitCode -eq 0 -and $rsGidResult.Output) {
+        $fixups["ravenscan_data"] = "$($rsUidResult.Output):$($rsGidResult.Output)"
+    } else {
+        Write-Host "  [warn] Could not resolve ravenscan's runtime uid/gid (image not pulled yet?) -- skipping ravenscan_data this run." -ForegroundColor Yellow
+    }
+
+    foreach ($vol in $fixups.Keys) {
+        $ownerUidGid = $fixups[$vol]
+        $volumeName = "${project}_${vol}"
+        $chownResult = Invoke-DockerRunChecked -Arguments @("run", "--rm", "-v", "${volumeName}:/target", "alpine:3.20", "chown", "-R", $ownerUidGid, "/target")
+        if ($chownResult.ExitCode -ne 0) {
+            Write-Host "  [warn] Could not fix ownership on volume '$volumeName' (target $ownerUidGid) -- continuing. If a product later fails with a permission error, run manually:" -ForegroundColor Yellow
+            Write-Host "         docker run --rm -v ${volumeName}:/target alpine:3.20 chown -R $ownerUidGid /target" -ForegroundColor Yellow
+        }
+    }
+}
+Repair-ProductVolumeOwnership
+
 # Note: `--pull always` retried a per-service GHCR manifest check at redeploy
 # time (intermittent timeout on slow connections). The Docker Desktop tag-cache
 # bug is already covered by `docker rmi -f` + `docker compose pull` above, so
