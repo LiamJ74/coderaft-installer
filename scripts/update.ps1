@@ -3969,16 +3969,25 @@ function Repair-ProductVolumeOwnership {
 
     function Invoke-DockerRunChecked {
         param([string[]]$Arguments)
+        # Fix (2026-10-24, found live on Liam's machine): -PassThru WITHOUT
+        # -Wait, followed by a manual $proc.WaitForExit(), left $proc.ExitCode
+        # unreadable (empty, no exception, even with HasExited=True and
+        # .Refresh() called) on Windows PowerShell 5.1 — every single call
+        # silently reported failure regardless of the real docker result.
+        # -Wait makes the cmdlet itself do the waiting with a live handle,
+        # which reliably populates ExitCode afterward — confirmed live.
+        # Trade-off: -Wait has no timeout parameter, so the 60s kill-on-hang
+        # guard is gone; acceptable here since chown/id against a local
+        # Docker daemon are near-instant, and a daemon unresponsive enough to
+        # hang on those would already be failing the surrounding docker
+        # compose pull/up this runs between.
         $stdoutFile = Join-Path $env:TEMP "coderaft-volchown-out-$(Get-Random).log"
         $stderrFile = Join-Path $env:TEMP "coderaft-volchown-err-$(Get-Random).log"
         $proc = Start-Process -FilePath "docker" -ArgumentList $Arguments `
-            -NoNewWindow -PassThru `
+            -NoNewWindow -Wait -PassThru `
             -RedirectStandardOutput $stdoutFile `
             -RedirectStandardError  $stderrFile `
             -ErrorAction SilentlyContinue
-        if ($proc -and -not $proc.WaitForExit(60000)) {   # 60s
-            try { $proc.Kill() } catch {}
-        }
         $stdout = Get-Content -Path $stdoutFile -Raw -ErrorAction SilentlyContinue
         Remove-Item -Path $stdoutFile,$stderrFile -ErrorAction SilentlyContinue
         $exitCode = if ($proc) { $proc.ExitCode } else { 1 }
