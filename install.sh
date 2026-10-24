@@ -49,7 +49,7 @@ set -e
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.sh/install.sh.sha256 at all — today it still proxies
 # the legacy `coderaft-installer` repo.
-EXPECTED_SHA256="d3f4388291c8ac287f5456c0d715e6a6ddd4f7bc014743d02b529d6764885e71"
+EXPECTED_SHA256="42556a50b0543198b7707f5df5395a6e8f16e051ba2158c766e3f5a57859e872"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -440,7 +440,6 @@ else
     PG_PASSWORD_BOOTSTRAP="$(gen_hex 24)"
     REDIS_PASSWORD_BOOTSTRAP="$(gen_hex 24)"
     cat > .env << ENVFILE
-# CodeRaft Dashboard — $(date -u +"%Y-%m-%d")
 POSTGRES_PASSWORD=${PG_PASSWORD_BOOTSTRAP}
 REDIS_PASSWORD=${REDIS_PASSWORD_BOOTSTRAP}
 DASHBOARD_SECRET=$(gen_hex 32)

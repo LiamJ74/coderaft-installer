@@ -48,7 +48,7 @@ $ErrorActionPreference = 'Stop'
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.ps1/install.ps1.sha256 at all — today it still
 # proxies the legacy `coderaft-installer` repo.
-$CoderaftExpectedSha256 = "75d883b4d9fbdb2e2c8cb5da7b5ba42335924199c6cf9e77404e928eecff26bd"
+$CoderaftExpectedSha256 = "e3c4f120b90fa6f985624b7e8d74c3be1c643d60a1d2173297ace5036a63bd79"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -740,7 +740,6 @@ if ((Test-Path '.env') -and (Select-String -Path '.env' -Pattern '^POSTGRES_PASS
     Write-Host "  Generating secrets..."
     $PgPasswordBootstrap = New-HexSecret 24
     $Env = @"
-# CodeRaft Dashboard — $(Get-Date -Format 'yyyy-MM-dd')
 POSTGRES_PASSWORD=$PgPasswordBootstrap
 REDIS_PASSWORD=$(New-HexSecret 24)
 DASHBOARD_SECRET=$(New-HexSecret 32)

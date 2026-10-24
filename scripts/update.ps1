@@ -385,13 +385,26 @@ function Repair-EnvFile {
         # balloon on every update cycle; this function dutifully wrote the
         # growing blob straight to $envPlain each time until it finally
         # collapsed .env to 1 line (2.5MB) and took 6 services down with it.
-        # No legitimate .env line is anywhere near this size — refuse to
-        # write and keep whatever .env already exists instead of propagating
-        # a corrupted decrypt.
-        $maxLineLen = ($decrypted | Measure-Object -Property Length -Maximum).Maximum
-        if ($decrypted -and $maxLineLen -gt 8000) {
-            Write-Host "  [!] .env.enc decrypted to a line of $maxLineLen bytes — refusing to write, looks corrupted. Restore .env.enc from a known-good dashboard_data\env-pre-finalize-*.bak and re-run." -ForegroundColor Red
-        } elseif ($decrypted) {
+        # No legitimate .env line is anywhere near this size. Refusing to
+        # write at all (the original fix, same day) turned out to be too
+        # blunt: it found a SECOND, independent corruption source (a
+        # decorative "# CodeRaft Dashboard — <install date>" bootstrap
+        # comment, non-ASCII em-dash, mangled a little more on every sops
+        # round-trip — root-caused and the comment removed from install.ps1/
+        # install.sh) and, because this function runs before EVERY docker
+        # compose call, hard-blocked the entire update rather than just the
+        # one cosmetic line. Drop only the oversized line(s) — the real
+        # secrets dashboard-api cares about are never anywhere near this
+        # size — and keep going with whatever legitimate content remains;
+        # dashboard-api's own re-encrypt (generateOverrideToDir) will
+        # regenerate the vault-managed block from Vault on its next run
+        # regardless of what this function wrote.
+        $oversized = @($decrypted | Where-Object { $_.Length -gt 8000 })
+        if ($oversized.Count -gt 0) {
+            Write-Host "  [!] Dropping $($oversized.Count) oversized .env.enc line(s) (up to $(($oversized | Measure-Object -Property Length -Maximum).Maximum) bytes) — looks corrupted, not a real secret. See dashboard_data\env-pre-finalize-*.bak if something expected goes missing." -ForegroundColor Yellow
+            $decrypted = @($decrypted | Where-Object { $_.Length -le 8000 })
+        }
+        if ($decrypted) {
             [System.IO.File]::WriteAllText($envPlain, (($decrypted -join "`n") + "`n"), [System.Text.UTF8Encoding]::new($false))
             Protect-EnvFileAcl $envPlain
             Write-Host "  ✓ .env refreshed from .env.enc (ensures docker compose sees real secrets)"
