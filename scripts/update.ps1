@@ -379,7 +379,19 @@ function Repair-EnvFile {
     if ((Test-Path $ageKey) -and $sopsPath) {
         $env:SOPS_AGE_KEY_FILE = $ageKey
         $decrypted = & $sopsPath --decrypt --input-type dotenv --output-type dotenv $envEnc 2>$null
-        if ($decrypted) {
+        # 2026-10-24 (chez Liam): this used to trust $decrypted blindly. A
+        # format mismatch on the dashboard-api re-encrypt side (missing
+        # --input-type/--output-type there, now fixed) let one .env.enc line
+        # balloon on every update cycle; this function dutifully wrote the
+        # growing blob straight to $envPlain each time until it finally
+        # collapsed .env to 1 line (2.5MB) and took 6 services down with it.
+        # No legitimate .env line is anywhere near this size — refuse to
+        # write and keep whatever .env already exists instead of propagating
+        # a corrupted decrypt.
+        $maxLineLen = ($decrypted | Measure-Object -Property Length -Maximum).Maximum
+        if ($decrypted -and $maxLineLen -gt 8000) {
+            Write-Host "  [!] .env.enc decrypted to a line of $maxLineLen bytes — refusing to write, looks corrupted. Restore .env.enc from a known-good dashboard_data\env-pre-finalize-*.bak and re-run." -ForegroundColor Red
+        } elseif ($decrypted) {
             [System.IO.File]::WriteAllText($envPlain, (($decrypted -join "`n") + "`n"), [System.Text.UTF8Encoding]::new($false))
             Protect-EnvFileAcl $envPlain
             Write-Host "  ✓ .env refreshed from .env.enc (ensures docker compose sees real secrets)"
