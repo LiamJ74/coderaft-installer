@@ -48,7 +48,7 @@ $ErrorActionPreference = 'Stop'
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.ps1/install.ps1.sha256 at all — today it still
 # proxies the legacy `coderaft-installer` repo.
-$CoderaftExpectedSha256 = "59f89854bf7f1d608cf246447fb25f65d91f21fd2d433e017084eeb0a9342bc8"
+$CoderaftExpectedSha256 = "75d883b4d9fbdb2e2c8cb5da7b5ba42335924199c6cf9e77404e928eecff26bd"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -1194,8 +1194,16 @@ clients:
     permissions: ["*"]
 
   - name: entraguard
+    # write:platform/identity/graph-tools removed (migration 060, 2026-10-24):
+    # WolfGuard no longer mirrors its own credential to the flat Vault secret
+    # (app/services/graph_tools_publisher.py deleted) — the Setup Wizard
+    # writes it directly, org-scoped, via dashboard-api. read:platform/
+    # identity/graph-tools/org/* added: WolfGuard now resolves its own Graph
+    # credential from the org-scoped entry (app.services.vault_client.
+    # fetch_platform_graph_tools_credential), falling back to the flat
+    # read:platform/identity/graph-tools grant already present below.
     cert_san: "entraguard.coderaft.local"
-    permissions: ["read:azure_*","read:license_key","read:entraguard_*","read:platform/identity/oidc","read:platform/identity/graph-tools","write:platform/identity/graph-tools","read:credentials/*","read:tenant/*","read:m365dsc-exo-cert/*","write:m365dsc-exo-cert/*","delete:m365dsc-exo-cert/*"]
+    permissions: ["read:azure_*","read:license_key","read:entraguard_*","read:platform/identity/oidc","read:platform/identity/graph-tools","read:platform/identity/graph-tools/org/*","read:credentials/*","read:tenant/*","read:m365dsc-exo-cert/*","write:m365dsc-exo-cert/*","delete:m365dsc-exo-cert/*"]
 
   - name: ravenscan
     cert_san: "ravenscan.coderaft.local"

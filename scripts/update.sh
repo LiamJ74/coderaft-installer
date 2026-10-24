@@ -994,6 +994,12 @@ _entraguard_acl_selfheal() {
         "read:platform/identity/oidc"
         "read:platform/identity/graph-tools"
         "write:platform/identity/graph-tools"
+        # Org-scoped Graph credential read (migration 060, 2026-10-24):
+        # WolfGuard resolves its own Graph credential from
+        # platform/identity/graph-tools/org/<uuid> first, falling back to the
+        # flat secret above — see app.services.vault_client.
+        # fetch_platform_graph_tools_credential.
+        "read:platform/identity/graph-tools/org/*"
         "read:credentials/*"
         "read:tenant/*"
         "read:m365dsc-exo-cert/*"
@@ -1017,6 +1023,7 @@ _entraguard_acl_selfheal() {
       - "read:platform/identity/oidc"
       - "read:platform/identity/graph-tools"
       - "write:platform/identity/graph-tools"
+      - "read:platform/identity/graph-tools/org/*"
       - "read:credentials/*"
       - "read:tenant/*"
       - "read:m365dsc-exo-cert/*"
@@ -2224,7 +2231,7 @@ clients:
     permissions: ["*"]
   - name: entraguard
     cert_san: "entraguard.coderaft.local"
-    permissions: ["read:azure_*","read:license_key","read:entraguard_*","read:platform/identity/oidc","read:platform/identity/graph-tools","write:platform/identity/graph-tools","read:credentials/*","read:tenant/*","read:m365dsc-exo-cert/*","write:m365dsc-exo-cert/*","delete:m365dsc-exo-cert/*"]
+    permissions: ["read:azure_*","read:license_key","read:entraguard_*","read:platform/identity/oidc","read:platform/identity/graph-tools","read:platform/identity/graph-tools/org/*","read:credentials/*","read:tenant/*","read:m365dsc-exo-cert/*","write:m365dsc-exo-cert/*","delete:m365dsc-exo-cert/*"]
   - name: ravenscan
     cert_san: "ravenscan.coderaft.local"
     permissions: ["read:ravenscan_*","read:neo4j_*","read:license_key","read:platform/identity/oidc"]
@@ -2252,6 +2259,7 @@ _entraguard_acl_selfheal "${INSTALL_DIR}/vault-config/acl.yaml"
 _vault_acl_live_selfheal "entraguard" "entraguard.coderaft.local" \
     "read:azure_*" "read:entraguard_*" "read:platform/identity/oidc" \
     "read:platform/identity/graph-tools" "write:platform/identity/graph-tools" \
+    "read:platform/identity/graph-tools/org/*" \
     "read:credentials/*" "read:tenant/*" \
     "read:m365dsc-exo-cert/*" "write:m365dsc-exo-cert/*" "delete:m365dsc-exo-cert/*"
 

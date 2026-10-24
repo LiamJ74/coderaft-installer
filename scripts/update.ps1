@@ -1505,6 +1505,12 @@ function Invoke-EntraguardAclSelfHeal {
         "read:platform/identity/oidc",
         "read:platform/identity/graph-tools",
         "write:platform/identity/graph-tools",
+        # Org-scoped Graph credential read (migration 060, 2026-10-24):
+        # WolfGuard resolves its own Graph credential from
+        # platform/identity/graph-tools/org/<uuid> first, falling back to
+        # the flat secret above — see app.services.vault_client.
+        # fetch_platform_graph_tools_credential.
+        "read:platform/identity/graph-tools/org/*",
         "read:credentials/*",
         "read:tenant/*",
         "read:m365dsc-exo-cert/*",
@@ -1534,6 +1540,7 @@ function Invoke-EntraguardAclSelfHeal {
       - "read:platform/identity/oidc"
       - "read:platform/identity/graph-tools"
       - "write:platform/identity/graph-tools"
+      - "read:platform/identity/graph-tools/org/*"
       - "read:credentials/*"
       - "read:tenant/*"
       - "read:m365dsc-exo-cert/*"
@@ -2534,7 +2541,7 @@ clients:
     permissions: ["*"]
   - name: entraguard
     cert_san: "entraguard.coderaft.local"
-    permissions: ["read:azure_*","read:license_key","read:entraguard_*","read:platform/identity/oidc","read:platform/identity/graph-tools","write:platform/identity/graph-tools","read:credentials/*","read:tenant/*","read:m365dsc-exo-cert/*","write:m365dsc-exo-cert/*","delete:m365dsc-exo-cert/*"]
+    permissions: ["read:azure_*","read:license_key","read:entraguard_*","read:platform/identity/oidc","read:platform/identity/graph-tools","read:platform/identity/graph-tools/org/*","read:credentials/*","read:tenant/*","read:m365dsc-exo-cert/*","write:m365dsc-exo-cert/*","delete:m365dsc-exo-cert/*"]
   - name: ravenscan
     cert_san: "ravenscan.coderaft.local"
     permissions: ["read:ravenscan_*","read:neo4j_*","read:license_key","read:platform/identity/oidc"]
@@ -3069,6 +3076,7 @@ Invoke-EntraguardAclSelfHeal -AclPath (Join-Path $INSTALL_DIR "vault-config\acl.
 Invoke-VaultAclLiveSelfHeal -InstallDir $INSTALL_DIR -Name "entraguard" -San "entraguard.coderaft.local" -Permissions @(
     "read:azure_*", "read:entraguard_*", "read:platform/identity/oidc",
     "read:platform/identity/graph-tools", "write:platform/identity/graph-tools",
+    "read:platform/identity/graph-tools/org/*",
     "read:credentials/*", "read:tenant/*",
     "read:m365dsc-exo-cert/*", "write:m365dsc-exo-cert/*", "delete:m365dsc-exo-cert/*"
 )
@@ -4422,6 +4430,13 @@ if ($reconcileUpProc -and -not $reconcileUpProc.WaitForExit(180000)) {   # 3min
     Write-Host "  ⚠  Reconciliation 'docker compose up -d' timed out after 180s." -ForegroundColor Yellow
     try { $reconcileUpProc.Kill() } catch {}
 }
+# 2026-10-24 (chez Liam): without -Wait (needed here for the custom 180s
+# timeout+Kill above, which -Wait doesn't support), .NET's Process object
+# caches property values from when the handle was obtained — .ExitCode reads
+# back stale/blank right after WaitForExit() returns true unless Refresh()
+# is called first (documented .NET behavior, not a PowerShell bug). Printed
+# as the literal "exited with code ." every run, even on full success.
+if ($reconcileUpProc) { try { $reconcileUpProc.Refresh() } catch {} }
 $reconcileExit = if ($reconcileUpProc) { $reconcileUpProc.ExitCode } else { -1 }
 $reconcileUpLog = ""
 if (Test-Path $reconcileUpErr) { $reconcileUpLog = (Get-Content $reconcileUpErr -Raw -ErrorAction SilentlyContinue) }
