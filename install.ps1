@@ -48,7 +48,7 @@ $ErrorActionPreference = 'Stop'
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.ps1/install.ps1.sha256 at all — today it still
 # proxies the legacy `coderaft-installer` repo.
-$CoderaftExpectedSha256 = "50927537da81c5d19c765bd0a6280634b283a5a1fab9919ccac03e3c503ac493"
+$CoderaftExpectedSha256 = "172d69d8b133fbfdefebde6d3f5c5d16460ba460f11f0d4ddc85c432d69b4e6c"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -3468,10 +3468,13 @@ try {
     Write-Host "  [warn] Could not register the Caddy cert watchdog scheduled task: $($_.Exception.Message)" -ForegroundColor Yellow
 }
 
+# Always open localhost right after install, even on a re-install where
+# coderaft.local is already in the hosts file from a previous run — the
+# operator hasn't gone through the Setup Wizard's TLS step yet on THIS
+# install, so there's nothing to confirm is actually serving there this
+# time. Once they configure a real hostname there, TlsWizardStep's own
+# post-apply redirect takes them to it automatically.
 $DashboardUrl = "http://localhost:3000"
-if ((Get-Content "$env:WINDIR\System32\drivers\etc\hosts" -ErrorAction SilentlyContinue) -match "coderaft\.local") {
-    $DashboardUrl = "https://coderaft.local"
-}
 
 Write-Host ""
 Write-Host "  ╔══════════════════════════════════════════════════════╗" -ForegroundColor Green
