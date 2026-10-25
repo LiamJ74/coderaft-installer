@@ -48,7 +48,7 @@ $ErrorActionPreference = 'Stop'
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.ps1/install.ps1.sha256 at all — today it still
 # proxies the legacy `coderaft-installer` repo.
-$CoderaftExpectedSha256 = "1b60bef5f8e9f99b392f395b1e838aed507fceb46fa67cd60c20ee377e699712"
+$CoderaftExpectedSha256 = "50927537da81c5d19c765bd0a6280634b283a5a1fab9919ccac03e3c503ac493"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -838,12 +838,14 @@ if (-not (Get-InstallConfigVar "RELAY_ADVERTISE_HOST")) {
 $ComposeEnvArgs = @("--env-file", "install-config.env", "--env-file", ".env")
 
 # Read the capture token back so we can hand it to the native daemon installer.
-$RavenscanCaptureToken = (Select-String -Path '.env' -Pattern '^RAVENSCAN_CAPTURE_TOKEN=' -Quiet) `
-    | ForEach-Object { (Select-String -Path '.env' -Pattern '^RAVENSCAN_CAPTURE_TOKEN=(.+)$').Matches.Groups[1].Value }
-if (-not $RavenscanCaptureToken) {
-    $match = Select-String -Path '.env' -Pattern '^RAVENSCAN_CAPTURE_TOKEN=(.+)$'
-    if ($match) { $RavenscanCaptureToken = $match.Matches.Groups[1].Value }
-}
+# NOTE: `Select-String -Quiet` returns a bare $false (not an empty array) when
+# there's no match, and piping a scalar $false into ForEach-Object still runs
+# the block once — confirmed crashing in prod (2026-10-25, "Cannot index into
+# a null array") on an install whose .env has no RAVENSCAN_CAPTURE_TOKEN line.
+# Only the single safely-guarded lookup below is needed.
+$RavenscanCaptureToken = $null
+$match = Select-String -Path '.env' -Pattern '^RAVENSCAN_CAPTURE_TOKEN=(.+)$'
+if ($match) { $RavenscanCaptureToken = $match.Matches.Groups[1].Value }
 
 # ── Vault master-key bootstrap (D2 + D3) ────────────────────────────────────
 # Runs once on fresh install. Skipped if vault-keys\age.key already exists.
