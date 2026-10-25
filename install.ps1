@@ -48,7 +48,7 @@ $ErrorActionPreference = 'Stop'
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.ps1/install.ps1.sha256 at all — today it still
 # proxies the legacy `coderaft-installer` repo.
-$CoderaftExpectedSha256 = "c7375c80b15526cd49eda25ed2aafc7bcb3a919ce02acd1bc61d6c0c98e53f59"
+$CoderaftExpectedSha256 = "c560a5beb2984bc9fa9fbf90932976cbc342be4ed75afe2d449ae07719fc2ca7"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -3143,6 +3143,25 @@ $vaultOk = Invoke-VaultCheckSealState
 if (-not $vaultOk) {
     Write-Host "  ⚠ Vault is sealed — dashboard will show 'vault unavailable' until an" -ForegroundColor Yellow
     Write-Host "    operator completes the ceremony printed above."
+    # 2026-10-25 (chez Liam, "tu vas me fixer ça" — the one-liner should do
+    # everything in one run, not require "re-run the installer afterwards").
+    # Still never auto-unseals (Invoke-VaultCheckSealState itself is
+    # untouched — it only polls and prints) — this just gives the SAME
+    # install run a chance to pick up where it left off once the operator
+    # has done the ceremony in another window, instead of forcing a second
+    # full re-run from scratch just to seed bootstrap secrets. Read-Host
+    # works fine even under `irm | iex` (iex evaluates in the current host,
+    # which still owns the console).
+    Write-Host ""
+    $sealResponse = Read-Host "  Press Enter once you've completed steps 1+2 above to retry now (or type 'skip' to continue without seeding)"
+    if ($sealResponse -ne 'skip') {
+        $vaultOk = Invoke-VaultCheckSealState
+        if ($vaultOk) {
+            Write-Host "  ✓ Vault unsealed — continuing." -ForegroundColor Green
+        } else {
+            Write-Host "  Still sealed — continuing anyway; re-run the installer once it's unsealed to seed bootstrap secrets." -ForegroundColor Yellow
+        }
+    }
 }
 
 Write-Host ""
