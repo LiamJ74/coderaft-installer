@@ -2538,7 +2538,18 @@ if docker compose "${COMPOSE_ENV_ARGS[@]}" ps postgres --quiet 2>/dev/null | gre
     # containing the rest of the script that bash has not read yet. docker exec
     # drains those bytes → bash hits EOF prematurely and the script exits
     # silently after "Backup saved" (no error, no rollback).
-    if docker compose "${COMPOSE_ENV_ARGS[@]}" exec -T postgres pg_dumpall -U coderaft < /dev/null 2>/dev/null | gzip > "$BACKUP_FILE"; then
+    #
+    # PGPASSWORD is likewise required: local socket auth for "coderaft" isn't
+    # `trust` once POSTGRES_PASSWORD is set, so without it pg_dumpall prompts
+    # on stderr — which `< /dev/null` immediately turns into an auth failure,
+    # and because this pipeline has no `pipefail`, `gzip`'s own exit code
+    # (0, on an empty/truncated input) is what `if` sees, silently reporting
+    # "Backup saved" on a backup that never actually ran. Confirmed in prod
+    # 2026-10-25 (the PowerShell sibling script hung on the same missing
+    # PGPASSWORD instead, surfacing it loudly there — this path was silent).
+    PG_DUMPALL_PW="$(grep '^POSTGRES_PASSWORD=' "${INSTALL_DIR}/.env" 2>/dev/null | head -1 | cut -d= -f2-)"
+    docker compose "${COMPOSE_ENV_ARGS[@]}" exec -T -e "PGPASSWORD=${PG_DUMPALL_PW}" postgres pg_dumpall -U coderaft < /dev/null 2>/dev/null | gzip > "$BACKUP_FILE"
+    if [ "${PIPESTATUS[0]}" -eq 0 ] && [ -s "$BACKUP_FILE" ]; then
         echo "  Backup saved: $BACKUP_FILE"
 
         # ── Encrypt at rest (2026-08-07) ────────────────────────────────────

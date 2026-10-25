@@ -3494,9 +3494,21 @@ try {
 
 if ($postgresRunning) {
     try {
+        # pg_dumpall needs a password to authenticate as "coderaft" (local
+        # socket auth isn't `trust` once POSTGRES_PASSWORD is set — only the
+        # postgres image's own superuser gets a free pass, not this app
+        # user). Without PGPASSWORD, it silently falls back to an
+        # interactive prompt on stderr — confirmed in prod (2026-10-25):
+        # the operator ends up typing a password straight into the
+        # terminal mid-update, with no indication it's even a password
+        # prompt. Read the real value from .env (same pattern as the
+        # postgres-secrets-file self-heal above) and pass it non-interactively.
+        $pgPwMatchDump = Select-String -Path (Join-Path $INSTALL_DIR ".env") -Pattern '^POSTGRES_PASSWORD=(.+)$' -ErrorAction SilentlyContinue | Select-Object -First 1
+        $pgDumpEnvArgs = if ($pgPwMatchDump) { @("-e", "PGPASSWORD=$($pgPwMatchDump.Matches.Groups[1].Value)") } else { @() }
+
         # Start-Process redirects stdout cleanly (no PS encoding issues)
         $proc = Start-Process -FilePath "docker" `
-            -ArgumentList (@("compose") + $ComposeEnvArgs + @("exec", "-T", "postgres", "pg_dumpall", "-U", "coderaft")) `
+            -ArgumentList (@("compose") + $ComposeEnvArgs + @("exec", "-T") + $pgDumpEnvArgs + @("postgres", "pg_dumpall", "-U", "coderaft")) `
             -RedirectStandardOutput $BACKUP_FILE `
             -NoNewWindow -PassThru -Wait
 
