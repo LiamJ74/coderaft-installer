@@ -2978,7 +2978,20 @@ _product_volumes_selfheal() {
 echo "  Downloading new images..."
 if docker compose "${COMPOSE_ARGS[@]}" pull; then
     _product_volumes_selfheal
-    docker compose "${COMPOSE_ARGS[@]}" up -d --force-recreate --remove-orphans
+    # 2026-10-25 (chez Liam, "les updates ou les restarts ne doivent pas
+    # demander de mot de passe" — see update.ps1's matching comment for the
+    # full writeup): coderaft-vault excluded from the blanket
+    # --force-recreate so a routine update that doesn't touch its image
+    # doesn't reseal an already-unsealed vault and force the Shamir ceremony
+    # again. Compose only recreates a container whose image/config actually
+    # changed, so this is a no-op when the vault image is unchanged, and a
+    # real (unavoidable) reseal event when it genuinely upgrades.
+    _services_to_force_recreate=()
+    while IFS= read -r _svc; do
+        [ -n "$_svc" ] && _services_to_force_recreate+=("$_svc")
+    done < <(docker compose "${COMPOSE_ARGS[@]}" config --services 2>/dev/null | grep -v '^coderaft-vault$')
+    docker compose "${COMPOSE_ARGS[@]}" up -d --force-recreate --remove-orphans "${_services_to_force_recreate[@]}"
+    docker compose "${COMPOSE_ARGS[@]}" up -d coderaft-vault
 fi
 
 # ── Post-update healthcheck ───────────────────────────────────────────────

@@ -4074,10 +4074,29 @@ Repair-ProductVolumeOwnership
 # time (intermittent timeout on slow connections). The Docker Desktop tag-cache
 # bug is already covered by `docker rmi -f` + `docker compose pull` above, so
 # we let `up` reuse the freshly pulled local images.
-& docker @ComposeArgs up -d --force-recreate --remove-orphans
+#
+# 2026-10-25 (chez Liam, "les updates ou les restarts ne doivent pas demander
+# de mot de passe" — after the AUDIT-SECU-2026-08-04 Shamir fix landed, every
+# routine update force-recreated coderaft-vault along with everything else,
+# resealing it and demanding the ceremony again on every single update, not
+# just genuine host reboots). coderaft-vault is excluded from the blanket
+# --force-recreate below and brought up separately WITHOUT it: Compose only
+# recreates a container whose image/config actually changed, so an update
+# that doesn't touch the vault image leaves the running, already-unsealed
+# container alone. The vault still gets upgraded like any other service when
+# its own image changes (that recreate is a real reseal event the operator
+# must handle — unavoidable, not the bug this fixes) — only the UNNECESSARY
+# reseal on every unrelated update goes away.
+$servicesToForceRecreate = @(docker @ComposeArgs config --services 2>$null) | Where-Object { $_ -and $_ -ne "coderaft-vault" }
+& docker @ComposeArgs up -d --force-recreate --remove-orphans @servicesToForceRecreate
 if ($LASTEXITCODE -ne 0) {
     Write-Host "  ERROR: docker compose up failed."
     return  # not 'exit' — irm|iex runs this in the caller's own scope, so exit would close their whole shell
+}
+& docker @ComposeArgs up -d coderaft-vault
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "  ERROR: docker compose up coderaft-vault failed."
+    return
 }
 
 # ── #137 fix: refresh certs/server-ca.pem — Caddy TLS mode-aware (#187) ──
