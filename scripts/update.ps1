@@ -23,7 +23,18 @@
 # against Docker Desktop hangs; long-running docker pull/run are untouched.
 
 param(
-    [string]$Product = ""
+    [string]$Product = "",
+    # Internal: set only by this script's own self-update re-exec below.
+    # A real parameter (unlike the old $env:CODERAFT_UPDATE_REEXEC) because
+    # the re-exec always goes through `-File`, never through `irm | iex` —
+    # so there's no reason to fall back to an env var here the way -Product
+    # does. Scoped to this one process launch, so it can never leak into a
+    # later, unrelated `.\update.ps1` run in the same interactive shell —
+    # confirmed in prod (2026-10-25) that the env-var version, despite two
+    # earlier leak fixes (2026-08-07, 2026-08-10), could still end up stuck
+    # set, silently skipping the self-update check (and whatever fix it was
+    # supposed to fetch) for the rest of the session.
+    [switch]$CoderaftReexec
 )
 
 $ErrorActionPreference = "Stop"
@@ -655,28 +666,24 @@ Write-Host "  Updating CodeRaft..."
 # ── Self-update update.ps1 + rollback.ps1 (with re-exec) ───────────────────
 # The in-memory script keeps running with its OLD logic after we overwrite
 # the file on disk. Without re-exec, the freshly downloaded fixes would only
-# take effect on the NEXT run. CODERAFT_UPDATE_REEXEC guards against loops.
+# take effect on the NEXT run. -CoderaftReexec guards against looping back
+# into the self-update check on the re-exec'd child.
 #
-# BUG (2026-08-10, found live on Liam's machine — the 2026-08-07 fix below
-# only covered HALF the leak): $env:CODERAFT_UPDATE_REEXEC is process-wide
-# state that outlives this one invocation — it lives in the PARENT
-# PowerShell session's own environment block, not some scope tied to the
-# child re-exec. The 2026-08-07 fix (see the Remove-Item further down)
-# only clears it on the path where a refresh actually happened and this
-# block re-exec'd a child — but if the CHILD errors out before reaching
-# that cleanup, or if some earlier run set it and this run's refresh check
-# never got that far, the flag stays stuck set FOREVER in that interactive
-# window. Every subsequent `.\update.ps1` call in the SAME window then
-# silently skips this entire self-update check — running whatever stale
-# on-disk copy happens to exist, potentially for days, with no visible
-# symptom other than old bugs (like the sops.exe System32 path fixed
-# 2026-08-07) mysteriously still reproducing after being "already fixed".
-# Fix: consume the flag the INSTANT we see it, unconditionally, before any
-# other logic — so it can never leak into a later, unrelated invocation.
-$IsReexecChild = [bool]$env:CODERAFT_UPDATE_REEXEC
-if ($IsReexecChild) {
-    Remove-Item Env:\CODERAFT_UPDATE_REEXEC -ErrorAction SilentlyContinue
-}
+# HISTORY: this used to be $env:CODERAFT_UPDATE_REEXEC — process-wide state
+# that outlives a single invocation, living in the PARENT PowerShell
+# session's own environment block rather than anything scoped to the
+# child. Two separate leak fixes (2026-08-07, 2026-08-10) narrowed when it
+# could get stuck, but by design an env var can ALWAYS leak into a later,
+# unrelated `.\update.ps1` run in the same interactive window if the
+# cleanup path is ever missed — confirmed still reproducing in prod
+# 2026-10-25 (self-update silently skipped for an entire session, running
+# a stale on-disk copy with no visible symptom other than fixes it should
+# have picked up mysteriously not applying). Switched to a real parameter:
+# the re-exec always goes through `-File` (never `irm | iex`, which is the
+# only case -Product falls back to an env var for), so there's no
+# leak-across-invocations class of bug possible here at all — each process
+# launch gets its own independent parameter binding.
+$IsReexecChild = $CoderaftReexec.IsPresent
 if (-not $IsReexecChild) {
     Write-Host "  Checking for script updates..."
     $refreshed = $false
@@ -709,21 +716,7 @@ if (-not $IsReexecChild) {
         Write-Host "  ╚════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
         Write-Host ""
         Start-Sleep -Seconds 1
-        $env:CODERAFT_UPDATE_REEXEC = "1"
-        & $PSBin -NoProfile -ExecutionPolicy Bypass -File ".\update.ps1"
-        # BUG (2026-08-07, found live — every re-test in the same PowerShell
-        # window after the FIRST self-update silently ran a stale on-disk
-        # copy forever): $env:CODERAFT_UPDATE_REEXEC is process-wide state,
-        # not scoped to this one invocation. The child process spawned above
-        # gets its own independent copy of the environment at spawn time (as
-        # every OS child process does) and needed it set to "1" to avoid
-        # looping — but by the time `& $PSBin ...` returns here, that child
-        # has already run to completion and exited, so clearing OUR OWN
-        # (parent) copy now cannot affect it. Without this, THIS interactive
-        # shell session would never self-update again, since every future
-        # `.\update.ps1` run in the same window would see the guard still
-        # set and skip the check — exactly what happened live today.
-        Remove-Item Env:\CODERAFT_UPDATE_REEXEC -ErrorAction SilentlyContinue
+        & $PSBin -NoProfile -ExecutionPolicy Bypass -File ".\update.ps1" -CoderaftReexec
         return  # not 'exit' — irm|iex runs this in the caller's own scope, so exit would close their whole shell
     }
 }
