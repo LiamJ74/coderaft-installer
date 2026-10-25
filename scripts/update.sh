@@ -2144,14 +2144,12 @@ _vault_gen_tls_update() {
                 -out "vault-tls/${_n}-client.crt" \
                 -extfile <(printf "subjectAltName=DNS:%s\nbasicConstraints=CA:FALSE" "$_s") 2>/dev/null
             rm -f "vault-tls/${_n}-client.csr"
-            if [ "$_n" = "falconone" ] || [ "$_n" = "cve-proxy" ]; then
-                # falconone-api / coderaft-cve-proxy run distroless nonroot
-                # (uid 65532) — 600 would be unreadable. See update.ps1 for
-                # the same fix.
-                chmod 644 "vault-tls/${_n}-client.crt" "vault-tls/${_n}-client.key"
-            else
-                chmod 600 "vault-tls/${_n}-client.crt" "vault-tls/${_n}-client.key"
-            fi
+            # 2026-10-25 (chez Liam): see install.sh's _vault_client_cert()
+            # for the full incident writeup — every non-root product client
+            # (not just falconone/cve-proxy) needs 644, not just the two
+            # that happened to be exempted. dashboard-api (root) reads 644
+            # fine too, so no whitelist needed at all.
+            chmod 644 "vault-tls/${_n}-client.crt" "vault-tls/${_n}-client.key"
         done
     else
         # Fallback: alpine container (no host openssl dep)

@@ -48,7 +48,7 @@ $ErrorActionPreference = 'Stop'
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.ps1/install.ps1.sha256 at all — today it still
 # proxies the legacy `coderaft-installer` repo.
-$CoderaftExpectedSha256 = "e3c4f120b90fa6f985624b7e8d74c3be1c643d60a1d2173297ace5036a63bd79"
+$CoderaftExpectedSha256 = "c7375c80b15526cd49eda25ed2aafc7bcb3a919ce02acd1bc61d6c0c98e53f59"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -1530,7 +1530,26 @@ function Invoke-VaultClientCertSelfHeal {
 
     $tlsDir = Join-Path (Get-Location).Path "vault-tls"
     $certPath = Join-Path $tlsDir "$Name-client.crt"
-    if (Test-Path $certPath) { return }
+    $keyPath = Join-Path $tlsDir "$Name-client.key"
+    # BUG FIX (2026-10-25, found live chez Liam — this script never got the
+    # fix update.ps1 already applied 2026-08-04 for the identical bug): plain
+    # Test-Path matches directories too. If a container's bind mount for this
+    # cert ever ran once with the file missing, Docker silently creates an
+    # EMPTY DIRECTORY at that host path instead of erroring — Test-Path then
+    # reports "exists" forever, this self-heal never regenerates the real
+    # cert, and the product fatals with "load client cert: ... is a
+    # directory" on every boot (confirmed live: mantisstrike-client.crt/.key
+    # were both empty directories, never real certs). -PathType Leaf
+    # requires a real file; if a stale directory is squatting on either path,
+    # remove it first so the generation step below can actually create it.
+    if ((Test-Path $certPath) -and -not (Test-Path $certPath -PathType Leaf)) {
+        Write-DetailLog "[install] Cert self-heal: $certPath is a directory (stale empty bind-mount artifact), not a cert — removing so it can be regenerated"
+        Remove-Item -LiteralPath $certPath -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if ((Test-Path $keyPath) -and -not (Test-Path $keyPath -PathType Leaf)) {
+        Remove-Item -LiteralPath $keyPath -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if (Test-Path $certPath -PathType Leaf) { return }
 
     $caKey = Join-Path $tlsDir "client-ca.key"
     $caCrt = Join-Path $tlsDir "client-ca.crt"
@@ -1540,11 +1559,12 @@ function Invoke-VaultClientCertSelfHeal {
     }
 
     Write-DetailLog "[install] Cert self-heal: generating vault-tls\$Name-client (was missing)"
-    $chmodExtra = if ($Name -eq "falconone" -or $Name -eq "cve-proxy") {
-        "chmod 644 '$Name-client.key' '$Name-client.crt'"
-    } else {
-        "chmod 600 '$Name-client.key' '$Name-client.crt'"
-    }
+    # 2026-10-25 (chez Liam): see install.sh's _vault_client_cert() for the
+    # full incident writeup — every non-root product client (entraguard,
+    # ravenscan, mantisstrike, redfox-api, not just falconone/cve-proxy)
+    # needs 644, not just the two that happened to be exempted here.
+    # dashboard-api (root) reads 644 fine too, so no whitelist needed.
+    $chmodExtra = "chmod 644 '$Name-client.key' '$Name-client.crt'"
     # Same proven pattern as Invoke-VaultBootstrapTLS (B20-docker): script
     # file + Start-Process with explicit redirection, never a bare pipeline
     # to `docker run`, or PowerShell 5.1 surfaces stderr as a scary red

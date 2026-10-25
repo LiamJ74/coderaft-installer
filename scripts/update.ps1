@@ -2054,11 +2054,12 @@ function Invoke-VaultClientCertSelfHeal {
     }
 
     Write-DetailLog "[update] Cert self-heal: generating vault-tls\$Name-client (was missing)"
-    $chmodExtra = if ($Name -eq "falconone" -or $Name -eq "cve-proxy") {
-        "chmod 644 '$Name-client.key' '$Name-client.crt'"
-    } else {
-        "chmod 600 '$Name-client.key' '$Name-client.crt'"
-    }
+    # 2026-10-25 (chez Liam): see install.sh's _vault_client_cert() for the
+    # full incident writeup — every non-root product client (entraguard,
+    # ravenscan, mantisstrike, redfox-api, not just falconone/cve-proxy)
+    # needs 644, not just the two that happened to be exempted here.
+    # dashboard-api (root) reads 644 fine too, so no whitelist needed.
+    $chmodExtra = "chmod 644 '$Name-client.key' '$Name-client.crt'"
     $script = @"
 set -e
 apk add --no-cache openssl >/dev/null

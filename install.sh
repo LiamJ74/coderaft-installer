@@ -49,7 +49,7 @@ set -e
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.sh/install.sh.sha256 at all — today it still proxies
 # the legacy `coderaft-installer` repo.
-EXPECTED_SHA256="42556a50b0543198b7707f5df5395a6e8f16e051ba2158c766e3f5a57859e872"
+EXPECTED_SHA256="18face477498c06ecba27e871e9541c96708084e163a77b22f85febaffd8ef00"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -895,13 +895,18 @@ _vault_client_cert() {
         -extfile <(printf "subjectAltName=DNS:%s\nbasicConstraints=CA:FALSE" "$san") \
         2>/dev/null
     rm -f "vault-tls/${name}-client.csr"
-    if [ "$name" = "falconone" ] || [ "$name" = "cve-proxy" ]; then
-        # falconone-api / coderaft-cve-proxy run distroless nonroot
-        # (uid 65532) — 600 would be unreadable. See update.sh for the same fix.
-        chmod 644 "vault-tls/${name}-client.crt" "vault-tls/${name}-client.key"
-    else
-        chmod 600 "vault-tls/${name}-client.crt" "vault-tls/${name}-client.key"
-    fi
+    # 2026-10-25 (chez Liam): this used to be chmod 600 for every client
+    # except falconone/cve-proxy (distroless nonroot, uid 65532 — 600 would
+    # be unreadable). Confirmed live: entraguard (uid 1001), ravenscan and
+    # mantisstrike run as their own non-root users too, and redfox-api runs
+    # at uid 65532 — the EXACT same uid as falconone, yet was never added to
+    # the exemption. All of them got a silent `PermissionError: [Errno 13]`
+    # the moment any of their code first tried an mTLS Vault read (WolfGuard
+    # hit it today via the new graph-tools credential lookup). dashboard-api
+    # is the only client that runs as root, and root can read 644 fine, so
+    # there is no case where 600 is actually needed — 644 for every client
+    # cert, no whitelist. See update.sh for the same fix.
+    chmod 644 "vault-tls/${name}-client.crt" "vault-tls/${name}-client.key"
 }
 
 # ── FalconOne agents mTLS PKI (#170, #174, #226) ─────────────────────────────
