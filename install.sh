@@ -49,7 +49,7 @@ set -e
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.sh/install.sh.sha256 at all — today it still proxies
 # the legacy `coderaft-installer` repo.
-EXPECTED_SHA256="020455626f74c8e040497ffb96a6e6cc1d1ff1c009f5e6611178cba89d112588"
+EXPECTED_SHA256="dc2986d6a06a35a6ffb6c06533e94eefbfd8514f648bdca62c6b0ff3d3c7a770"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -797,10 +797,13 @@ EOF
         -out "${name}-client.crt" -extfile /tmp/client.ext 2>/dev/null
     rm -f "${name}-client.csr" /tmp/client.ext
 done
-chmod 600 *.key 2>/dev/null || true
-# falconone-api / coderaft-cve-proxy nonroot fix (distroless uid 65532).
-chmod 644 falconone-client.key falconone-client.crt 2>/dev/null || true
-chmod 644 cve-proxy-client.key cve-proxy-client.crt 2>/dev/null || true
+# Every non-root product client (entraguard, ravenscan, mantisstrike,
+# redfox-api — not just falconone/cve-proxy) needs 644, not just the two
+# that happened to be whitelisted here. No whitelist is actually needed:
+# dashboard-api (root) reads 644 fine too. Confirmed live 2026-10-25: a
+# fresh install left ravenscan-client.key/redfox-client.key at 600,
+# breaking their vault client TLS ("permission denied") on first boot.
+chmod 644 *.key *.crt 2>/dev/null || true
 SCRIPT
 )
 
@@ -1364,11 +1367,7 @@ _vault_client_cert_selfheal() {
                     -in '${name}-client.csr' -CA client-ca.crt -CAkey client-ca.key -CAcreateserial \
                     -out '${name}-client.crt' -extfile /tmp/client.ext 2>/dev/null
                 rm -f '${name}-client.csr' /tmp/client.ext
-                if [ '${name}' = 'falconone' ] || [ '${name}' = 'cve-proxy' ]; then
-                    chmod 644 '${name}-client.key' '${name}-client.crt'
-                else
-                    chmod 600 '${name}-client.key' '${name}-client.crt'
-                fi
+                chmod 644 '${name}-client.key' '${name}-client.crt'
             " 2>&1
     fi
 }

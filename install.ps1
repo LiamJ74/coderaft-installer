@@ -48,7 +48,7 @@ $ErrorActionPreference = 'Stop'
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.ps1/install.ps1.sha256 at all — today it still
 # proxies the legacy `coderaft-installer` repo.
-$CoderaftExpectedSha256 = "172d69d8b133fbfdefebde6d3f5c5d16460ba460f11f0d4ddc85c432d69b4e6c"
+$CoderaftExpectedSha256 = "6e1b63ce9741ceff6b3d9d42bbebcb4fab7d283d30ed8ac151dd985775cf9583"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -1110,11 +1110,16 @@ EOF
         -out "${name}-client.crt" -extfile /tmp/client.ext 2>/dev/null
     rm -f "${name}-client.csr" /tmp/client.ext
 done
-chmod 600 *.key 2>/dev/null || true
-# falconone-api / coderaft-cve-proxy run distroless nonroot (uid 65532) —
-# 600 would be unreadable.
-chmod 644 falconone-client.key falconone-client.crt 2>/dev/null || true
-chmod 644 cve-proxy-client.key cve-proxy-client.crt 2>/dev/null || true
+# Every non-root product client (entraguard, ravenscan, mantisstrike,
+# redfox-api — not just falconone/cve-proxy) needs 644, not just the two
+# that happened to be whitelisted here. dashboard-api (root) reads 644
+# fine too, so no whitelist is actually needed — confirmed live
+# 2026-10-25: a fresh install left ravenscan-client.key/redfox-client.key
+# at 600, breaking their vault client TLS ("permission denied") on first
+# boot. The self-heal path for a single missing cert (this script's
+# Invoke-VaultClientCertSelfHeal / update.ps1's equivalent) already got
+# this fix; this bulk first-generation path had been missed.
+chmod 644 *.key *.crt 2>/dev/null || true
 '@
     $absTlsDir = (Resolve-Path -LiteralPath $tlsDir -ErrorAction SilentlyContinue)
     if (-not $absTlsDir) {

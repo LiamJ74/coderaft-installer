@@ -1545,6 +1545,12 @@ _vault_client_cert_selfheal() {
     fi
 
     echo "  [update] Cert self-heal: generating vault-tls/${name}-client (was missing)"
+    # 644, not 600: every non-root product client (entraguard, ravenscan,
+    # mantisstrike, redfox-api, falconone, cve-proxy) needs to read this —
+    # dashboard-api (root) reads 644 fine too, so no whitelist is needed.
+    # This self-heal path had been stuck at a flat 600 (no client could
+    # ever read a cert it regenerated), unlike update.ps1's equivalent and
+    # install.sh's primary _vault_client_cert() path, both already fixed.
     if command -v openssl &>/dev/null; then
         ( cd "$tls_dir" && \
           openssl req -newkey rsa:2048 -nodes -sha256 \
@@ -1556,7 +1562,7 @@ _vault_client_cert_selfheal() {
               -extfile <(printf "subjectAltName=DNS:%s\nbasicConstraints=CA:FALSE" "$san") \
               2>/dev/null && \
           rm -f "${name}-client.csr" && \
-          chmod 600 "${name}-client.key" "${name}-client.crt" )
+          chmod 644 "${name}-client.key" "${name}-client.crt" )
     else
         local abs_tls_dir
         abs_tls_dir="$(cd "$tls_dir" && pwd)"
@@ -1574,7 +1580,7 @@ _vault_client_cert_selfheal() {
                     -in '${name}-client.csr' -CA client-ca.crt -CAkey client-ca.key -CAcreateserial \
                     -out '${name}-client.crt' -extfile /tmp/client.ext 2>/dev/null
                 rm -f '${name}-client.csr' /tmp/client.ext
-                chmod 600 '${name}-client.key' '${name}-client.crt'
+                chmod 644 '${name}-client.key' '${name}-client.crt'
             " 2>&1
     fi
 }
@@ -2178,10 +2184,11 @@ for pair in "dashboard-api:dashboard-api.coderaft.local" "entraguard:entraguard.
     openssl x509 -req -days 3650 -sha256 -in "${n}-client.csr" -CA client-ca.crt -CAkey client-ca.key -CAcreateserial -out "${n}-client.crt" -extfile /tmp/client.ext 2>/dev/null
     rm -f "${n}-client.csr" /tmp/client.ext
 done
-chmod 600 *.key 2>/dev/null || true
-# falconone-api / coderaft-cve-proxy nonroot fix — see rationale above.
-chmod 644 falconone-client.key falconone-client.crt 2>/dev/null || true
-chmod 644 cve-proxy-client.key cve-proxy-client.crt 2>/dev/null || true
+# Every non-root product client needs 644, not just the two whitelisted
+# here — see rationale above. Confirmed live 2026-10-25: a fresh install
+# left ravenscan-client.key/redfox-client.key at 600, breaking their
+# vault client TLS on first boot.
+chmod 644 *.key *.crt 2>/dev/null || true
 SCRIPT
     fi
 

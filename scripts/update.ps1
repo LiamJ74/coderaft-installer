@@ -2471,15 +2471,17 @@ EOF
         -out "${name}-client.crt" -extfile /tmp/client.ext 2>/dev/null
     rm -f "${name}-client.csr" /tmp/client.ext
 done
-chmod 600 *.key 2>/dev/null || true
-# falconone-api / coderaft-cve-proxy run distroless nonroot (uid 65532) —
-# they CAN'T read files owned by root with mode 600. Loosen to 644 so the
-# bind-mounted certs are world-readable inside the container. The private
-# key lives on a chmod 700 vault-tls dir anyway, and Docker Desktop's
-# Windows/Mac bind-mount already strips POSIX perms, so this only affects
-# Linux hosts.
-chmod 644 falconone-client.key falconone-client.crt 2>/dev/null || true
-chmod 644 cve-proxy-client.key cve-proxy-client.crt 2>/dev/null || true
+# Every non-root product client (entraguard, ravenscan, mantisstrike,
+# redfox-api — not just falconone/cve-proxy) needs 644, not just the two
+# that happened to be whitelisted here. No whitelist is actually needed:
+# dashboard-api (root) reads 644 fine too. The private key lives on a
+# chmod 700 vault-tls dir anyway, and Docker Desktop's Windows/Mac
+# bind-mount already strips POSIX perms, so this only affects Linux hosts.
+# Confirmed live 2026-10-25: a fresh install left ravenscan-client.key/
+# redfox-client.key at 600, breaking their vault client TLS ("permission
+# denied") on first boot — this bulk first-generation path had been
+# missed by the single-missing-cert self-heal's own 2026-10-25 fix above.
+chmod 644 *.key *.crt 2>/dev/null || true
 '@
         # Bind-mount tlsDir into the alpine container at /work and run the script.
         # Use --user to keep file ownership readable on Linux hosts; on Windows/Mac
