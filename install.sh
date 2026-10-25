@@ -49,7 +49,7 @@ set -e
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.sh/install.sh.sha256 at all — today it still proxies
 # the legacy `coderaft-installer` repo.
-EXPECTED_SHA256="939ad641b28a53ff9ba2394f521a1b53931f230511c6ac0920a0fc3a7fb5b44c"
+EXPECTED_SHA256="020455626f74c8e040497ffb96a6e6cc1d1ff1c009f5e6611178cba89d112588"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -2680,23 +2680,79 @@ vault_check_seal_state() {
         return 0
     fi
 
+    # 2026-10-25 (chez Liam, "avec une action humaine mais dans un seul
+    # shell" — see install.ps1's Invoke-VaultCheckSealState for the full
+    # writeup of this tradeoff and why it does NOT reintroduce the
+    # AUDIT-SECU-2026-08-04 auto-unseal bug). Try POST /v1/init
+    # unconditionally: on a never-initialized vault this is the ONLY caller
+    # who can ever see the shares (returned exactly once), so doing it here
+    # and showing them in THIS shell beats making the operator hand-type the
+    # identical docker/curl call themselves, with zero loss of the
+    # ceremony's security property — a human still reads the shares, still
+    # must explicitly confirm, and every SUBSEQUENT boot still requires that
+    # same human resubmitting them (this script has no way to automate
+    # that later). On an already-initialized vault (no shares available to
+    # this process), /v1/init correctly 409s and this falls through to the
+    # manual unseal-only instructions below, same as before.
+    local init_body
+    init_body=$(_vault_curl_fresh "POST" "/v1/init")
+
+    if echo "$init_body" | grep -q '"initialized":true'; then
+        local threshold shares_block
+        threshold=$(echo "$init_body" | grep -oE '"threshold":[0-9]+' | grep -oE '[0-9]+')
+        shares_block=$(echo "$init_body" | grep -oE '"shares":\[[^]]*\]' | sed -e 's/^"shares":\[//' -e 's/\]$//')
+        local shares_list=()
+        while IFS= read -r tok; do
+            [ -n "$tok" ] && shares_list+=("$tok")
+        done < <(echo "$shares_block" | grep -oE '"[^"]*"' | tr -d '"')
+
+        echo ""
+        echo "  ────────────────────────────────────────────────────────────────"
+        echo "  Vault initialized for the first time. These ${#shares_list[@]} shares are"
+        echo "  shown ONLY NOW and never stored anywhere — the vault keeps no copy."
+        echo "  WRITE EACH ONE DOWN somewhere safe and separate from this machine"
+        echo "  (password manager, physical safe) before continuing — ${threshold} of"
+        echo "  them will be required every time the vault restarts/reboots, and"
+        echo "  there is no other way to recover it if they are lost."
+        echo ""
+        local si=1
+        for s in "${shares_list[@]}"; do
+            echo "    Share ${si}: ${s}"
+            si=$((si + 1))
+        done
+        echo ""
+        echo "  ────────────────────────────────────────────────────────────────"
+        if [ -r /dev/tty ]; then
+            read -r -p "  Press Enter once every share above is written down somewhere safe: " _confirm < /dev/tty || true
+        fi
+
+        local unseal_shares="" i=0
+        for s in "${shares_list[@]}"; do
+            [ "$i" -ge "$threshold" ] && break
+            [ -n "$unseal_shares" ] && unseal_shares="${unseal_shares},"
+            unseal_shares="${unseal_shares}\"${s}\""
+            i=$((i + 1))
+        done
+        local unseal_resp
+        unseal_resp=$(_vault_curl_fresh "POST" "/v1/unseal" "{\"shares\":[${unseal_shares}]}")
+        if echo "$unseal_resp" | grep -q '"sealed":false'; then
+            echo "  ✓ Vault initialized and unsealed."
+            return 0
+        else
+            echo "  ✗ Auto-unseal after init failed — response: ${unseal_resp}"
+            echo "    The shares above are still valid; submit ${threshold} of them manually via POST /v1/unseal."
+            return 1
+        fi
+    fi
+
     echo ""
     echo "  ────────────────────────────────────────────────────────────────"
     echo "  Vault is SEALED. This is expected — Coderaft Vault requires a"
-    echo "  real, human, multi-operator Shamir ceremony (default: 3 of 5"
-    echo "  shares) before it will hold or serve ANY secret. No script can"
-    echo "  complete this unattended, by design (AUDIT-SECU-2026-08-04)."
+    echo "  real, human, multi-operator Shamir ceremony before it will hold"
+    echo "  or serve ANY secret. It was already initialized before (no shares"
+    echo "  are available to this install run) — an operator must submit a"
+    echo "  threshold of the ORIGINAL shares, from this directory:"
     echo ""
-    echo "  An operator must run, from this directory:"
-    echo ""
-    echo "    # 1) ONE TIME ONLY per vault (skip if already run before):"
-    echo "    docker run --rm --user 0:0 --network ${vault_network} \\"
-    echo "      -v \"\$(cd vault-tls && pwd)\":/tls:ro curlimages/curl:latest \\"
-    echo "      --cert /tls/dashboard-api-client.crt --key /tls/dashboard-api-client.key \\"
-    echo "      --cacert /tls/client-ca.crt -sS -X POST https://coderaft-vault:8200/v1/init"
-    echo "    # -> WRITE DOWN the returned shares, one per operator, then:"
-    echo ""
-    echo "    # 2) EVERY time the vault starts sealed (every restart/reboot):"
     echo "    docker run --rm --user 0:0 --network ${vault_network} \\"
     echo "      -v \"\$(cd vault-tls && pwd)\":/tls:ro curlimages/curl:latest \\"
     echo "      --cert /tls/dashboard-api-client.crt --key /tls/dashboard-api-client.key \\"

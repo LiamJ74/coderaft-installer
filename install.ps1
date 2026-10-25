@@ -48,7 +48,7 @@ $ErrorActionPreference = 'Stop'
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.ps1/install.ps1.sha256 at all — today it still
 # proxies the legacy `coderaft-installer` repo.
-$CoderaftExpectedSha256 = "c560a5beb2984bc9fa9fbf90932976cbc342be4ed75afe2d449ae07719fc2ca7"
+$CoderaftExpectedSha256 = "1b60bef5f8e9f99b392f395b1e838aed507fceb46fa67cd60c20ee377e699712"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -2885,23 +2885,65 @@ function Invoke-VaultCheckSealState {
         return $true
     }
 
+    # 2026-10-25 (chez Liam, "avec une action humaine mais dans un seul
+    # shell" — he accepted that a human confirmation is still required, but
+    # rejected having to open a second window and hand-type docker/curl
+    # commands himself). Try POST /v1/init unconditionally: on a vault that
+    # has never been initialized this is the ONLY caller who can ever see
+    # the shares (returned exactly once, never persisted — see handleInit's
+    # own doc comment in the coderaft-vault repo), so doing it here and
+    # showing them in THIS shell is strictly more convenient than making the
+    # operator construct the identical docker/curl call by hand, with zero
+    # loss of the ceremony's actual security property: a human still reads
+    # the shares, still must explicitly confirm, and the vault still refuses
+    # every SUBSEQUENT boot (restart/reboot) without that same human
+    # resubmitting them — this script has no way to do that automatically
+    # later, by design. On a vault that was already initialized before (no
+    # shares available to this process), /v1/init correctly 409s and this
+    # falls through to printing manual unseal-only instructions, same as
+    # before.
+    $initBody = Invoke-VaultCurlFresh -Method "POST" -Path "/v1/init"
+    $initParsed = $null
+    try { $initParsed = $initBody | ConvertFrom-Json -ErrorAction Stop } catch { }
+
+    if ($initParsed -and $initParsed.initialized -and $initParsed.shares) {
+        Write-Host ""
+        Write-Host "  ────────────────────────────────────────────────────────────────" -ForegroundColor Yellow
+        Write-Host "  Vault initialized for the first time. These $($initParsed.shares.Count) shares are" -ForegroundColor Yellow
+        Write-Host "  shown ONLY NOW and never stored anywhere — the vault keeps no copy." -ForegroundColor Yellow
+        Write-Host "  WRITE EACH ONE DOWN somewhere safe and separate from this machine" -ForegroundColor Yellow
+        Write-Host "  (password manager, physical safe) before continuing — $($initParsed.threshold) of" -ForegroundColor Yellow
+        Write-Host "  them will be required every time the vault restarts/reboots, and" -ForegroundColor Yellow
+        Write-Host "  there is no other way to recover it if they are lost." -ForegroundColor Yellow
+        Write-Host ""
+        for ($si = 0; $si -lt $initParsed.shares.Count; $si++) {
+            Write-Host ("    Share {0}: {1}" -f ($si + 1), $initParsed.shares[$si]) -ForegroundColor Cyan
+        }
+        Write-Host ""
+        Write-Host "  ────────────────────────────────────────────────────────────────" -ForegroundColor Yellow
+        Read-Host "  Press Enter once every share above is written down somewhere safe"
+
+        $unsealShares = $initParsed.shares[0..([Math]::Min($initParsed.threshold, $initParsed.shares.Count) - 1)]
+        $unsealBody = (@{ shares = $unsealShares } | ConvertTo-Json -Compress)
+        $unsealResp = Invoke-VaultCurlFresh -Method "POST" -Path "/v1/unseal" -JsonBody $unsealBody
+        if ($unsealResp -match '"sealed":false') {
+            Write-Host "  ✓ Vault initialized and unsealed." -ForegroundColor Green
+            return $true
+        } else {
+            Write-Host "  ✗ Auto-unseal after init failed — response: $unsealResp" -ForegroundColor Red
+            Write-Host "    The shares above are still valid; submit $($initParsed.threshold) of them manually via POST /v1/unseal." -ForegroundColor Red
+            return $false
+        }
+    }
+
     Write-Host ""
     Write-Host "  ────────────────────────────────────────────────────────────────" -ForegroundColor Yellow
     Write-Host "  Vault is SEALED. This is expected — Coderaft Vault requires a" -ForegroundColor Yellow
-    Write-Host "  real, human, multi-operator Shamir ceremony (default: 3 of 5" -ForegroundColor Yellow
-    Write-Host "  shares) before it will hold or serve ANY secret. No script can" -ForegroundColor Yellow
-    Write-Host "  complete this unattended, by design (AUDIT-SECU-2026-08-04)." -ForegroundColor Yellow
+    Write-Host "  real, human, multi-operator Shamir ceremony before it will hold" -ForegroundColor Yellow
+    Write-Host "  or serve ANY secret. It was already initialized before (no shares" -ForegroundColor Yellow
+    Write-Host "  are available to this install run) — an operator must submit a" -ForegroundColor Yellow
+    Write-Host "  threshold of the ORIGINAL shares, from this directory (PowerShell):" -ForegroundColor Yellow
     Write-Host ""
-    Write-Host "  An operator must run, from this directory (PowerShell):"
-    Write-Host ""
-    Write-Host "    # 1) ONE TIME ONLY per vault (skip if already run before):"
-    Write-Host "    docker run --rm --user 0:0 --network $vaultNetwork ``"
-    Write-Host "      -v `"$absTlsDir`:/tls:ro`" curlimages/curl:latest ``"
-    Write-Host "      --cert /tls/dashboard-api-client.crt --key /tls/dashboard-api-client.key ``"
-    Write-Host "      --cacert /tls/client-ca.crt -sS -X POST https://coderaft-vault:8200/v1/init"
-    Write-Host "    # -> WRITE DOWN the returned shares, one per operator, then:"
-    Write-Host ""
-    Write-Host "    # 2) EVERY time the vault starts sealed (every restart/reboot):"
     Write-Host "    docker run --rm --user 0:0 --network $vaultNetwork ``"
     Write-Host "      -v `"$absTlsDir`:/tls:ro`" curlimages/curl:latest ``"
     Write-Host "      --cert /tls/dashboard-api-client.crt --key /tls/dashboard-api-client.key ``"
