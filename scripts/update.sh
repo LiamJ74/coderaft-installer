@@ -992,6 +992,7 @@ _entraguard_acl_selfheal() {
         "read:azure_*"
         "read:entraguard_*"
         "read:platform/identity/oidc"
+        "read:platform/identity/oidc/credential"
         "read:platform/identity/graph-tools"
         "write:platform/identity/graph-tools"
         # Org-scoped Graph credential read (migration 060, 2026-10-24):
@@ -1021,6 +1022,7 @@ _entraguard_acl_selfheal() {
       - "read:azure_*"
       - "read:entraguard_*"
       - "read:platform/identity/oidc"
+      - "read:platform/identity/oidc/credential"
       - "read:platform/identity/graph-tools"
       - "write:platform/identity/graph-tools"
       - "read:platform/identity/graph-tools/org/*"
@@ -1104,6 +1106,7 @@ _falconone_acl_selfheal() {
         "read:license_key"
         "read:falconone_*"
         "read:platform/identity/oidc"
+        "read:platform/identity/oidc/credential"
         "read:platform/identity/graph-tools"
         "sign:falconone_agent_cert"
         "read:falconone/nvd_api_key"
@@ -1130,6 +1133,7 @@ _falconone_acl_selfheal() {
       - "read:license_key"
       - "read:falconone_*"
       - "read:platform/identity/oidc"
+      - "read:platform/identity/oidc/credential"
       - "read:platform/identity/graph-tools"
       - "sign:falconone_agent_cert"
       - "read:falconone/nvd_api_key"
@@ -1301,6 +1305,7 @@ _redfox_acl_selfheal() {
         "read:license_key"
         "read:redfox_*"
         "read:platform/identity/oidc"
+        "read:platform/identity/oidc/credential"
         "read:platform/identity/graph-tools"
         "read:redfox/connections/*"
         "write:redfox/connections/*"
@@ -1324,6 +1329,7 @@ _redfox_acl_selfheal() {
       - "read:license_key"
       - "read:redfox_*"
       - "read:platform/identity/oidc"
+      - "read:platform/identity/oidc/credential"
       - "read:platform/identity/graph-tools"
       - "read:redfox/connections/*"
       - "write:redfox/connections/*"
@@ -2236,16 +2242,16 @@ clients:
     permissions: ["*"]
   - name: entraguard
     cert_san: "entraguard.coderaft.local"
-    permissions: ["read:azure_*","read:license_key","read:entraguard_*","read:platform/identity/oidc","read:platform/identity/graph-tools","read:platform/identity/graph-tools/org/*","read:credentials/*","read:tenant/*","read:m365dsc-exo-cert/*","write:m365dsc-exo-cert/*","delete:m365dsc-exo-cert/*"]
+    permissions: ["read:azure_*","read:license_key","read:entraguard_*","read:platform/identity/oidc","read:platform/identity/oidc/credential","read:platform/identity/graph-tools","read:platform/identity/graph-tools/org/*","read:credentials/*","read:tenant/*","read:m365dsc-exo-cert/*","write:m365dsc-exo-cert/*","delete:m365dsc-exo-cert/*"]
   - name: ravenscan
     cert_san: "ravenscan.coderaft.local"
     permissions: ["read:ravenscan_*","read:neo4j_*","read:license_key","read:platform/identity/oidc"]
   - name: redfox
     cert_san: "redfox.coderaft.local"
-    permissions: ["read:redfox_*","read:license_key","read:platform/identity/oidc","read:platform/identity/graph-tools","read:redfox/connections/*","write:redfox/connections/*","delete:redfox/connections/*","read:redfox/k8s/*","write:redfox/k8s/*","delete:redfox/k8s/*"]
+    permissions: ["read:redfox_*","read:license_key","read:platform/identity/oidc","read:platform/identity/oidc/credential","read:platform/identity/graph-tools","read:redfox/connections/*","write:redfox/connections/*","delete:redfox/connections/*","read:redfox/k8s/*","write:redfox/k8s/*","delete:redfox/k8s/*"]
   - name: falconone
     cert_san: "falconone.coderaft.local"
-    permissions: ["read:license_key","read:falconone_*","read:platform/identity/oidc","sign:falconone_agent_cert","read:falconone/nvd_api_key","read:falconone/audit_hmac_key","write:falconone/audit_hmac_key","read:falconone/pki/agents-ca/cert","read:pki/falconone-agents-ca*","write:pki/falconone-agents-ca*","read:falconone/scripts_ca*","write:falconone/scripts_ca*"]
+    permissions: ["read:license_key","read:falconone_*","read:platform/identity/oidc","read:platform/identity/oidc/credential","sign:falconone_agent_cert","read:falconone/nvd_api_key","read:falconone/audit_hmac_key","write:falconone/audit_hmac_key","read:falconone/pki/agents-ca/cert","read:pki/falconone-agents-ca*","write:pki/falconone-agents-ca*","read:falconone/scripts_ca*","write:falconone/scripts_ca*"]
   - name: cve-proxy
     cert_san: "cve-proxy.coderaft.local"
     permissions: ["read:cve-proxy/*", "write:cve-proxy/*"]
@@ -2263,6 +2269,7 @@ ACLEOF
 _entraguard_acl_selfheal "${INSTALL_DIR}/vault-config/acl.yaml"
 _vault_acl_live_selfheal "entraguard" "entraguard.coderaft.local" \
     "read:azure_*" "read:entraguard_*" "read:platform/identity/oidc" \
+    "read:platform/identity/oidc/credential" \
     "read:platform/identity/graph-tools" "write:platform/identity/graph-tools" \
     "read:platform/identity/graph-tools/org/*" \
     "read:credentials/*" "read:tenant/*" \
@@ -2277,6 +2284,7 @@ _falconone_tls_bootstrap "${INSTALL_DIR}"
 _falconone_acl_selfheal "${INSTALL_DIR}/vault-config/acl.yaml"
 _vault_acl_live_selfheal "falconone" "falconone.coderaft.local" \
     "read:license_key" "read:falconone_*" "read:platform/identity/oidc" \
+    "read:platform/identity/oidc/credential" \
     "read:platform/identity/graph-tools" \
     "sign:falconone_agent_cert" "read:falconone/nvd_api_key" \
     "read:falconone/audit_hmac_key" "write:falconone/audit_hmac_key" \
@@ -2304,6 +2312,7 @@ _vault_acl_live_selfheal "mantisstrike" "mantisstrike.coderaft.local" \
 _redfox_acl_selfheal "${INSTALL_DIR}/vault-config/acl.yaml"
 _vault_acl_live_selfheal "redfox" "redfox.coderaft.local" \
     "read:license_key" "read:redfox_*" "read:platform/identity/oidc" \
+    "read:platform/identity/oidc/credential" \
     "read:platform/identity/graph-tools" "read:redfox/connections/*" \
     "write:redfox/connections/*" "delete:redfox/connections/*" \
     "read:redfox/k8s/*" "write:redfox/k8s/*" "delete:redfox/k8s/*"

@@ -48,7 +48,7 @@ $ErrorActionPreference = 'Stop'
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.ps1/install.ps1.sha256 at all — today it still
 # proxies the legacy `coderaft-installer` repo.
-$CoderaftExpectedSha256 = "9336fdbb52e227ec48a5b15e4d2d5c648fd97a153452d455dd770e4c3d8ff0c8"
+$CoderaftExpectedSha256 = "118a18272f523ec4d975e22d6cde150db35ca5521831a79cd5125e0bdf90bb8c"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -1209,7 +1209,7 @@ clients:
     # fetch_platform_graph_tools_credential), falling back to the flat
     # read:platform/identity/graph-tools grant already present below.
     cert_san: "entraguard.coderaft.local"
-    permissions: ["read:azure_*","read:license_key","read:entraguard_*","read:platform/identity/oidc","read:platform/identity/graph-tools","read:platform/identity/graph-tools/org/*","read:credentials/*","read:tenant/*","read:m365dsc-exo-cert/*","write:m365dsc-exo-cert/*","delete:m365dsc-exo-cert/*"]
+    permissions: ["read:azure_*","read:license_key","read:entraguard_*","read:platform/identity/oidc","read:platform/identity/oidc/credential","read:platform/identity/graph-tools","read:platform/identity/graph-tools/org/*","read:credentials/*","read:tenant/*","read:m365dsc-exo-cert/*","write:m365dsc-exo-cert/*","delete:m365dsc-exo-cert/*"]
 
   - name: ravenscan
     cert_san: "ravenscan.coderaft.local"
@@ -1217,11 +1217,11 @@ clients:
 
   - name: redfox
     cert_san: "redfox.coderaft.local"
-    permissions: ["read:redfox_*","read:license_key","read:platform/identity/oidc","read:platform/identity/graph-tools","read:redfox/connections/*","write:redfox/connections/*","delete:redfox/connections/*","read:redfox/k8s/*","write:redfox/k8s/*","delete:redfox/k8s/*"]
+    permissions: ["read:redfox_*","read:license_key","read:platform/identity/oidc","read:platform/identity/oidc/credential","read:platform/identity/graph-tools","read:redfox/connections/*","write:redfox/connections/*","delete:redfox/connections/*","read:redfox/k8s/*","write:redfox/k8s/*","delete:redfox/k8s/*"]
 
   - name: falconone
     cert_san: "falconone.coderaft.local"
-    permissions: ["read:license_key","read:falconone_*","read:platform/identity/oidc","read:platform/identity/graph-tools","sign:falconone_agent_cert","read:falconone/nvd_api_key","read:falconone/audit_hmac_key","write:falconone/audit_hmac_key","read:falconone/pki/agents-ca/cert","read:pki/falconone-agents-ca*","write:pki/falconone-agents-ca*","read:falconone/scripts_ca*","write:falconone/scripts_ca*"]
+    permissions: ["read:license_key","read:falconone_*","read:platform/identity/oidc","read:platform/identity/oidc/credential","read:platform/identity/graph-tools","sign:falconone_agent_cert","read:falconone/nvd_api_key","read:falconone/audit_hmac_key","write:falconone/audit_hmac_key","read:falconone/pki/agents-ca/cert","read:pki/falconone-agents-ca*","write:pki/falconone-agents-ca*","read:falconone/scripts_ca*","write:falconone/scripts_ca*"]
 
   - name: cve-proxy
     cert_san: "cve-proxy.coderaft.local"
@@ -1313,6 +1313,7 @@ function Invoke-FalconOneAclSelfHeal {
         "read:license_key",
         "read:falconone_*",
         "read:platform/identity/oidc",
+        "read:platform/identity/oidc/credential",
         "read:platform/identity/graph-tools",
         "sign:falconone_agent_cert",
         "read:falconone/nvd_api_key",
@@ -1344,6 +1345,7 @@ function Invoke-FalconOneAclSelfHeal {
       - "read:license_key"
       - "read:falconone_*"
       - "read:platform/identity/oidc"
+      - "read:platform/identity/oidc/credential"
       - "read:platform/identity/graph-tools"
       - "sign:falconone_agent_cert"
       - "read:falconone/nvd_api_key"
@@ -1417,6 +1419,7 @@ function Invoke-RedfoxAclSelfHeal {
         "read:license_key",
         "read:redfox_*",
         "read:platform/identity/oidc",
+        "read:platform/identity/oidc/credential",
         "read:platform/identity/graph-tools",
         "read:redfox/connections/*",
         "write:redfox/connections/*",
@@ -1445,6 +1448,7 @@ function Invoke-RedfoxAclSelfHeal {
       - "read:license_key"
       - "read:redfox_*"
       - "read:platform/identity/oidc"
+      - "read:platform/identity/oidc/credential"
       - "read:platform/identity/graph-tools"
       - "read:redfox/connections/*"
       - "write:redfox/connections/*"
