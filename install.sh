@@ -49,7 +49,7 @@ set -e
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.sh/install.sh.sha256 at all — today it still proxies
 # the legacy `coderaft-installer` repo.
-EXPECTED_SHA256="dc2986d6a06a35a6ffb6c06533e94eefbfd8514f648bdca62c6b0ff3d3c7a770"
+EXPECTED_SHA256="463a0dd3b4b0208ad21739478714c7061b501f744e8defd3aadd68a624406832"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -2500,7 +2500,7 @@ EOF
 
 # --max-time 5: mirrors install.ps1's Invoke-WebRequest -TimeoutSec 5 for this
 # same fetch (best-effort; falls back to the bundled placeholder below).
-curl -fsSL --max-time 5 "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/update.sh" -o update.sh 2>/dev/null || cat > update.sh << 'EOF'
+curl -fsSL --max-time 15 "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/update.sh" -o update.sh 2>/dev/null || cat > update.sh << 'EOF'
 #!/bin/bash
 echo "Updating CodeRaft..."
 docker compose --env-file install-config.env --env-file .env pull && docker compose --env-file install-config.env --env-file .env up -d --force-recreate --remove-orphans
@@ -2523,7 +2523,7 @@ EOF
 
 # --max-time 5: mirrors install.ps1's Invoke-WebRequest -TimeoutSec 5 for this
 # same fetch (best-effort; falls back to the bundled placeholder below).
-curl -fsSL --max-time 5 "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/rollback.sh" -o rollback.sh 2>/dev/null || cat > rollback.sh << 'EOF'
+curl -fsSL --max-time 15 "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/rollback.sh" -o rollback.sh 2>/dev/null || cat > rollback.sh << 'EOF'
 #!/bin/bash
 echo "rollback.sh placeholder — fetch the real one from https://install.coderaft.io/rollback"
 echo "or run: curl -fsSL https://install.coderaft.io/rollback -o rollback.sh && chmod +x rollback.sh"
@@ -2538,7 +2538,11 @@ EOF
 # certificate with nobody around to run `docker compose restart caddy`.
 # --max-time 5: mirrors install.ps1's Invoke-WebRequest -TimeoutSec 5 for this
 # same fetch (best-effort; falls back to the bundled placeholder below).
-curl -fsSL --max-time 5 "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/check-caddy-cert.sh" -o check-caddy-cert.sh 2>/dev/null || cat > check-caddy-cert.sh << 'EOF'
+# 2026-10-26 (chez Liam, Windows sibling): the equivalent fetch in
+# install.ps1 timed out at 5s twice right after 8 Docker images had just
+# pulled in parallel — bandwidth/AV-scan contention from that burst, not a
+# persistent outage. 15s gives it room on both platforms.
+curl -fsSL --max-time 15 "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/check-caddy-cert.sh" -o check-caddy-cert.sh 2>/dev/null || cat > check-caddy-cert.sh << 'EOF'
 #!/bin/bash
 echo "check-caddy-cert.sh placeholder — fetch the real one from https://install.coderaft.io/check-caddy-cert.sh"
 echo "or run: curl -fsSL https://install.coderaft.io/check-caddy-cert.sh -o check-caddy-cert.sh && chmod +x check-caddy-cert.sh"

@@ -48,7 +48,7 @@ $ErrorActionPreference = 'Stop'
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.ps1/install.ps1.sha256 at all — today it still
 # proxies the legacy `coderaft-installer` repo.
-$CoderaftExpectedSha256 = "6e1b63ce9741ceff6b3d9d42bbebcb4fab7d283d30ed8ac151dd985775cf9583"
+$CoderaftExpectedSha256 = "9336fdbb52e227ec48a5b15e4d2d5c648fd97a153452d455dd770e4c3d8ff0c8"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -2672,7 +2672,7 @@ Write-Host "Done."
 '@ -Encoding UTF8
 
 try {
-    $u = Invoke-WebRequest -Uri "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/update.ps1" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+    $u = Invoke-WebRequest -Uri "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/update.ps1" -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
     [System.IO.File]::WriteAllText("$PWD\update.ps1", $u.Content, [System.Text.Encoding]::UTF8)
 } catch {
     Set-Content -Path 'update.ps1' -Value @'
@@ -2708,7 +2708,7 @@ Write-Host "  Updated! Dashboard: https://$dashboardHostname"
 }
 
 try {
-    $r = Invoke-WebRequest -Uri "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/rollback.ps1" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+    $r = Invoke-WebRequest -Uri "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/rollback.ps1" -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
     [System.IO.File]::WriteAllText("$PWD\rollback.ps1", $r.Content, [System.Text.Encoding]::UTF8)
 } catch {
     Set-Content -Path 'rollback.ps1' -Value @'
@@ -2726,7 +2726,13 @@ exit 1
 # expired Caddy certificate with nobody around to run
 # `docker compose restart caddy`.
 try {
-    $c = Invoke-WebRequest -Uri "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/check-caddy-cert.ps1" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+    # 2026-10-26 (chez Liam): this specific fetch (the largest of the three
+    # sibling script downloads here, ~20K vs ~10K for rollback.ps1) timed
+    # out at 5s twice in a row, right after 8 Docker images had just
+    # finished pulling in parallel — network/Defender-scan contention from
+    # that burst, not a persistent outage (update.ps1/rollback.ps1 right
+    # above succeeded both times). 15s gives it enough room.
+    $c = Invoke-WebRequest -Uri "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/check-caddy-cert.ps1" -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
     [System.IO.File]::WriteAllText("$PWD\check-caddy-cert.ps1", $c.Content, [System.Text.Encoding]::UTF8)
 } catch {
     Set-Content -Path 'check-caddy-cert.ps1' -Value @'
