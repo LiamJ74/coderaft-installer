@@ -48,7 +48,7 @@ $ErrorActionPreference = 'Stop'
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.ps1/install.ps1.sha256 at all — today it still
 # proxies the legacy `coderaft-installer` repo.
-$CoderaftExpectedSha256 = "118a18272f523ec4d975e22d6cde150db35ca5521831a79cd5125e0bdf90bb8c"
+$CoderaftExpectedSha256 = "e2e8f32dc279237739a1c88cf64c2e1f7c5f567f172c68da32a001d46224c71d"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -2528,16 +2528,22 @@ function Install-CaddyRootCA {
         if ($proc) { return $proc.ExitCode } else { return 1 }
     }
 
+    # 2026-10-26 (chez Liam): 30s (15x2s) wasn't enough on a fresh install —
+    # Caddy racing against everything else pulling/starting at the same time
+    # cold-start-wise. Confirmed: this whole function (including the
+    # auto-elevated Import-Certificate below, which IS already built) never
+    # got a chance to run because this readiness check gave up first. 90s
+    # gives it real room without hanging forever on a genuinely broken Caddy.
     $caContainerPath = "/data/caddy/pki/authorities/local/root.crt"
-    Write-Host "  Waiting for Caddy to generate its internal CA (max 30s)…"
+    Write-Host "  Waiting for Caddy to generate its internal CA (max 90s)…"
     $caReady = $false
-    for ($i = 0; $i -lt 15; $i++) {
+    for ($i = 0; $i -lt 45; $i++) {
         $code = Invoke-DockerExitCode -Arguments (@("compose") + $ComposeEnvArgs + @("exec","-T","caddy","test","-f",$caContainerPath))
         if ($code -eq 0) { $caReady = $true; break }
         Start-Sleep -Seconds 2
     }
     if (-not $caReady) {
-        Write-Host "  ⚠ Caddy CA not found after 30s — browsers will warn on https://coderaft.local." -ForegroundColor Yellow
+        Write-Host "  ⚠ Caddy CA not found after 90s — browsers will warn on https://coderaft.local." -ForegroundColor Yellow
         Write-Host "    Download it later from the dashboard: Setup → TLS → Download CA." -ForegroundColor Yellow
         return $false
     }

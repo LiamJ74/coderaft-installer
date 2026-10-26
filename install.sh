@@ -49,7 +49,7 @@ set -e
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.sh/install.sh.sha256 at all — today it still proxies
 # the legacy `coderaft-installer` repo.
-EXPECTED_SHA256="8a94eff8bc7cd1ca2895209c1c3d897a3ca2e5f9a155e02724ac4f5b535f592e"
+EXPECTED_SHA256="1dd546edda6dfd6e7628582161482b59c971d1d7eaa6af1f04a442b59cf1cc11"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -2385,10 +2385,13 @@ trust_caddy_ca() {
             echo "  Caddy TLS mode: file ($(basename "$leaf") acts as trust anchor)"
             ;;
         internal)
+            # 2026-10-26 (chez Liam, Windows sibling): 30s (15x2s) wasn't
+            # enough on a fresh install — Caddy racing everything else
+            # pulling/starting at once. 90s gives it real room.
             local ca_container_path="/data/caddy/pki/authorities/local/root.crt"
-            echo "  Waiting for Caddy to generate its internal CA (max 30s)…"
+            echo "  Waiting for Caddy to generate its internal CA (max 90s)…"
             local i ca_ready=0
-            for i in $(seq 1 15); do
+            for i in $(seq 1 45); do
                 if docker compose "${COMPOSE_ENV_ARGS[@]}" exec -T caddy test -f "$ca_container_path" >/dev/null 2>&1; then
                     ca_ready=1
                     break
@@ -2396,7 +2399,7 @@ trust_caddy_ca() {
                 sleep 2
             done
             if [ "$ca_ready" = "0" ]; then
-                echo "  ⚠ Caddy internal CA not found after 30s — browsers will warn on https://coderaft.local."
+                echo "  ⚠ Caddy internal CA not found after 90s — browsers will warn on https://coderaft.local."
                 echo "    Download it later from the dashboard: Setup → TLS → Download CA."
                 return 1
             fi
