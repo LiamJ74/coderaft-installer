@@ -15,6 +15,16 @@
 #
 # Usage:
 #   .\vault-recover.ps1
+#   irm https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/vault-recover.ps1 | iex
+#
+# IMPORTANT: every early-return below uses `return`, never `exit`. This
+# script is designed to run via `irm | iex` in the operator's own
+# interactive shell (the published recovery one-liner) — `exit` there
+# terminates iex's HOST PROCESS, i.e. closes the entire PowerShell window
+# the operator is sitting in, not just this script. Confirmed live
+# 2026-10-30: the "not enough shares yet, re-run" branch hit `exit 1` and
+# killed the window before the message could even be read, making a
+# routine "need a couple more shares" case look like a hard crash.
 
 param(
     [string] $InstallDir = $env:INSTALL_DIR
@@ -47,7 +57,7 @@ while ($true) {
 
 if ($shares.Count -eq 0) {
     Write-Host "  [!] No shares entered. Aborting." -ForegroundColor Red
-    exit 1
+    return
 }
 
 # Detect compose project name (determines Docker network for sidecar)
@@ -118,11 +128,11 @@ if ($unsealResp -match '"ok"\s*:\s*true') {
     Write-Host "  [!] Not enough shares yet — re-run this script and enter the remaining share(s)." -ForegroundColor Yellow
     Write-Host "    Shares already submitted are NOT remembered between separate runs of this"
     Write-Host "    script if the vault process restarts in between; submit them all in one run."
-    exit 1
+    return
 } else {
     Write-Host "  [!] Unseal failed — see response above (wrong shares, or vault not yet" -ForegroundColor Red
     Write-Host "    initialized — run POST /v1/init first if this is a brand new vault)." -ForegroundColor Red
-    exit 1
+    return
 }
 
 $finalHealth = Invoke-VaultCurlRecover -Method "GET" -Path "/v1/health"
@@ -134,5 +144,5 @@ if ($finalHealth -match '"sealed"\s*:\s*false') {
     Write-Host ""
     Write-Host "  [!] Unseal reported success but health check does not confirm sealed:false." -ForegroundColor Yellow
     Write-Host "    Health: $finalHealth" -ForegroundColor Yellow
-    exit 1
+    return
 }
