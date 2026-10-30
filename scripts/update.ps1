@@ -3109,6 +3109,29 @@ Invoke-VaultAclLiveSelfHeal -InstallDir $INSTALL_DIR -Name "entraguard" -San "en
     "read:m365dsc-exo-cert/*", "write:m365dsc-exo-cert/*", "delete:m365dsc-exo-cert/*"
 )
 Invoke-FalconOneTlsBootstrap -InstallDir $INSTALL_DIR
+
+# ── FalconOne relay signal-server key self-heal (mint-on-boot pattern) ──────
+# BUG FOUND 2026-10-30: the pre-create+chmod fix for this file was added
+# earlier tonight ONLY inside the one-time vault-migration block above
+# (search "FalconOne relay signal-server key" higher in this file) — which
+# NEVER runs for an already-migrated install (every update on Liam's own
+# install logs "Vault migration not needed"). Confirmed live: falconone-relay
+# kept crash-looping with "permission denied" on every update after that
+# "fix", because the code path that was supposed to apply it never executed.
+# This unconditional copy, in the section that genuinely runs on every
+# update, is the actual fix. See the migration-block copy for the "why
+# pre-create at all" rationale (Docker auto-vivifies a directory otherwise).
+$foCertsDir = Join-Path $INSTALL_DIR "certs"
+New-Item -ItemType Directory -Force -Path $foCertsDir | Out-Null
+$foSignalKey = Join-Path $foCertsDir "falconone-signal-server.key"
+if (Test-Path $foSignalKey -PathType Container) {
+    Remove-Item -LiteralPath $foSignalKey -Recurse -Force -ErrorAction SilentlyContinue
+}
+if (-not (Test-Path $foSignalKey -PathType Leaf)) {
+    New-Item -ItemType File -Force -Path $foSignalKey | Out-Null
+}
+docker run --rm -v "${foCertsDir}:/work" alpine:3.20 chmod 666 /work/falconone-signal-server.key 2>$null | Out-Null
+
 Invoke-FalconOneAclSelfHeal -AclPath (Join-Path $INSTALL_DIR "vault-config\acl.yaml")
 Invoke-VaultAclLiveSelfHeal -InstallDir $INSTALL_DIR -Name "falconone" -San "falconone.coderaft.local" -Permissions @(
     "read:license_key", "read:falconone_*", "read:platform/identity/oidc",

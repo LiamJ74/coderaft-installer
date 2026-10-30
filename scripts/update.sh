@@ -2288,6 +2288,23 @@ _vault_acl_live_selfheal "entraguard" "entraguard.coderaft.local" \
 # = 0) still get the legacy-PKI cleanup (#226) and any missing ACL
 # permissions healed.
 _falconone_tls_bootstrap "${INSTALL_DIR}"
+
+# ── FalconOne relay signal-server key self-heal (mint-on-boot pattern) ──────
+# BUG FOUND 2026-10-30: the pre-create+chmod fix for this file was added
+# earlier tonight ONLY inside the one-time vault-migration block above
+# (search "falconone-signal-server.key" higher in this file) -- which NEVER
+# runs for an already-migrated install. Confirmed live: falconone-relay kept
+# crash-looping with "permission denied" on every update after that "fix",
+# because the code path that was supposed to apply it never executed. This
+# unconditional copy, in the section that genuinely runs on every update, is
+# the actual fix.
+mkdir -p "${INSTALL_DIR}/certs"
+if [ -d "${INSTALL_DIR}/certs/falconone-signal-server.key" ]; then
+    rm -rf "${INSTALL_DIR}/certs/falconone-signal-server.key"
+fi
+[ -f "${INSTALL_DIR}/certs/falconone-signal-server.key" ] || touch "${INSTALL_DIR}/certs/falconone-signal-server.key"
+chmod 666 "${INSTALL_DIR}/certs/falconone-signal-server.key" 2>/dev/null || true
+
 _falconone_acl_selfheal "${INSTALL_DIR}/vault-config/acl.yaml"
 _vault_acl_live_selfheal "falconone" "falconone.coderaft.local" \
     "read:license_key" "read:falconone_*" "read:platform/identity/oidc" \
