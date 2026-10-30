@@ -247,10 +247,11 @@ if [ -z "$CODERAFT_UPDATE_REEXEC" ]; then
     echo "  Checking for script updates..."
     REFRESHED=0
     for name in update.sh rollback.sh check-caddy-cert.sh; do
-        # --max-time 5: mirrors update.ps1's Invoke-WebRequest -TimeoutSec 5 for
-        # this same self-update fetch (best-effort; falls back to the local
-        # copy silently on any failure, so a fast timeout is safe).
-        LATEST=$(curl -fsSL --max-time 5 "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/$name" 2>/dev/null)
+        # --max-time 15: mirrors update.ps1's Invoke-WebRequest -TimeoutSec 15
+        # for this same self-update fetch — bumped from 5s 2026-10-30 after
+        # check-caddy-cert.sh's Windows sibling (check-caddy-cert.ps1, the
+        # largest of the three) fell back to its placeholder stub twice live.
+        LATEST=$(curl -fsSL --max-time 15 "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/$name" 2>/dev/null)
         if [ -n "$LATEST" ] && [ ${#LATEST} -gt 50 ]; then
             echo "$LATEST" > "$name.tmp"
             if ! cmp -s "$name" "$name.tmp" 2>/dev/null; then

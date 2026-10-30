@@ -696,7 +696,11 @@ if (-not $IsReexecChild) {
     foreach ($name in @("update.ps1", "rollback.ps1", "check-caddy-cert.ps1")) {
         try {
             $url = "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/$name"
-            $latest = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+            # 2026-10-30 (chez Liam): check-caddy-cert.ps1 (largest of the
+            # three fetched here) fell back to its "placeholder" stub twice
+            # in a row at 5s — same root cause already fixed in install.ps1's
+            # separate end-of-install fetch of these same three files.
+            $latest = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
             if ($latest.StatusCode -eq 200 -and $latest.Content.Length -gt 50) {
                 [System.IO.File]::WriteAllText("$PWD\$name", $latest.Content, [System.Text.Encoding]::UTF8)
                 Write-Host "  $name refreshed"
