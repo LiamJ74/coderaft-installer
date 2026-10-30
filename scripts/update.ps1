@@ -2601,7 +2601,13 @@ clients:
     # denied" despite the file existing, every single update since whenever
     # this pre-create block was added. Widen it from inside a Linux
     # container, same reasoning as the vault-tls cert chmod fix above.
-    docker run --rm -v "${foCertsDir}:/work" alpine:3.20 chmod 666 /work/falconone-signal-server.key 2>$null | Out-Null
+    # chmod from inside a Linux container does NOT work here (confirmed live
+    # 2026-10-30): a pre-existing file with a restrictive Windows NTFS ACL
+    # (BUILTIN\Users:(RX) only, no write) rejects chmod regardless of the
+    # container's UID -- NTFS ACLs are enforced independently of whatever
+    # POSIX bits a Linux process requests. icacls, run natively here, is the
+    # only thing that actually grants write access on the Windows side.
+    icacls $foSignalKey /grant "BUILTIN\Users:(M)" | Out-Null
 
     # ── FalconOne agents mTLS PKI (falconone-tls/) — #170/#174/#226 ─────────
     # See Invoke-FalconOneTlsBootstrap definition above for why this no

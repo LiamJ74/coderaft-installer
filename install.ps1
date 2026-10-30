@@ -48,7 +48,7 @@ $ErrorActionPreference = 'Stop'
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.ps1/install.ps1.sha256 at all — today it still
 # proxies the legacy `coderaft-installer` repo.
-$CoderaftExpectedSha256 = "ef296ee1cbddb7f9448b68e3bad6ef9cbfc4c2cf761deee3a7a4839327b5c574"
+$CoderaftExpectedSha256 = "cbd14c40bf019df89405073066e265716872537223e6f1a726455e40c9e911ef"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -1648,7 +1648,13 @@ if (Test-Path $foSignalKey -PathType Container) {
 if (-not (Test-Path $foSignalKey -PathType Leaf)) {
     New-Item -ItemType File -Force -Path $foSignalKey | Out-Null
 }
-docker run --rm -v "${foCertsDir}:/work" alpine:3.20 chmod 666 /work/falconone-signal-server.key 2>$null | Out-Null
+# chmod from inside a Linux container does NOT work here (confirmed live
+# 2026-10-30): a pre-existing file with a restrictive Windows NTFS ACL
+# (BUILTIN\Users:(RX) only, no write) rejects chmod regardless of the
+# container's UID -- NTFS ACLs are enforced independently of whatever
+# POSIX bits a Linux process requests. icacls, run natively here, is the
+# only thing that actually grants write access on the Windows side.
+icacls $foSignalKey /grant "BUILTIN\Users:(M)" | Out-Null
 
 # ── RedFox connections/k8s vault-backed credentials ACL self-heal ───────────
 # Zero-Knowledge Credential Architecture Palier 1 — see Invoke-RedfoxAclSelfHeal
