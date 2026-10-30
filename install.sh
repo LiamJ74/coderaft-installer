@@ -49,7 +49,7 @@ set -e
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.sh/install.sh.sha256 at all — today it still proxies
 # the legacy `coderaft-installer` repo.
-EXPECTED_SHA256="1dd546edda6dfd6e7628582161482b59c971d1d7eaa6af1f04a442b59cf1cc11"
+EXPECTED_SHA256="65e976b28bb94569e88286584c924cf68c4b3054b0cce02de1d344f695be66e9"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -1385,6 +1385,23 @@ vault_bootstrap
 # healed.
 _falconone_tls_bootstrap "$PWD"
 _falconone_acl_selfheal "vault-config/acl.yaml"
+
+# ── FalconOne relay signal-server key (mint-on-boot pattern) ────────────────
+# falconone-relay expects /keys/signal-server.key mounted from
+# certs/falconone-signal-server.key on the host. Missing entirely on a
+# fresh install (gap found 2026-10-30 while fixing the same file's
+# permissions in update.sh): Docker would auto-create a DIRECTORY at the
+# missing bind-mount source -> the relay reads it as a directory -> fatal
+# "signal server key: is a directory". Pre-create an empty, world-writable
+# file so Docker mounts a regular file and the relay's non-root distroless
+# user can mint+persist its Ed25519 key on first boot (touch's default 644
+# isn't enough when the invoking host user != the container's non-root uid).
+mkdir -p certs
+if [ -d "certs/falconone-signal-server.key" ]; then
+    rm -rf "certs/falconone-signal-server.key"
+fi
+[ -f "certs/falconone-signal-server.key" ] || touch "certs/falconone-signal-server.key"
+chmod 666 "certs/falconone-signal-server.key" 2>/dev/null || true
 
 # ── MantisStrike vault client cert + ACL self-heal (Phase 1 platform wiring,
 # same pattern as falconone above) ───────────────────────────────────────────

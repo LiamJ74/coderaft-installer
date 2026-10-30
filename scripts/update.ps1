@@ -2594,6 +2594,14 @@ clients:
     if (-not (Test-Path $foSignalKey -PathType Leaf)) {
         New-Item -ItemType File -Force -Path $foSignalKey | Out-Null
     }
+    # PowerShell's New-Item can't set a real POSIX write-for-others bit on
+    # a Docker Desktop/WSL2 bind-mount source — confirmed live 2026-10-30:
+    # falconone-relay's non-root distroless user fatal'd in a restart loop
+    # with "signal server key: persist signal server key: ... permission
+    # denied" despite the file existing, every single update since whenever
+    # this pre-create block was added. Widen it from inside a Linux
+    # container, same reasoning as the vault-tls cert chmod fix above.
+    docker run --rm -v "${foCertsDir}:/work" alpine:3.20 chmod 666 /work/falconone-signal-server.key 2>$null | Out-Null
 
     # ── FalconOne agents mTLS PKI (falconone-tls/) — #170/#174/#226 ─────────
     # See Invoke-FalconOneTlsBootstrap definition above for why this no

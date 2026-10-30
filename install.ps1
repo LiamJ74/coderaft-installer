@@ -48,7 +48,7 @@ $ErrorActionPreference = 'Stop'
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.ps1/install.ps1.sha256 at all — today it still
 # proxies the legacy `coderaft-installer` repo.
-$CoderaftExpectedSha256 = "e2e8f32dc279237739a1c88cf64c2e1f7c5f567f172c68da32a001d46224c71d"
+$CoderaftExpectedSha256 = "ef296ee1cbddb7f9448b68e3bad6ef9cbfc4c2cf761deee3a7a4839327b5c574"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -1627,6 +1627,28 @@ Invoke-VaultBootstrap
 Write-Host "  Checking vault ACL / PKI provisioning..."
 Invoke-FalconOneTlsBootstrap -InstallDir (Get-Location).Path
 Invoke-FalconOneAclSelfHeal -AclPath (Join-Path (Get-Location).Path "vault-config\acl.yaml")
+
+# ── FalconOne relay signal-server key (mint-on-boot pattern) ────────────────
+# falconone-relay expects /keys/signal-server.key mounted from
+# certs/falconone-signal-server.key on the host. Missing entirely on a
+# fresh install (gap found 2026-10-30 while fixing the same file's
+# permissions in update.ps1): Docker would auto-create a DIRECTORY at the
+# missing bind-mount source -> the relay reads it as a directory -> fatal
+# "signal server key: is a directory". Pre-create an empty, world-writable
+# file so Docker mounts a regular file and the relay's non-root distroless
+# user can mint+persist its Ed25519 key on first boot. PowerShell's
+# New-Item can't set the write-for-others bit itself under Docker Desktop's
+# WSL2 bind-mount translation, hence the alpine chmod.
+$foCertsDir = Join-Path (Get-Location).Path "certs"
+New-Item -ItemType Directory -Force -Path $foCertsDir | Out-Null
+$foSignalKey = Join-Path $foCertsDir "falconone-signal-server.key"
+if (Test-Path $foSignalKey -PathType Container) {
+    Remove-Item -LiteralPath $foSignalKey -Recurse -Force -ErrorAction SilentlyContinue
+}
+if (-not (Test-Path $foSignalKey -PathType Leaf)) {
+    New-Item -ItemType File -Force -Path $foSignalKey | Out-Null
+}
+docker run --rm -v "${foCertsDir}:/work" alpine:3.20 chmod 666 /work/falconone-signal-server.key 2>$null | Out-Null
 
 # ── RedFox connections/k8s vault-backed credentials ACL self-heal ───────────
 # Zero-Knowledge Credential Architecture Palier 1 — see Invoke-RedfoxAclSelfHeal

@@ -2209,6 +2209,12 @@ SCRIPT
         rm -rf "certs/falconone-signal-server.key"
     fi
     [ -f "certs/falconone-signal-server.key" ] || touch "certs/falconone-signal-server.key"
+    # If the host user invoking this script != the relay container's
+    # non-root distroless user, the default 644 from touch leaves the
+    # relay unable to write its own key (fatal "permission denied" restart
+    # loop, confirmed live 2026-10-30 on a Docker Desktop host). Same
+    # reasoning as the vault-tls cert chmod fix above.
+    chmod 666 "certs/falconone-signal-server.key" 2>/dev/null || true
 
     # FalconOne agents mTLS PKI (falconone-tls/) — #170/#174/#226. See
     # _falconone_tls_bootstrap definition above for why this no longer
