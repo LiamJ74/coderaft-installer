@@ -4,6 +4,18 @@
 # Usage: bash migrate-to-sops.sh   (from the install directory)
 #
 # Idempotent: can be safely re-run if the first execution fails.
+#
+# !! THIS FILE HAS A DUPLICATE, KEEP IN SYNC !! — dashboard-api/migrate-to-
+# sops.sh is a byte-for-byte copy of this file, baked into the dashboard-api
+# image via Dockerfile's `COPY migrate-to-sops.sh /usr/local/bin/coderaft-
+# migrate-secrets.sh` (build context is ./dashboard-api only, can't
+# reference ../deploy/scripts/ directly). Drifted out of sync twice already
+# (2026-11-04): two rounds of fixes landed here without that copy being
+# updated, so the dashboard's "run migration" button kept running old,
+# already-fixed-elsewhere bugs. After editing THIS file, immediately run:
+#   cp deploy/scripts/migrate-to-sops.sh dashboard-api/migrate-to-sops.sh
+# Never hand-edit the dashboard-api copy directly — it gets overwritten by
+# that command (and its own copy of this same header, which is correct).
 # =============================================================================
 
 set -euo pipefail
