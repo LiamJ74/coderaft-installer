@@ -48,7 +48,7 @@ $ErrorActionPreference = 'Stop'
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.ps1/install.ps1.sha256 at all — today it still
 # proxies the legacy `coderaft-installer` repo.
-$CoderaftExpectedSha256 = "cbd14c40bf019df89405073066e265716872537223e6f1a726455e40c9e911ef"
+$CoderaftExpectedSha256 = "59f89854bf7f1d608cf246447fb25f65d91f21fd2d433e017084eeb0a9342bc8"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the

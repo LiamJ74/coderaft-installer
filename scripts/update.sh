@@ -884,7 +884,16 @@ if ! docker compose "${COMPOSE_ENV_ARGS[@]}" ps >/dev/null 2>&1; then
         echo "    ✓ override backed up + removed"
     fi
     docker pull ghcr.io/liamj74/coderaft-dashboard-api:latest >/dev/null 2>&1 || true
-    if docker compose "${COMPOSE_ENV_ARGS[@]}" up -d postgres redis dashboard-api >/dev/null 2>&1; then
+    # dashboard-api needs --force-recreate specifically: the only thing that
+    # regenerates docker-compose.override.yml (just deleted above) is
+    # dashboard-api's own bootstrap() logic running at container start. If its
+    # image hasn't changed, a plain `up -d` is a no-op on an already-running
+    # container, bootstrap() never re-runs, and override.yml stays deleted
+    # indefinitely (confirmed in prod 2026-11-03: every product container
+    # silently became an "orphan" to Compose). postgres/redis have no
+    # equivalent dependency, so they stay a plain `up -d`.
+    docker compose "${COMPOSE_ENV_ARGS[@]}" up -d postgres redis >/dev/null 2>&1
+    if docker compose "${COMPOSE_ENV_ARGS[@]}" up -d --force-recreate --no-deps dashboard-api >/dev/null 2>&1; then
         sleep 6
         if docker compose "${COMPOSE_ENV_ARGS[@]}" ps >/dev/null 2>&1; then
             echo "    ✓ compose repaired"

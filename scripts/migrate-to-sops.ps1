@@ -15,7 +15,6 @@
 
 [CmdletBinding()]
 param(
-    [string]$BackupPassphrase = $env:CODERAFT_BACKUP_PASS,
     [switch]$SkipSelfUpdate,
     [switch]$Finalize
 )
@@ -227,48 +226,25 @@ if (-not $agePub) { Write-Fatal "Could not extract age public key" }
 Set-Content -Path $AgePubPath -Value $agePub -Encoding UTF8
 Write-Info "Public key: $agePub"
 
-# ── 4. GPG backup ────────────────────────────────────────────────────────────
+# ── 4. Encrypted .env backup ─────────────────────────────────────────────────
+# Root-cause fix (2026-11-04): this used to shell out to gpg.exe (Gpg4win) for
+# a password-protected backup — a third-party tool absent on most fresh
+# Windows servers, forcing an "install this first" or "continue without a
+# backup" dead end on every single deployment (reported repeatedly). sops and
+# age-keygen are ALREADY required and verified present a few lines above (see
+# the binary check at the top of this script) — reuse them instead of adding
+# a second encryption tool. The backup is just .env encrypted to the same age
+# key, recoverable with `sops --decrypt` exactly like .env.enc itself, no
+# separate passphrase to lose.
 Write-Host "  -- .env backup --"
 New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
 $ts         = (Get-Date -Format 'yyyyMMddTHHmmssZ')
-$backupPath = Join-Path $DataDir "migration-backup-$ts.env.gpg"
+$backupPath = Join-Path $DataDir "migration-backup-$ts.env.enc"
 
-$gpgExe = Get-Command gpg.exe -ErrorAction SilentlyContinue
-if (-not $gpgExe) {
-    Write-Warn "gpg.exe not found."
-    Write-Warn "Install Gpg4win (https://gpg4win.org) for the encrypted backup."
-    Write-Warn "WARNING: Without a GPG backup, .env will not be saved!"
-    $confirm = Read-Host "  Continue without GPG backup? [yes/NO]"
-    if ($confirm -ne 'yes') { Write-Fatal "Migration cancelled by user." }
-} else {
-    # Passphrase
-    if ([string]::IsNullOrEmpty($BackupPassphrase)) {
-        $secPass1 = Read-Host "  Passphrase for the GPG backup" -AsSecureString
-        $secPass2 = Read-Host "  Confirm the passphrase" -AsSecureString
-        $p1 = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-            [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secPass1))
-        $p2 = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-            [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secPass2))
-        if ($p1 -ne $p2) { Write-Fatal "Passphrases do not match." }
-        if ([string]::IsNullOrEmpty($p1)) { Write-Fatal "Passphrase cannot be empty." }
-        $BackupPassphrase = $p1
-        Remove-Variable p1, p2
-    }
-
-    # gpg --batch passphrase via stdin
-    $BackupPassphrase | gpg.exe --batch --yes `
-        --passphrase-fd 0 `
-        --cipher-algo AES256 `
-        --compress-algo none `
-        --symmetric `
-        --output $backupPath `
-        .env
-    if ($LASTEXITCODE -ne 0) { Write-Fatal "GPG backup failed" }
-    Remove-Variable BackupPassphrase
-    Write-Info "GPG backup created: $backupPath"
-    Write-Warn "IMPORTANT: Keep the passphrase offline."
-    Write-Warn "          Lost passphrase = backup inaccessible = secrets lost."
-}
+& sops.exe --encrypt --age $agePub --output $backupPath .env
+if ($LASTEXITCODE -ne 0) { Write-Fatal "Encrypted .env backup failed" }
+Write-Info "Encrypted backup created: $backupPath"
+Write-Info "Recoverable with: sops --decrypt $backupPath (using the age key at $AgeKeyPath)"
 
 # ── 5. SOPS encryption ───────────────────────────────────────────────────────
 Write-Host "  -- SOPS encryption --"
@@ -367,7 +343,7 @@ Write-Host "  +------------------------------------------------------+" -Foregro
 Write-Host "  |  .env.enc   : $(Resolve-Path '.env.enc')"
 Write-Host "  |  age key    : $AgeKeyPath"
 if (Test-Path $backupPath) {
-Write-Host "  |  GPG backup : $backupPath"
+Write-Host "  |  .env backup: $backupPath"
 }
 Write-Host "  +------------------------------------------------------+" -ForegroundColor Green
 Write-Host "  |  IMPORTANT: Back up the age key offline!            |" -ForegroundColor Yellow

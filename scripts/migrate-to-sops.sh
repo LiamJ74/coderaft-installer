@@ -68,7 +68,6 @@ AGE_PUB_PATH="${AGE_KEY_DIR}/age.pub"
 SOPS_VERSION="v3.8.1"
 AGE_VERSION="v1.2.1"
 DATA_DIR="${CODERAFT_DATA_DIR:-./dashboard_data}"
-BACKUP_PASS_ENV="${CODERAFT_BACKUP_PASS:-}"
 
 echo ""
 echo "  ╔══════════════════════════════════════════╗"
@@ -264,54 +263,24 @@ echo "$AGE_PUB" | srun tee "${AGE_PUB_PATH}" > /dev/null
 srun chmod 444 "${AGE_PUB_PATH}"
 info "Public key: ${AGE_PUB}"
 
-# ── 4. GPG backup of the original .env ───────────────────────────────────────
-headline "GPG backup of .env"
+# ── 4. Encrypted backup of the original .env ─────────────────────────────────
+# Root-cause fix (2026-11-04): this used to shell out to gpg for a password-
+# protected backup — a third-party tool absent on most fresh servers, forcing
+# an "install this first" or "continue without a backup" dead end on every
+# deployment (reported repeatedly). sops and age-keygen are ALREADY required
+# and verified present a few lines above (see the binary check at the top of
+# this script) — reuse them instead of adding a second encryption tool. The
+# backup is just .env encrypted to the same age key, recoverable with
+# `sops --decrypt` exactly like .env.enc itself, no separate passphrase to lose.
+headline ".env backup"
 mkdir -p "${DATA_DIR}"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
-BACKUP_PATH="${DATA_DIR}/migration-backup-${TS}.env.gpg"
+BACKUP_PATH="${DATA_DIR}/migration-backup-${TS}.env.enc"
 
-if ! command -v gpg &>/dev/null; then
-  warn "gpg not found — encrypted GPG backup is skipped."
-  warn "WARNING: Manually keep an offline copy of .env before continuing."
-  read -r -p "  Continue without GPG backup? [yes/NO]: " _CONFIRM
-  if [ "${_CONFIRM}" != "yes" ]; then
-    fatal "Migration cancelled by user."
-  fi
-else
-  # Get the passphrase
-  if [ -n "${BACKUP_PASS_ENV}" ]; then
-    _PASSPHRASE="${BACKUP_PASS_ENV}"
-  else
-    # shellcheck disable=SC2162
-    read -r -s -p "  Passphrase for the GPG backup (will NOT be stored): " _PASSPHRASE
-    echo ""
-    # shellcheck disable=SC2162
-    read -r -s -p "  Confirm the passphrase: " _PASSPHRASE2
-    echo ""
-    if [ "${_PASSPHRASE}" != "${_PASSPHRASE2}" ]; then
-      fatal "Passphrases do not match."
-    fi
-  fi
-
-  if [ -z "${_PASSPHRASE}" ]; then
-    fatal "Passphrase cannot be empty. Aborting."
-  fi
-
-  gpg --batch --yes \
-      --passphrase-fd 3 \
-      --cipher-algo AES256 \
-      --compress-algo none \
-      --symmetric \
-      --output "${BACKUP_PATH}" \
-      .env \
-      3< <(printf '%s' "${_PASSPHRASE}") \
-    || fatal "GPG backup failed"
-
-  unset _PASSPHRASE _PASSPHRASE2
-  info "GPG backup created: ${BACKUP_PATH}"
-  warn "IMPORTANT: Keep the passphrase offline (vault, password manager)."
-  warn "          Lost passphrase = backup inaccessible = secrets lost if the migration breaks."
-fi
+sops --encrypt --age "${AGE_PUB}" --output "${BACKUP_PATH}" .env \
+  || fatal "Encrypted .env backup failed"
+info "Encrypted backup created: ${BACKUP_PATH}"
+info "Recoverable with: sops --decrypt ${BACKUP_PATH} (using the age key at ${AGE_KEY_PATH})"
 
 # ── 5. SOPS encryption ───────────────────────────────────────────────────────
 headline "SOPS encryption"
@@ -410,7 +379,7 @@ echo "  ╠═══════════════════════
 printf  "  ║  .env.enc      : %-36s║\n" "$(pwd)/.env.enc"
 printf  "  ║  age key       : %-36s║\n" "${AGE_KEY_PATH}"
 if [ -f "${BACKUP_PATH}" ]; then
-printf  "  ║  GPG backup    : %-36s║\n" "${BACKUP_PATH}"
+printf  "  ║  .env backup   : %-36s║\n" "${BACKUP_PATH}"
 fi
 echo "  ╠══════════════════════════════════════════════════════╣"
 echo "  ║  IMPORTANT: Back up the age key offline!            ║"

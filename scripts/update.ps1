@@ -1296,9 +1296,32 @@ if (-not $composeOK) {
     try {
         # docker compose up -d: its stdout is desired output, but stderr
         # surfaces as NativeCommandError in PS 5.1. Redirect stderr only.
+        #
+        # dashboard-api needs --force-recreate specifically: this whole block only
+        # runs after docker-compose.override.yml was just deleted above, and the
+        # ONLY thing that regenerates it is dashboard-api's own bootstrap() logic
+        # (server.js) running at container start. If dashboard-api's image hasn't
+        # changed since it was last started, a plain `up -d` is a no-op — the
+        # already-running container is left alone, bootstrap() never re-runs, and
+        # override.yml stays deleted indefinitely (confirmed in prod 2026-11-03:
+        # `docker compose config --services` showed only the 8 core platform
+        # services — every product container had silently become an "orphan" to
+        # Compose, one `--remove-orphans` away from being stopped). postgres/redis
+        # don't have an equivalent regen-on-start dependency, so they stay plain
+        # `up -d` (no unnecessary recreate).
         $upHealErr = Join-Path $env:TEMP "coderaft-upheal-err-$(Get-Random).log"
         $upHealOut = Join-Path $env:TEMP "coderaft-upheal-out-$(Get-Random).log"
-        $upHealProc = Start-Process -FilePath "docker" -ArgumentList (@("compose") + $ComposeEnvArgs + @("up","-d","postgres","redis","dashboard-api")) `
+        $upHealProc = Start-Process -FilePath "docker" -ArgumentList (@("compose") + $ComposeEnvArgs + @("up","-d","postgres","redis")) `
+            -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput $upHealOut `
+            -RedirectStandardError  $upHealErr `
+            -ErrorAction SilentlyContinue
+        if (Test-Path $upHealOut) { Get-Content $upHealOut -ErrorAction SilentlyContinue | Out-Host }
+        Remove-Item -Path $upHealOut,$upHealErr -ErrorAction SilentlyContinue
+
+        $upHealErr = Join-Path $env:TEMP "coderaft-upheal-err-$(Get-Random).log"
+        $upHealOut = Join-Path $env:TEMP "coderaft-upheal-out-$(Get-Random).log"
+        $upHealProc = Start-Process -FilePath "docker" -ArgumentList (@("compose") + $ComposeEnvArgs + @("up","-d","--force-recreate","--no-deps","dashboard-api")) `
             -NoNewWindow -Wait -PassThru `
             -RedirectStandardOutput $upHealOut `
             -RedirectStandardError  $upHealErr `

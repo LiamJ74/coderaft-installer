@@ -49,7 +49,7 @@ set -e
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.sh/install.sh.sha256 at all — today it still proxies
 # the legacy `coderaft-installer` repo.
-EXPECTED_SHA256="65e976b28bb94569e88286584c924cf68c4b3054b0cce02de1d344f695be66e9"
+EXPECTED_SHA256="74299331ed5b14d033536608a995be32856f9ad402b762499e30d513817d42d2"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
