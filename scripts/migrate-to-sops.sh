@@ -300,12 +300,26 @@ fi
 if [ -z "$AGE_PUB" ]; then
   fatal "Could not extract age public key from ${AGE_KEY_PATH}"
 fi
+# Root-cause fix (2026-11-04, found live: migration aborted with exit 1 on
+# "tee: /etc/coderaft/age.pub: Permission denied"): under `set -euo
+# pipefail`, that single failed write killed the WHOLE migration, even
+# though this .pub file is a derived convenience artifact, never read back
+# by anything below -- the actual sops --encrypt call a few lines down uses
+# the $AGE_PUB shell variable, not this file. A pre-existing legacy key at
+# /etc/coderaft/age.key (created by an earlier, privileged run) is
+# perfectly readable by an unprivileged process re-running the migration
+# later, but that process may have no sudo and no write access to
+# /etc/coderaft itself -- writing the .pub sidecar there can fail for a
+# reason that has nothing to do with whether the migration itself can
+# succeed. Never let this one write abort the encryption that follows.
 if [ "${AGE_KEY_DIR}" = "/etc/coderaft" ]; then
-  echo "$AGE_PUB" | srun tee "${AGE_PUB_PATH}" > /dev/null
-  srun chmod 444 "${AGE_PUB_PATH}"
+  if ! (echo "$AGE_PUB" | srun tee "${AGE_PUB_PATH}" > /dev/null && srun chmod 444 "${AGE_PUB_PATH}"); then
+    warn "Could not write ${AGE_PUB_PATH} (no write access) — continuing, the public key is only needed in-memory for the encryption step below"
+  fi
 else
-  echo "$AGE_PUB" > "${AGE_PUB_PATH}"
-  chmod 444 "${AGE_PUB_PATH}"
+  if ! (echo "$AGE_PUB" > "${AGE_PUB_PATH}" && chmod 444 "${AGE_PUB_PATH}"); then
+    warn "Could not write ${AGE_PUB_PATH} — continuing, the public key is only needed in-memory for the encryption step below"
+  fi
 fi
 info "Public key: ${AGE_PUB}"
 

@@ -243,7 +243,20 @@ if (-not (Test-Path $AgeKeyPath)) {
 
 $agePub = (Select-String -Path $AgeKeyPath -Pattern '# public key: (.+)').Matches.Groups[1].Value.Trim()
 if (-not $agePub) { Write-Fatal "Could not extract age public key" }
-Set-Content -Path $AgePubPath -Value $agePub -Encoding UTF8
+# Root-cause fix (2026-11-04, found live on the bash sibling: migration
+# aborted entirely on a permission-denied writing the .pub sidecar): this
+# file is a derived convenience artifact, never read back by anything below
+# -- the actual sops --encrypt call a few lines down uses the $agePub
+# variable, not this file. A pre-existing legacy key in C:\ProgramData\
+# coderaft (created by an earlier, elevated run) is perfectly readable by a
+# later non-elevated run, but that process may have no write access to
+# ProgramData -- writing the .pub sidecar there can fail for a reason that
+# has nothing to do with whether the migration itself can succeed.
+try {
+    Set-Content -Path $AgePubPath -Value $agePub -Encoding UTF8 -ErrorAction Stop
+} catch {
+    Write-Warn "Could not write $AgePubPath (no write access) — continuing, the public key is only needed in-memory for the encryption step below"
+}
 Write-Info "Public key: $agePub"
 
 # ── 4. Encrypted .env backup ─────────────────────────────────────────────────
