@@ -48,7 +48,7 @@ $ErrorActionPreference = 'Stop'
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.ps1/install.ps1.sha256 at all — today it still
 # proxies the legacy `coderaft-installer` repo.
-$CoderaftExpectedSha256 = "59f89854bf7f1d608cf246447fb25f65d91f21fd2d433e017084eeb0a9342bc8"
+$CoderaftExpectedSha256 = "82d5f5bc1d4dd5931488657b92a6605d277130841e68b28d87d8fcf1804e853b"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -3143,6 +3143,40 @@ if ($LASTEXITCODE -ne 0) {
     Write-Host "  ✗ Image pull failed (exit $LASTEXITCODE). Aborting install." -ForegroundColor Red
     Write-Host "    Check Docker daemon, network connectivity, or GHCR auth." -ForegroundColor Yellow
     exit 1
+}
+
+# ── SOPS+age migration (auto, first install) ──────────────────────────────
+# Encrypts the .env just generated above into .env.enc before the stack ever
+# starts, so fresh installs never sit on plaintext secrets even transiently
+# (2026-11-04: closes the gap where this was deferred to a manual, separate
+# migrate-to-sops.ps1 run that most customers never knew to do). Reuses
+# migrate-to-sops.ps1 itself (fetched fresh, same pattern as update.ps1/
+# rollback.ps1 above) instead of duplicating its backup/encrypt/verify logic
+# -- non-interactive since the gpg prompt it used to have is gone.
+#
+# Run in a SEPARATE process, not an in-process `&` call: migrate-to-sops.ps1's
+# own Write-Fatal does `exit 1` on error, which in-process would tear down
+# THIS install.ps1 run too (and, under `irm | iex`, the user's whole shell —
+# see the "return not exit" comments elsewhere in this file). A child
+# process's exit only ends that child; non-fatal either way, since a failed
+# migration here just leaves the already-working plaintext .env in place.
+if (-not (Test-Path ".env.enc")) {
+    Write-Host ""
+    Write-Host "  Encrypting secrets (SOPS + age)..."
+    try {
+        $migrateScript = Invoke-WebRequest -Uri "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/migrate-to-sops.ps1" -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
+        [System.IO.File]::WriteAllText("$PWD\migrate-to-sops.ps1", $migrateScript.Content, [System.Text.UTF8Encoding]::new($false))
+        $migratePSBin = (Get-Process -Id $PID).Path
+        if (-not $migratePSBin -or -not (Test-Path $migratePSBin)) {
+            $migratePSBin = if (Get-Command pwsh -ErrorAction SilentlyContinue) { "pwsh" } else { "powershell" }
+        }
+        $migrateProc = Start-Process -FilePath $migratePSBin -ArgumentList @("-NoProfile","-ExecutionPolicy","Bypass","-File",".\migrate-to-sops.ps1") -NoNewWindow -PassThru -Wait
+        if ($migrateProc.ExitCode -ne 0) {
+            Write-Host "  ⚠ SOPS migration failed — continuing with plaintext .env (run migrate-to-sops.ps1 manually later)" -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host "  ⚠ Could not fetch migrate-to-sops.ps1 — continuing with plaintext .env (run it manually later)" -ForegroundColor Yellow
+    }
 }
 
 Write-Host ""

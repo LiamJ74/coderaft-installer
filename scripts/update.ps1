@@ -693,7 +693,11 @@ if (-not $IsReexecChild) {
     # doesn't exist yet on disk, so it always "refreshes" and gets
     # written like any other refresh. The Scheduled Task self-heal
     # further down (-RegisterTask) is what then actually wires it in.
-    foreach ($name in @("update.ps1", "rollback.ps1", "check-caddy-cert.ps1")) {
+    # migrate-to-sops.ps1 (2026-11-04) added to this list for the same
+    # reason as check-caddy-cert.ps1 above: existing installs pre-dating
+    # auto-migration (below) don't have a local copy yet, so this always
+    # "refreshes" it like any other first-time fetch.
+    foreach ($name in @("update.ps1", "rollback.ps1", "check-caddy-cert.ps1", "migrate-to-sops.ps1")) {
         try {
             $url = "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/$name"
             # 2026-10-30 (chez Liam): check-caddy-cert.ps1 (largest of the
@@ -722,6 +726,30 @@ if (-not $IsReexecChild) {
         Start-Sleep -Seconds 1
         & $PSBin -NoProfile -ExecutionPolicy Bypass -File ".\update.ps1" -CoderaftReexec
         return  # not 'exit' — irm|iex runs this in the caller's own scope, so exit would close their whole shell
+    }
+}
+
+# ── SOPS+age migration (auto, existing installs) ───────────────────────────
+# Closes the gap where a server that installed before auto-migration shipped
+# (or whose install-time migration failed, see install.ps1's own version of
+# this same block) stays on plaintext .env forever: nothing previously
+# re-triggered the migration on later update.ps1 runs, and most customers
+# never knew migrate-to-sops.ps1 existed to run manually (reported
+# repeatedly, 2026-11-04). migrate-to-sops.ps1 is idempotent and now fully
+# non-interactive (no more gpg passphrase prompt), so it's safe to just run
+# it here whenever the encrypted file is still missing.
+#
+# Separate process, not an in-process `&` call: migrate-to-sops.ps1's own
+# Write-Fatal does `exit 1` on error, which in-process would tear down this
+# update.ps1 run too. Non-fatal either way: a failed migration here leaves
+# the already-working plaintext .env in place, same as every run before
+# this one.
+if ((Test-Path ".env") -and -not (Test-Path ".env.enc") -and (Test-Path ".\migrate-to-sops.ps1")) {
+    Write-Host ""
+    Write-Host "  Plaintext .env found with no .env.enc — encrypting (SOPS + age)..."
+    $migrateProc = Start-Process -FilePath $PSBin -ArgumentList @("-NoProfile","-ExecutionPolicy","Bypass","-File",".\migrate-to-sops.ps1") -NoNewWindow -PassThru -Wait
+    if ($migrateProc.ExitCode -ne 0) {
+        Write-Host "  ⚠ SOPS migration failed — continuing with plaintext .env (run migrate-to-sops.ps1 manually later)" -ForegroundColor Yellow
     }
 }
 

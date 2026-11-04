@@ -49,7 +49,7 @@ set -e
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.sh/install.sh.sha256 at all — today it still proxies
 # the legacy `coderaft-installer` repo.
-EXPECTED_SHA256="74299331ed5b14d033536608a995be32856f9ad402b762499e30d513817d42d2"
+EXPECTED_SHA256="53c18e726bf5e6c410f5d1f72179d4765e1666e481666a66fb2cd59776698b3a"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -2992,6 +2992,29 @@ else
         echo "  ✗ Image pull failed. Aborting install."
         echo "    Check Docker daemon, network connectivity, or GHCR auth."
         exit 1
+    fi
+
+    # ── SOPS+age migration (auto, first install) ───────────────────────────
+    # Encrypts the .env just generated above into .env.enc before the stack
+    # ever starts, so fresh installs never sit on plaintext secrets even
+    # transiently (2026-11-04: closes the gap where this was deferred to a
+    # manual, separate migrate-to-sops.sh run that most customers never knew
+    # to do). Reuses migrate-to-sops.sh itself (fetched fresh, same pattern
+    # as update.sh/rollback.sh above) instead of duplicating its backup/
+    # encrypt/verify logic -- non-interactive since the gpg prompt it used
+    # to have is gone. Non-fatal: a failed migration here leaves the
+    # already-working plaintext .env in place; dashboard-api's own fallback
+    # handles that, and the operator can re-run migrate-to-sops.sh manually.
+    if [ ! -f ".env.enc" ]; then
+        echo ""
+        echo "  Encrypting secrets (SOPS + age)..."
+        curl -fsSL --max-time 15 "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/migrate-to-sops.sh" -o migrate-to-sops.sh 2>/dev/null
+        if [ -s "migrate-to-sops.sh" ]; then
+            chmod +x migrate-to-sops.sh
+            bash migrate-to-sops.sh || echo "  ⚠ SOPS migration failed — continuing with plaintext .env (run migrate-to-sops.sh manually later)"
+        else
+            echo "  ⚠ Could not fetch migrate-to-sops.sh — continuing with plaintext .env (run it manually later)"
+        fi
     fi
 
     echo ""

@@ -246,7 +246,11 @@ fi
 if [ -z "$CODERAFT_UPDATE_REEXEC" ]; then
     echo "  Checking for script updates..."
     REFRESHED=0
-    for name in update.sh rollback.sh check-caddy-cert.sh; do
+    # migrate-to-sops.sh (2026-11-04) added to this list for the same reason
+    # as check-caddy-cert.sh above: existing installs pre-dating auto-
+    # migration (below) don't have a local copy yet, so this always
+    # "refreshes" it like any other first-time fetch.
+    for name in update.sh rollback.sh check-caddy-cert.sh migrate-to-sops.sh; do
         # --max-time 15: mirrors update.ps1's Invoke-WebRequest -TimeoutSec 15
         # for this same self-update fetch — bumped from 5s 2026-10-30 after
         # check-caddy-cert.sh's Windows sibling (check-caddy-cert.ps1, the
@@ -276,6 +280,24 @@ if [ -z "$CODERAFT_UPDATE_REEXEC" ]; then
         export CODERAFT_UPDATE_REEXEC=1
         exec bash ./update.sh "${ORIG_ARGS[@]}"
     fi
+fi
+
+# ── SOPS+age migration (auto, existing installs) ────────────────────────────
+# Closes the gap where a server that installed before auto-migration shipped
+# (or whose install-time migration failed, see install.sh's own version of
+# this same block) stays on plaintext .env forever: nothing previously
+# re-triggered the migration on later update.sh runs, and most customers
+# never knew migrate-to-sops.sh existed to run manually (reported
+# repeatedly, 2026-11-04). migrate-to-sops.sh is idempotent and now fully
+# non-interactive (no more gpg passphrase prompt), so it's safe to just run
+# it here whenever the encrypted file is still missing. `bash migrate-to-
+# sops.sh` already runs as a genuinely separate process (unlike PowerShell's
+# `&`), so its own `exit 1` on error can't tear down this update.sh run.
+if [ -f ".env" ] && [ ! -f ".env.enc" ] && [ -f "./migrate-to-sops.sh" ]; then
+    echo ""
+    echo "  Plaintext .env found with no .env.enc — encrypting (SOPS + age)..."
+    chmod +x ./migrate-to-sops.sh
+    bash ./migrate-to-sops.sh || echo "  ⚠ SOPS migration failed — continuing with plaintext .env (run migrate-to-sops.sh manually later)"
 fi
 
 # ── install-config.env helpers (see bootstrap near top of script, task #150) ─
