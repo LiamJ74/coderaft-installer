@@ -697,7 +697,17 @@ if (-not $IsReexecChild) {
     # reason as check-caddy-cert.ps1 above: existing installs pre-dating
     # auto-migration (below) don't have a local copy yet, so this always
     # "refreshes" it like any other first-time fetch.
-    foreach ($name in @("update.ps1", "rollback.ps1", "check-caddy-cert.ps1", "migrate-to-sops.ps1")) {
+    # vault-recover.ps1 (2026-11-17, found live chez Liam): this is the ONLY
+    # tool that can bring the vault back from sealed (no auto-unseal exists
+    # by design, AUDIT-SECU-2026-08-04 Vault H1) — exactly the moment an
+    # operator has the least patience for "go fetch a script from GitHub
+    # first." It was never added to this list, so any install that set up
+    # before vault-recover.ps1 existed (or that never happened to run it
+    # manually once) has no local copy sitting ready when a routine
+    # container restart reseals the vault and cascades into dashboard-api's
+    # degraded mode + dependent services crash-looping — the exact incident
+    # this list exists to prevent for the other three scripts.
+    foreach ($name in @("update.ps1", "rollback.ps1", "check-caddy-cert.ps1", "migrate-to-sops.ps1", "vault-recover.ps1")) {
         try {
             $url = "https://raw.githubusercontent.com/LiamJ74/coderaft-installer/master/scripts/$name"
             # 2026-10-30 (chez Liam): check-caddy-cert.ps1 (largest of the
@@ -1261,6 +1271,97 @@ if (Test-Path $composePathSelfUpdateRunner) {
     }
 }
 
+# ── Self-heal: docker-compose.yml missing coderaft-vault-pkcs11-sidecar ───
+# AUDIT-SECU-2026-11-17 (Vault H2 follow-up). Same line-based scan +
+# insertion-before-postgres: approach as coderaft-cve-proxy/self-update-
+# runner above — an install provisioned before this feature shipped has no
+# trace of this service until this self-heal (or a fresh install.ps1 run)
+# adds it. `profiles: ["pkcs11"]` keeps it from ever being started by a
+# plain `docker compose up -d` — only explicitly started below, and only
+# when keys.provider: pkcs11 is detected in vault-config/config.yaml.
+$composePathPkcs11Sidecar = Join-Path $INSTALL_DIR "docker-compose.yml"
+if (Test-Path $composePathPkcs11Sidecar) {
+    $pkcs11Lines = [System.IO.File]::ReadAllText($composePathPkcs11Sidecar, [System.Text.UTF8Encoding]::new($false)) -split "`r?`n"
+    $hasPkcs11Sidecar = $pkcs11Lines | Where-Object { $_ -match '^\s*coderaft-vault-pkcs11-sidecar:\s*$' }
+    $postgresLineIdx3 = -1
+    for ($i = 0; $i -lt $pkcs11Lines.Count; $i++) {
+        if ($pkcs11Lines[$i] -match '^\s*postgres:\s*$') { $postgresLineIdx3 = $i; break }
+    }
+    if (-not $hasPkcs11Sidecar -and $postgresLineIdx3 -ge 0) {
+        $bakPkcs11Sidecar = Join-Path $SELF_HEAL_BACKUP_DIR ((Split-Path -Leaf $composePathPkcs11Sidecar) + ".bak-pkcs11sidecar-" + (Get-Date -Format "yyyyMMddHHmmss"))
+        try { Copy-Item -LiteralPath $composePathPkcs11Sidecar -Destination $bakPkcs11Sidecar -Force -ErrorAction SilentlyContinue } catch {}
+        Invoke-RotateBackups -BasePath (Join-Path $SELF_HEAL_BACKUP_DIR (Split-Path -Leaf $composePathPkcs11Sidecar))
+        $pkcs11SidecarBlock = @(
+            "  # ── coderaft-vault-pkcs11-sidecar (AUDIT-SECU-2026-11-17 Vault H2) ──────"
+            "  # The ONLY thing that speaks real PKCS#11 to a hardware token (a YubiKey"
+            "  # PIV slot, in practice) — see coderaft-vault's internal/pkcs11sidecar"
+            "  # package doc. profiles: [pkcs11] keeps a normal docker compose up -d"
+            "  # from ever starting it — update.ps1/.sh run --profile pkcs11 up -d"
+            "  # explicitly, only when vault-config/config.yaml says keys.provider:"
+            "  # pkcs11. Unlike coderaft-cve-proxy, this image has a real shell and its"
+            "  # source lives in this ecosystem (coderaft-vault repo) — its secret uses"
+            "  # a real Docker secrets file, not a plaintext environment: value."
+            "  coderaft-vault-pkcs11-sidecar:"
+            "    image: ghcr.io/liamj74/coderaft-vault-pkcs11-sidecar:latest"
+            '    profiles: ["pkcs11"]'
+            "    networks:"
+            "      - coderaft-vault-net"
+            "    environment:"
+            "      - CODERAFT_PKCS11_PIN_FILE=/run/secrets/pkcs11_pin"
+            "    secrets:"
+            "      - pkcs11_pin"
+            "    volumes:"
+            "      - ./vault-tls/pkcs11-sidecar.crt:/tls/pkcs11-sidecar.crt:ro"
+            "      - ./vault-tls/pkcs11-sidecar.key:/tls/pkcs11-sidecar.key:ro"
+            "      - ./vault-tls/client-ca.crt:/tls/client-ca.crt:ro"
+            "    security_opt: [no-new-privileges:true]"
+            "    cap_drop: [ALL]"
+            "    mem_limit: 256m"
+            "    memswap_limit: 256m"
+            "    mem_reservation: 64m"
+            "    cpus: 1"
+            "    restart: unless-stopped"
+            ""
+        )
+        $before3 = if ($postgresLineIdx3 -gt 0) { $pkcs11Lines[0..($postgresLineIdx3 - 1)] } else { @() }
+        $after3  = $pkcs11Lines[$postgresLineIdx3..($pkcs11Lines.Count - 1)]
+        $merged3 = @($before3 + $pkcs11SidecarBlock + $after3)
+        [System.IO.File]::WriteAllText($composePathPkcs11Sidecar, ($merged3 -join "`n"), [System.Text.UTF8Encoding]::new($false))
+        Write-Host "  ✓ Self-heal docker-compose.yml — coderaft-vault-pkcs11-sidecar service added"
+        # Re-read after the service-block insertion below needs fresh content.
+        $pkcs11Lines = [System.IO.File]::ReadAllText($composePathPkcs11Sidecar, [System.Text.UTF8Encoding]::new($false)) -split "`r?`n"
+    }
+
+    # Top-level `secrets:` entry — separate anchor (`^secrets:\s*$`, column 0,
+    # never matches a service's own indented `secrets: [name]` reference
+    # list). Inserted as the first entry under that key; exact position
+    # among siblings doesn't matter to Compose.
+    $hasPkcs11PinSecret = $pkcs11Lines | Where-Object { $_ -match '^\s*pkcs11_pin:\s*$' }
+    $secretsLineIdx = -1
+    for ($i = 0; $i -lt $pkcs11Lines.Count; $i++) {
+        if ($pkcs11Lines[$i] -match '^secrets:\s*$') { $secretsLineIdx = $i; break }
+    }
+    if (-not $hasPkcs11PinSecret -and $secretsLineIdx -ge 0) {
+        $bakPkcs11Secret = Join-Path $SELF_HEAL_BACKUP_DIR ((Split-Path -Leaf $composePathPkcs11Sidecar) + ".bak-pkcs11secret-" + (Get-Date -Format "yyyyMMddHHmmss"))
+        try { Copy-Item -LiteralPath $composePathPkcs11Sidecar -Destination $bakPkcs11Secret -Force -ErrorAction SilentlyContinue } catch {}
+        Invoke-RotateBackups -BasePath (Join-Path $SELF_HEAL_BACKUP_DIR (Split-Path -Leaf $composePathPkcs11Sidecar))
+        $pkcs11SecretBlock = @(
+            "  # AUDIT-SECU-2026-11-17 (Vault H2 follow-up): only read by"
+            "  # coderaft-vault-pkcs11-sidecar, which is profiles:-gated — this file's"
+            "  # absence does not affect docker compose up -d/pull for anyone not using"
+            "  # keys.provider: pkcs11. No writer exists yet (no Setup Wizard step) —"
+            "  # enabling pkcs11 mode requires creating ./secrets/pkcs11_pin by hand."
+            "  pkcs11_pin:"
+            "    file: ./secrets/pkcs11_pin"
+        )
+        $before4 = $pkcs11Lines[0..$secretsLineIdx]
+        $after4  = if ($secretsLineIdx -lt $pkcs11Lines.Count - 1) { $pkcs11Lines[($secretsLineIdx + 1)..($pkcs11Lines.Count - 1)] } else { @() }
+        $merged4 = @($before4 + $pkcs11SecretBlock + $after4)
+        [System.IO.File]::WriteAllText($composePathPkcs11Sidecar, ($merged4 -join "`n"), [System.Text.UTF8Encoding]::new($false))
+        Write-Host "  ✓ Self-heal docker-compose.yml — pkcs11_pin secret entry added"
+    }
+}
+
 # ── Self-heal HOST_PROJECT_DIR in install-config.env ──────────────────────
 # Older oneliners (and any install where the dir was renamed/moved) leave
 # it without HOST_PROJECT_DIR, which causes:
@@ -1409,6 +1510,14 @@ if (-not $composeOK) {
             Write-Host "  ⚠  Docker command timed out after 60s: docker compose ps" -ForegroundColor Yellow
             try { $psHealProc.Kill() } catch {}
         }
+        # Captured for the final error message below (2026-11-17, found live
+        # chez Liam): a sealed vault — it always boots sealed, no auto-unseal,
+        # AUDIT-SECU-2026-08-04 Vault H1 — cascades into exactly this failure
+        # shape (dashboard-api stuck in vault-recovery mode, never regenerates
+        # override.yml, dependent containers crash-loop) but the generic
+        # message below used to blame override.yml, sending the operator to
+        # inspect a file that was never the problem.
+        $psHealOutContent = if (Test-Path $psHealOut) { Get-Content $psHealOut -Raw -ErrorAction SilentlyContinue } else { "" }
         Remove-Item -Path $psHealOut,$psHealErr -ErrorAction SilentlyContinue
 
         # B27 (2026-10-23): a single `docker compose ps` run right after
@@ -1438,6 +1547,7 @@ if (-not $composeOK) {
                     Write-Host "  ⚠  Docker command timed out after 60s: docker compose ps" -ForegroundColor Yellow
                     try { $psHealProc.Kill() } catch {}
                 }
+                $psHealOutContent = if (Test-Path $psHealOut) { Get-Content $psHealOut -Raw -ErrorAction SilentlyContinue } else { "" }
                 Remove-Item -Path $psHealOut,$psHealErr -ErrorAction SilentlyContinue
             }
         }
@@ -1457,6 +1567,17 @@ if (-not $composeOK) {
             # problem, it would just leave the operator's licensed products
             # un-updated for no benefit. Warn and keep going.
             Write-Host "    ⚠  compose repaired (dashboard-api confirmed via logs) but 'docker compose ps' is still failing — continuing anyway; verify manually: docker compose ps" -ForegroundColor Yellow
+        } elseif ($psHealOutContent -match "(?i)vault.*\(unhealthy\)") {
+            # See this block's capture of $psHealOutContent above: a sealed
+            # vault produces exactly this failure shape (dashboard-api never
+            # confirms its own self-heal, 'docker compose ps' keeps failing)
+            # with docker-compose.override.yml being perfectly fine the whole
+            # time — don't send the operator to inspect a file that was never
+            # the problem.
+            Write-Host "  ERROR: self-heal failed — coderaft-vault is sealed (it always boots sealed, by design," -ForegroundColor Red
+            Write-Host "    no auto-unseal) and nobody has run the unseal ceremony since its last restart." -ForegroundColor Red
+            Write-Host "    Run .\vault-recover.ps1, then re-run this update." -ForegroundColor Red
+            return  # not 'exit' — irm|iex runs this in the caller's own scope, so exit would close their whole shell
         } else {
             Write-Host "  ERROR: self-heal failed. Inspect docker-compose.override.yml manually."
             return  # not 'exit' — irm|iex runs this in the caller's own scope, so exit would close their whole shell
@@ -2147,6 +2268,156 @@ $chmodExtra
     Remove-Item -Path $runStdout, $runStderr, $scriptFile -ErrorAction SilentlyContinue
     if (-not $proc -or $proc.ExitCode -ne 0 -or -not (Test-Path $certPath)) {
         Write-DetailLog "[update] Cert self-heal: $Name-client generation failed (non-fatal, retried next run)"
+    }
+}
+
+# AUDIT-SECU-2026-11-17 (Vault H2 follow-up): same shape as
+# Invoke-VaultClientCertSelfHeal above, for the ONE server cert that needs
+# healing here (coderaft-vault-pkcs11-sidecar's own). Hardcoded name/SAN
+# (there is only one such cert) and chmod 600, not 644 — treated like
+# vault.crt/key (a server cert), not a product client cert.
+function Invoke-VaultServerCertSelfHeal {
+    param(
+        [Parameter(Mandatory = $true)][string]$InstallDir
+    )
+
+    $tlsDir = Join-Path $InstallDir "vault-tls"
+    $certPath = Join-Path $tlsDir "pkcs11-sidecar.crt"
+    $keyPath = Join-Path $tlsDir "pkcs11-sidecar.key"
+    if ((Test-Path $certPath) -and -not (Test-Path $certPath -PathType Leaf)) {
+        Write-DetailLog "[update] Cert self-heal: $certPath is a directory (stale empty bind-mount artifact), not a cert — removing so it can be regenerated"
+        Remove-Item -LiteralPath $certPath -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if ((Test-Path $keyPath) -and -not (Test-Path $keyPath -PathType Leaf)) {
+        Remove-Item -LiteralPath $keyPath -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if (Test-Path $certPath -PathType Leaf) { return }
+
+    $caKey = Join-Path $tlsDir "client-ca.key"
+    $caCrt = Join-Path $tlsDir "client-ca.crt"
+    if (-not (Test-Path $caKey) -or -not (Test-Path $caCrt)) {
+        Write-Host "  [update] Cert self-heal: vault-tls\client-ca.key missing — cannot mint pkcs11-sidecar cert (needs a full CA rotation, not a self-heal)"
+        return
+    }
+
+    Write-DetailLog "[update] Cert self-heal: generating vault-tls\pkcs11-sidecar (was missing)"
+    $script = @'
+set -e
+apk add --no-cache openssl >/dev/null
+cd /work
+openssl req -newkey rsa:2048 -nodes -sha256 \
+    -keyout pkcs11-sidecar.key -out pkcs11-sidecar.csr \
+    -subj "/CN=coderaft-vault-pkcs11-sidecar" 2>/dev/null
+printf 'subjectAltName=DNS:coderaft-vault-pkcs11-sidecar\nbasicConstraints=CA:FALSE' > /tmp/pkcs11.ext
+openssl x509 -req -days 3650 -sha256 \
+    -in pkcs11-sidecar.csr -CA client-ca.crt -CAkey client-ca.key -CAcreateserial \
+    -out pkcs11-sidecar.crt -extfile /tmp/pkcs11.ext 2>/dev/null
+rm -f pkcs11-sidecar.csr /tmp/pkcs11.ext
+chmod 600 pkcs11-sidecar.key pkcs11-sidecar.crt
+'@
+    $scriptFile = Join-Path $env:TEMP "coderaft-cert-selfheal-$(Get-Random).sh"
+    $scriptLF = $script -replace "`r`n", "`n"
+    [System.IO.File]::WriteAllText($scriptFile, $scriptLF, [System.Text.UTF8Encoding]::new($false))
+
+    $runStdout = Join-Path $env:TEMP "coderaft-cert-selfheal-out-$(Get-Random).log"
+    $runStderr = Join-Path $env:TEMP "coderaft-cert-selfheal-err-$(Get-Random).log"
+    $absTlsDir = (Resolve-Path -LiteralPath $tlsDir).Path
+    $proc = Start-Process -FilePath "docker" -ArgumentList @(
+        "run","--rm",
+        "-v","${scriptFile}:/script.sh:ro",
+        "-v","${absTlsDir}:/work",
+        "alpine:3.20","sh","/script.sh"
+    ) -NoNewWindow -Wait -PassThru `
+        -RedirectStandardOutput $runStdout `
+        -RedirectStandardError $runStderr `
+        -ErrorAction SilentlyContinue
+    Remove-Item -Path $runStdout, $runStderr, $scriptFile -ErrorAction SilentlyContinue
+    if (-not $proc -or $proc.ExitCode -ne 0 -or -not (Test-Path $certPath)) {
+        Write-DetailLog "[update] Cert self-heal: pkcs11-sidecar generation failed (non-fatal, retried next run)"
+    }
+}
+
+# AUDIT-SECU-2026-11-17 (Vault H2 follow-up — Windows is the priority
+# deployment target for this feature, see feedback_windows_is_default_
+# priority_platform memory). Attaches a YubiKey's USB device into the WSL2
+# VM Docker Desktop backs onto, via Microsoft's own usbipd-win tool, so
+# coderaft-vault-pkcs11-sidecar's container sees it as a normal Linux USB
+# device. Liam: fully automatic, silent — no prompts, no confirmation gate
+# — including the scheduled-task persistence below, explicitly confirmed
+# (2026-11-17) as its own decision, separate from the rest of this
+# automation. Every step is non-fatal: the sidecar container still starts
+# regardless, and simply can't reach the token yet — PKCS11Sealer.
+# Reconstruct fails cleanly (vault stays sealed) until a later run (or the
+# scheduled task, after a reboot) succeeds.
+function Invoke-YubiKeyUsbAttach {
+    if (-not (Get-Command usbipd -ErrorAction SilentlyContinue)) {
+        Write-DetailLog "[update] usbipd-win not found — installing via winget..."
+        try {
+            Start-Process -FilePath "winget" -ArgumentList @(
+                "install", "--id", "dorssel.usbipd-win", "-e", "--silent",
+                "--accept-package-agreements", "--accept-source-agreements"
+            ) -NoNewWindow -Wait -ErrorAction Stop
+        } catch {
+            Write-DetailLog "[update] usbipd-win install via winget failed: $($_.Exception.Message) — YubiKey USB attach skipped this run"
+            return
+        }
+        if (-not (Get-Command usbipd -ErrorAction SilentlyContinue)) {
+            Write-DetailLog "[update] usbipd-win still not on PATH after install attempt — YubiKey USB attach skipped this run (may need a fresh shell for PATH to refresh)"
+            return
+        }
+    }
+
+    $listOut = Join-Path $env:TEMP "coderaft-usbipd-list-$(Get-Random).log"
+    Start-Process -FilePath "usbipd" -ArgumentList @("list") -NoNewWindow -Wait -RedirectStandardOutput $listOut -ErrorAction SilentlyContinue | Out-Null
+    $listContent = if (Test-Path $listOut) { Get-Content $listOut -ErrorAction SilentlyContinue } else { @() }
+    Remove-Item -Path $listOut -ErrorAction SilentlyContinue
+
+    # Yubico's USB vendor ID is 1050 (confirmed official, every YubiKey
+    # model) — match on VID alone; PID varies by which USB interfaces
+    # (OTP/FIDO/CCID) are enabled on the key, not worth enumerating.
+    $yubiLine = $listContent | Where-Object { $_ -match '(?i)\b1050:[0-9a-f]{4}\b' } | Select-Object -First 1
+    if (-not $yubiLine) {
+        Write-DetailLog "[update] No YubiKey detected via 'usbipd list' — USB attach skipped this run"
+        return
+    }
+    $busId = ($yubiLine.Trim() -split '\s+')[0]
+    if (-not $busId) { return }
+
+    if ($yubiLine -notmatch '(?i)Shared') {
+        Start-Process -FilePath "usbipd" -ArgumentList @("bind", "--busid", $busId) -NoNewWindow -Wait -ErrorAction SilentlyContinue | Out-Null
+    }
+    Start-Process -FilePath "usbipd" -ArgumentList @("attach", "--wsl", "--busid", $busId, "--auto-attach") -NoNewWindow -ErrorAction SilentlyContinue | Out-Null
+    Write-DetailLog "[update] YubiKey (busid $busId) bound + attached to WSL2"
+
+    # Persistence across reboots (explicitly confirmed with Liam,
+    # 2026-11-17 — not inferred from the general "automatic/silent"
+    # answer): `usbipd attach --auto-attach` only keeps re-attaching while
+    # ITS OWN process keeps running, which a one-shot update.ps1 invocation
+    # does not survive past this run. Same exact pattern as check-caddy-
+    # cert.ps1's Register-CaddyCertWatchdogTask (RunLevel Highest, current
+    # interactive user, not SYSTEM — Docker Desktop's engine pipe is scoped
+    # to that session, already live in prod for every customer since
+    # 2026-08-13) — idempotent: always refresh the action (busid can change
+    # if the key moves USB ports).
+    $taskName = "CoderaftYubiKeyUsbAttach"
+    $taskPath = "\CodeRaft\"
+    try {
+        $action = New-ScheduledTaskAction -Execute "usbipd" -Argument "attach --wsl --busid $busId --auto-attach"
+        $existingTask = Get-ScheduledTask -TaskName $taskName -TaskPath $taskPath -ErrorAction SilentlyContinue
+        if ($existingTask) {
+            Set-ScheduledTask -TaskName $taskName -TaskPath $taskPath -Action $action -ErrorAction Stop | Out-Null
+            Write-DetailLog "[update] $taskName scheduled task already present (action refreshed for busid $busId)"
+        } else {
+            $trigger = New-ScheduledTaskTrigger -AtStartup
+            $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+            $principal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Highest
+            Register-ScheduledTask -TaskName $taskName -TaskPath $taskPath -Action $action -Trigger $trigger -Principal $principal `
+                -Description "CodeRaft: re-attaches the YubiKey to Docker Desktop's WSL2 VM at boot (keys.provider: pkcs11 — AUDIT-SECU-2026-11-17 Vault H2)." `
+                -Force -ErrorAction Stop | Out-Null
+            Write-DetailLog "[update] $taskName scheduled task registered (at startup, user: $currentUser, busid $busId)"
+        }
+    } catch {
+        Write-DetailLog "[update] Could not register/refresh $taskName scheduled task: $($_.Exception.Message) — USB attach will need a manual re-run after a reboot until this succeeds"
     }
 }
 
@@ -3223,6 +3494,7 @@ Invoke-CveProxyAclSelfHeal -AclPath (Join-Path $INSTALL_DIR "vault-config\acl.ya
 Invoke-VaultAclLiveSelfHeal -InstallDir $INSTALL_DIR -Name "cve-proxy" -San "cve-proxy.coderaft.local" -Permissions @(
     "read:cve-proxy/*", "write:cve-proxy/*"
 )
+Invoke-VaultServerCertSelfHeal -InstallDir $INSTALL_DIR
 Write-Host "  ✓ Vault ACL / PKI provisioning OK (detail: $UPDATE_LOG)"
 
 # ── Banking-grade plaintext .env handling ─────────────────────────────────
@@ -4205,6 +4477,34 @@ if ($LASTEXITCODE -ne 0) {
 if ($LASTEXITCODE -ne 0) {
     Write-Host "  ERROR: docker compose up coderaft-vault failed."
     return
+}
+
+# ── AUDIT-SECU-2026-11-17 (Vault H2 follow-up): PKCS#11 sidecar ──────────
+# coderaft-vault-pkcs11-sidecar is profiles:-gated (see the self-heal
+# above) — $servicesToForceRecreate above already never touches it (a plain
+# `docker compose config --services`, no --profile flag, excludes
+# profile-gated services by default; confirmed empirically). Start it only
+# when vault-config/config.yaml actually says keys.provider: pkcs11; stop
+# it if config has since moved away from pkcs11 (never `rm`, so switching
+# back later doesn't need a fresh container).
+$vaultConfigPath = Join-Path $INSTALL_DIR "vault-config\config.yaml"
+$vaultKeyProvider = "shamir"
+if (Test-Path $vaultConfigPath) {
+    $vaultConfigText = [System.IO.File]::ReadAllText($vaultConfigPath, [System.Text.UTF8Encoding]::new($false))
+    $providerMatch = [regex]::Match($vaultConfigText, '(?m)^\s*provider:\s*(\S+)\s*$')
+    if ($providerMatch.Success) { $vaultKeyProvider = $providerMatch.Groups[1].Value }
+}
+if ($vaultKeyProvider -eq "pkcs11") {
+    Invoke-YubiKeyUsbAttach
+    & docker @ComposeArgs --profile pkcs11 up -d coderaft-vault-pkcs11-sidecar
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  ⚠  docker compose up coderaft-vault-pkcs11-sidecar failed — vault stays sealed in pkcs11 mode until this is retried" -ForegroundColor Yellow
+    }
+} else {
+    $pkcs11Running = (docker @ComposeArgs --profile pkcs11 ps -q coderaft-vault-pkcs11-sidecar 2>$null)
+    if ($pkcs11Running) {
+        & docker @ComposeArgs --profile pkcs11 stop coderaft-vault-pkcs11-sidecar
+    }
 }
 
 # ── #137 fix: refresh certs/server-ca.pem — Caddy TLS mode-aware (#187) ──

@@ -250,7 +250,18 @@ if [ -z "$CODERAFT_UPDATE_REEXEC" ]; then
     # as check-caddy-cert.sh above: existing installs pre-dating auto-
     # migration (below) don't have a local copy yet, so this always
     # "refreshes" it like any other first-time fetch.
-    for name in update.sh rollback.sh check-caddy-cert.sh migrate-to-sops.sh; do
+    # vault-recover.sh (2026-11-17, found live chez Liam, ported from
+    # update.ps1's same-day fix): this is the ONLY tool that can bring the
+    # vault back from sealed (no auto-unseal exists by design, AUDIT-SECU-
+    # 2026-08-04 Vault H1) — exactly the moment an operator has the least
+    # patience for "go fetch a script from GitHub first." It was never added
+    # to this list, so any install that set up before vault-recover.sh
+    # existed (or that never happened to run it manually once) has no local
+    # copy sitting ready when a routine container restart reseals the vault
+    # and cascades into dashboard-api's degraded mode + dependent services
+    # crash-looping — the exact incident this list exists to prevent for the
+    # other three scripts.
+    for name in update.sh rollback.sh check-caddy-cert.sh migrate-to-sops.sh vault-recover.sh; do
         # --max-time 15: mirrors update.ps1's Invoke-WebRequest -TimeoutSec 15
         # for this same self-update fetch — bumped from 5s 2026-10-30 after
         # check-caddy-cert.sh's Windows sibling (check-caddy-cert.ps1, the
@@ -700,6 +711,105 @@ SELFUPDATERUNNERBLOCK
     rm -f "$_selfupdaterunner_blockfile"
 fi
 
+# ── Self-heal: docker-compose.yml missing coderaft-vault-pkcs11-sidecar ───
+# AUDIT-SECU-2026-11-17 (Vault H2 follow-up). Same detection +
+# insertion-before-`postgres:` approach as coderaft-cve-proxy/self-update-
+# runner above — an install provisioned before this feature shipped has no
+# trace of this service until this self-heal (or a fresh install.sh run)
+# adds it. profiles: [pkcs11] keeps it from ever being started by a plain
+# `docker compose up -d` — only explicitly started above, and only when
+# keys.provider: pkcs11 is detected in vault-config/config.yaml.
+if [ -f "$COMPOSE_PATH" ] && ! grep -qE '^[[:space:]]*coderaft-vault-pkcs11-sidecar:[[:space:]]*$' "$COMPOSE_PATH" \
+   && grep -qE '^[[:space:]]*postgres:[[:space:]]*$' "$COMPOSE_PATH"; then
+    cp "$COMPOSE_PATH" "$SELF_HEAL_BACKUP_DIR/$(basename "$COMPOSE_PATH").bak-pkcs11sidecar-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    _rotate_backups "$SELF_HEAL_BACKUP_DIR/$(basename "$COMPOSE_PATH")"
+    _pkcs11sidecar_blockfile="$(mktemp "${TMPDIR:-/tmp}/coderaft-pkcs11sidecar-block.XXXXXX")"
+    cat <<'PKCS11SIDECARBLOCK' > "$_pkcs11sidecar_blockfile"
+  # ── coderaft-vault-pkcs11-sidecar (AUDIT-SECU-2026-11-17 Vault H2) ──────
+  # The ONLY thing that speaks real PKCS#11 to a hardware token (a YubiKey
+  # PIV slot, in practice) — see coderaft-vault's internal/pkcs11sidecar
+  # package doc. profiles: [pkcs11] keeps a normal docker compose up -d from
+  # ever starting it — update.sh/.ps1 run --profile pkcs11 up -d explicitly,
+  # only when vault-config/config.yaml says keys.provider: pkcs11. Unlike
+  # coderaft-cve-proxy, this image has a real shell and its source lives in
+  # this ecosystem (coderaft-vault repo) — its secret uses a real Docker
+  # secrets file, not a plaintext environment: value.
+  coderaft-vault-pkcs11-sidecar:
+    image: ghcr.io/liamj74/coderaft-vault-pkcs11-sidecar:latest
+    profiles: ["pkcs11"]
+    networks:
+      - coderaft-vault-net
+    environment:
+      - CODERAFT_PKCS11_PIN_FILE=/run/secrets/pkcs11_pin
+    secrets:
+      - pkcs11_pin
+    volumes:
+      - ./vault-tls/pkcs11-sidecar.crt:/tls/pkcs11-sidecar.crt:ro
+      - ./vault-tls/pkcs11-sidecar.key:/tls/pkcs11-sidecar.key:ro
+      - ./vault-tls/client-ca.crt:/tls/client-ca.crt:ro
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    mem_limit: 256m
+    memswap_limit: 256m
+    mem_reservation: 64m
+    cpus: 1
+    restart: unless-stopped
+
+PKCS11SIDECARBLOCK
+    if awk -v blockfile="$_pkcs11sidecar_blockfile" '
+        /^[[:space:]]*postgres:[[:space:]]*$/ && !done {
+            while ((getline line < blockfile) > 0) print line
+            close(blockfile)
+            done = 1
+        }
+        { print }
+    ' "$COMPOSE_PATH" > "$COMPOSE_PATH.tmp" && mv "$COMPOSE_PATH.tmp" "$COMPOSE_PATH"; then
+        echo "  ✓ Self-heal docker-compose.yml — coderaft-vault-pkcs11-sidecar service added"
+    else
+        echo "  ⚠ Self-heal docker-compose.yml — coderaft-vault-pkcs11-sidecar insertion failed (awk/mv error), compose file left unchanged" >&2
+        rm -f "$COMPOSE_PATH.tmp"
+    fi
+    rm -f "$_pkcs11sidecar_blockfile"
+fi
+
+# Top-level `secrets:` entry — separate anchor (`^secrets:$`, column 0, never
+# matches a service's own indented `secrets: [name]` reference list).
+# Inserted right after that key; exact position among siblings doesn't
+# matter to Compose. Confirmed empirically: this file's absence does not
+# affect `docker compose up -d`/`pull` for anyone not using keys.provider:
+# pkcs11 (the sidecar that reads it is profiles:-gated).
+if [ -f "$COMPOSE_PATH" ] && ! grep -qE '^[[:space:]]*pkcs11_pin:[[:space:]]*$' "$COMPOSE_PATH" \
+   && grep -qE '^secrets:[[:space:]]*$' "$COMPOSE_PATH"; then
+    cp "$COMPOSE_PATH" "$SELF_HEAL_BACKUP_DIR/$(basename "$COMPOSE_PATH").bak-pkcs11secret-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    _rotate_backups "$SELF_HEAL_BACKUP_DIR/$(basename "$COMPOSE_PATH")"
+    _pkcs11secret_blockfile="$(mktemp "${TMPDIR:-/tmp}/coderaft-pkcs11secret-block.XXXXXX")"
+    cat <<'PKCS11SECRETBLOCK' > "$_pkcs11secret_blockfile"
+  # AUDIT-SECU-2026-11-17 (Vault H2 follow-up): only read by
+  # coderaft-vault-pkcs11-sidecar, which is profiles:-gated — this file's
+  # absence does not affect docker compose up -d/pull for anyone not using
+  # keys.provider: pkcs11. No writer exists yet (no Setup Wizard step) —
+  # enabling pkcs11 mode requires creating ./secrets/pkcs11_pin by hand.
+  pkcs11_pin:
+    file: ./secrets/pkcs11_pin
+PKCS11SECRETBLOCK
+    if awk -v blockfile="$_pkcs11secret_blockfile" '
+        /^secrets:[[:space:]]*$/ && !done {
+            print
+            while ((getline line < blockfile) > 0) print line
+            close(blockfile)
+            done = 1
+            next
+        }
+        { print }
+    ' "$COMPOSE_PATH" > "$COMPOSE_PATH.tmp" && mv "$COMPOSE_PATH.tmp" "$COMPOSE_PATH"; then
+        echo "  ✓ Self-heal docker-compose.yml — pkcs11_pin secret entry added"
+    else
+        echo "  ⚠ Self-heal docker-compose.yml — pkcs11_pin secret insertion failed (awk/mv error), compose file left unchanged" >&2
+        rm -f "$COMPOSE_PATH.tmp"
+    fi
+    rm -f "$_pkcs11secret_blockfile"
+fi
+
 # ── Self-heal: dashboard-api tmpfs for the ephemeral working .env (#148) ──
 # Banking-grade runtime exposure reduction (2026-07-31): the *working* .env
 # (resolved secret VALUES, passed to `docker compose --env-file`) moves off
@@ -917,8 +1027,23 @@ if ! docker compose "${COMPOSE_ENV_ARGS[@]}" ps >/dev/null 2>&1; then
     docker compose "${COMPOSE_ENV_ARGS[@]}" up -d postgres redis >/dev/null 2>&1
     if docker compose "${COMPOSE_ENV_ARGS[@]}" up -d --force-recreate --no-deps dashboard-api >/dev/null 2>&1; then
         sleep 6
-        if docker compose "${COMPOSE_ENV_ARGS[@]}" ps >/dev/null 2>&1; then
+        # Captured instead of discarded (2026-11-17, found live chez Liam,
+        # ported from update.ps1's same-day fix): a sealed vault — it always
+        # boots sealed, no auto-unseal, AUDIT-SECU-2026-08-04 Vault H1 —
+        # cascades into exactly this failure shape (dashboard-api stuck in
+        # vault-recovery mode, never regenerates override.yml, dependent
+        # containers crash-loop) but the generic branch below used to blame
+        # override.yml, sending the operator to inspect a file that was
+        # never the problem.
+        HEAL_PS_OUTPUT=$(docker compose "${COMPOSE_ENV_ARGS[@]}" ps 2>/dev/null)
+        HEAL_PS_STATUS=$?
+        if [ "$HEAL_PS_STATUS" -eq 0 ]; then
             echo "    ✓ compose repaired"
+        elif echo "$HEAL_PS_OUTPUT" | grep -qiE "vault.*\(unhealthy\)"; then
+            echo "  ERROR: self-heal failed — coderaft-vault is sealed (it always boots sealed, by design,"
+            echo "    no auto-unseal) and nobody has run the unseal ceremony since its last restart."
+            echo "    Run ./vault-recover.sh, then re-run this update."
+            exit 1
         else
             echo "  ERROR: self-heal failed. Inspect docker-compose.override.yml manually."
             exit 1
@@ -1619,6 +1744,57 @@ _vault_client_cert_selfheal() {
                     -out '${name}-client.crt' -extfile /tmp/client.ext 2>/dev/null
                 rm -f '${name}-client.csr' /tmp/client.ext
                 chmod 644 '${name}-client.key' '${name}-client.crt'
+            " 2>&1
+    fi
+}
+
+# AUDIT-SECU-2026-11-17 (Vault H2 follow-up): same shape as
+# _vault_client_cert_selfheal above, for the ONE server cert that needs
+# healing here (coderaft-vault-pkcs11-sidecar's own). Hardcoded name/SAN
+# (there is only one such cert) and chmod 600, not 644 — treated like
+# vault.crt/key (a server cert), not a product client cert.
+_vault_server_cert_selfheal() {
+    local tls_dir="${INSTALL_DIR}/vault-tls"
+
+    if [ -f "${tls_dir}/pkcs11-sidecar.crt" ]; then
+        return 0
+    fi
+    if [ ! -f "${tls_dir}/client-ca.key" ] || [ ! -f "${tls_dir}/client-ca.crt" ]; then
+        echo "  [update] Cert self-heal: ${tls_dir}/client-ca.key missing — cannot mint pkcs11-sidecar cert (needs a full CA rotation, not a self-heal)"
+        return 0
+    fi
+
+    echo "  [update] Cert self-heal: generating vault-tls/pkcs11-sidecar (was missing)"
+    if command -v openssl &>/dev/null; then
+        ( cd "$tls_dir" && \
+          openssl req -newkey rsa:2048 -nodes -sha256 \
+              -keyout pkcs11-sidecar.key -out pkcs11-sidecar.csr \
+              -subj "/CN=coderaft-vault-pkcs11-sidecar" 2>/dev/null && \
+          openssl x509 -req -days 3650 -sha256 \
+              -in pkcs11-sidecar.csr -CA client-ca.crt -CAkey client-ca.key -CAcreateserial \
+              -out pkcs11-sidecar.crt \
+              -extfile <(printf "subjectAltName=DNS:coderaft-vault-pkcs11-sidecar\nbasicConstraints=CA:FALSE") \
+              2>/dev/null && \
+          rm -f pkcs11-sidecar.csr && \
+          chmod 600 pkcs11-sidecar.key pkcs11-sidecar.crt )
+    else
+        local abs_tls_dir
+        abs_tls_dir="$(cd "$tls_dir" && pwd)"
+        docker run --rm -i \
+            -v "${abs_tls_dir}:/work" \
+            alpine:3.20 sh -c "
+                set -e
+                apk add --no-cache openssl >/dev/null
+                cd /work
+                openssl req -newkey rsa:2048 -nodes -sha256 \
+                    -keyout pkcs11-sidecar.key -out pkcs11-sidecar.csr \
+                    -subj '/CN=coderaft-vault-pkcs11-sidecar' 2>/dev/null
+                printf 'subjectAltName=DNS:coderaft-vault-pkcs11-sidecar\nbasicConstraints=CA:FALSE' > /tmp/pkcs11.ext
+                openssl x509 -req -days 3650 -sha256 \
+                    -in pkcs11-sidecar.csr -CA client-ca.crt -CAkey client-ca.key -CAcreateserial \
+                    -out pkcs11-sidecar.crt -extfile /tmp/pkcs11.ext 2>/dev/null
+                rm -f pkcs11-sidecar.csr /tmp/pkcs11.ext
+                chmod 600 pkcs11-sidecar.key pkcs11-sidecar.crt
             " 2>&1
     fi
 }
@@ -2380,6 +2556,7 @@ _vault_acl_live_selfheal "redfox" "redfox.coderaft.local" \
 _vault_client_cert_selfheal "falconone" "falconone.coderaft.local"
 _vault_client_cert_selfheal "cve-proxy" "cve-proxy.coderaft.local"
 _cveproxy_acl_selfheal "${INSTALL_DIR}/vault-config/acl.yaml"
+_vault_server_cert_selfheal
 _vault_acl_live_selfheal "cve-proxy" "cve-proxy.coderaft.local" \
     "read:cve-proxy/*" "write:cve-proxy/*"
 
@@ -3074,6 +3251,34 @@ if docker compose "${COMPOSE_ARGS[@]}" pull; then
     done < <(docker compose "${COMPOSE_ARGS[@]}" config --services 2>/dev/null | grep -v '^coderaft-vault$')
     docker compose "${COMPOSE_ARGS[@]}" up -d --force-recreate --remove-orphans "${_services_to_force_recreate[@]}"
     docker compose "${COMPOSE_ARGS[@]}" up -d coderaft-vault
+
+    # ── AUDIT-SECU-2026-11-17 (Vault H2 follow-up): PKCS#11 sidecar ──────
+    # coderaft-vault-pkcs11-sidecar is profiles:-gated (see the self-heal
+    # below) — ${_services_to_force_recreate} above already never includes
+    # it (a plain `docker compose config --services`, no --profile flag,
+    # excludes profile-gated services by default; confirmed empirically).
+    # Start it only when vault-config/config.yaml actually says
+    # keys.provider: pkcs11; stop it if config has since moved away from
+    # pkcs11 (never `rm`, so switching back later doesn't need a fresh
+    # container). No USB attach step needed here unlike update.ps1 — a
+    # native Linux host sees the device directly, no Docker-Desktop-VM
+    # passthrough layer to bridge.
+    _vault_key_provider="shamir"
+    _vault_config_yaml="${INSTALL_DIR}/vault-config/config.yaml"
+    if [ -f "$_vault_config_yaml" ]; then
+        _provider_line=$(grep -E '^[[:space:]]*provider:[[:space:]]*' "$_vault_config_yaml" | head -1)
+        if [ -n "$_provider_line" ]; then
+            _vault_key_provider=$(echo "$_provider_line" | sed -E 's/^[[:space:]]*provider:[[:space:]]*//' | tr -d '[:space:]')
+        fi
+    fi
+    if [ "$_vault_key_provider" = "pkcs11" ]; then
+        docker compose "${COMPOSE_ARGS[@]}" --profile pkcs11 up -d coderaft-vault-pkcs11-sidecar || \
+            echo "  [warn] docker compose up coderaft-vault-pkcs11-sidecar failed — vault stays sealed in pkcs11 mode until this is retried"
+    else
+        if docker compose "${COMPOSE_ARGS[@]}" --profile pkcs11 ps -q coderaft-vault-pkcs11-sidecar 2>/dev/null | grep -q .; then
+            docker compose "${COMPOSE_ARGS[@]}" --profile pkcs11 stop coderaft-vault-pkcs11-sidecar
+        fi
+    fi
 fi
 
 # ── Post-update healthcheck ───────────────────────────────────────────────

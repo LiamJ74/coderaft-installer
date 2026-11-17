@@ -48,7 +48,7 @@ $ErrorActionPreference = 'Stop'
 # to make the public `install.coderaft.io` endpoint actually serve this
 # monorepo's install.ps1/install.ps1.sha256 at all — today it still
 # proxies the legacy `coderaft-installer` repo.
-$CoderaftExpectedSha256 = "82d5f5bc1d4dd5931488657b92a6605d277130841e68b28d87d8fcf1804e853b"
+$CoderaftExpectedSha256 = "bc80fb2450aa1f9e045ded005152563a1c2ece3cc2c7ec2fd801a55265999fb3"
 
 # CODERAFT_INSTALL_SHA256_URL is overridable purely so this mechanism can be
 # tested end-to-end against a throwaway local HTTP server instead of the
@@ -1089,6 +1089,21 @@ openssl x509 -req -days 3650 -sha256 \
     -in vault.csr -CA client-ca.crt -CAkey client-ca.key -CAcreateserial \
     -out vault.crt -extfile /tmp/server.ext 2>/dev/null
 rm -f vault.csr /tmp/server.ext
+# PKCS#11 sidecar server cert (Vault H2 follow-up): coderaft-vault-pkcs11-sidecar
+# terminates its own mTLS, same CA, single SAN (its own service name on the
+# Docker network — no localhost/127.0.0.1 needed, nothing dials it that way,
+# unlike vault.crt's self-ping healthcheck).
+openssl req -newkey rsa:2048 -nodes -sha256 \
+    -keyout pkcs11-sidecar.key -out pkcs11-sidecar.csr \
+    -subj "/CN=coderaft-vault-pkcs11-sidecar" 2>/dev/null
+cat > /tmp/pkcs11.ext <<EOF
+subjectAltName=DNS:coderaft-vault-pkcs11-sidecar
+basicConstraints=CA:FALSE
+EOF
+openssl x509 -req -days 3650 -sha256 \
+    -in pkcs11-sidecar.csr -CA client-ca.crt -CAkey client-ca.key -CAcreateserial \
+    -out pkcs11-sidecar.crt -extfile /tmp/pkcs11.ext 2>/dev/null
+rm -f pkcs11-sidecar.csr /tmp/pkcs11.ext
 # Per-product client certs
 for pair in "dashboard-api:dashboard-api.coderaft.local" \
             "entraguard:entraguard.coderaft.local" \
@@ -1174,7 +1189,17 @@ chmod 644 *.key *.crt 2>/dev/null || true
         exit 1
     }
 
-    # vault config.yaml — correct file paths
+    # vault config.yaml — correct file paths.
+    # AUDIT-SECU-2026-08-04 (Vault H1): age_key_path is dead — removed here
+    # (was stale leftover from before that fix; the vault itself already
+    # silently ignores it, see coderaft-vault's config.go, but writing it
+    # into every fresh install's config.yaml was actively misleading about
+    # what field actually governs unsealing). keys.provider: shamir is the
+    # default/recommended H1 model (explicit threshold ceremony). AUDIT-SECU-
+    # 2026-11-17 (Vault H2): azure_keyvault/pkcs11 are opt-in alternatives —
+    # switching keys.provider is a manual config.yaml edit for now (no Setup
+    # Wizard step yet, tracked as a follow-up); this installer only ever
+    # writes the shamir default.
     $configYaml = @'
 server:
   addr: "0.0.0.0:8200"
@@ -1184,7 +1209,9 @@ server:
 storage:
   path: "/data/vault.db"
 keys:
-  age_key_path: "/keys/age.key"
+  provider: shamir
+  shamir_shares: 5
+  shamir_threshold: 3
 audit:
   log_path: "/data/audit.log"
 acl_path: "/etc/coderaft-vault/acl.yaml"
@@ -1228,7 +1255,7 @@ clients:
     permissions: ["read:cve-proxy/*", "write:cve-proxy/*"]
 '@
     [System.IO.File]::WriteAllText((Join-Path $cfgDir "acl.yaml"), $aclYaml, [System.Text.UTF8Encoding]::new($false))
-    Write-Host "  ✓ Vault mTLS PKI generated (CA + server cert + 6 client certs)" -ForegroundColor Green
+    Write-Host "  ✓ Vault mTLS PKI generated (CA + server cert + pkcs11-sidecar cert + 6 client certs)" -ForegroundColor Green
 }
 
 # ── FalconOne agents mTLS PKI (#170, #174, #226) ─────────────────────────────
@@ -1615,6 +1642,72 @@ $chmodExtra
     }
 }
 
+# AUDIT-SECU-2026-11-17 (Vault H2 follow-up): same shape as
+# Invoke-VaultClientCertSelfHeal above, for the ONE server cert this
+# installer also needs to heal (coderaft-vault-pkcs11-sidecar's own —
+# Invoke-VaultBootstrapTLS's early-return guard, "client-ca.crt AND
+# vault.crt already exist -> skip entirely", means a re-run of this
+# installer on an existing install that predates this feature never
+# reaches the sidecar-cert-generation lines added to that function — this
+# is what actually heals that gap). Hardcoded name/SAN (there is only one
+# such cert) and chmod 600, not 644 — treated like vault.crt/key (a server
+# cert), not like a product client cert.
+function Invoke-VaultServerCertSelfHeal {
+    $tlsDir = Join-Path (Get-Location).Path "vault-tls"
+    $certPath = Join-Path $tlsDir "pkcs11-sidecar.crt"
+    $keyPath = Join-Path $tlsDir "pkcs11-sidecar.key"
+    if ((Test-Path $certPath) -and -not (Test-Path $certPath -PathType Leaf)) {
+        Write-DetailLog "[install] Cert self-heal: $certPath is a directory (stale empty bind-mount artifact), not a cert — removing so it can be regenerated"
+        Remove-Item -LiteralPath $certPath -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if ((Test-Path $keyPath) -and -not (Test-Path $keyPath -PathType Leaf)) {
+        Remove-Item -LiteralPath $keyPath -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if (Test-Path $certPath -PathType Leaf) { return }
+
+    $caKey = Join-Path $tlsDir "client-ca.key"
+    $caCrt = Join-Path $tlsDir "client-ca.crt"
+    if (-not (Test-Path $caKey) -or -not (Test-Path $caCrt)) {
+        Write-Host "  [install] Cert self-heal: vault-tls\client-ca.key missing — cannot mint pkcs11-sidecar cert (needs a full CA rotation, not a self-heal)"
+        return
+    }
+
+    Write-DetailLog "[install] Cert self-heal: generating vault-tls\pkcs11-sidecar (was missing)"
+    $script = @'
+set -e
+apk add --no-cache openssl >/dev/null
+cd /work
+openssl req -newkey rsa:2048 -nodes -sha256 \
+    -keyout pkcs11-sidecar.key -out pkcs11-sidecar.csr \
+    -subj "/CN=coderaft-vault-pkcs11-sidecar" 2>/dev/null
+printf 'subjectAltName=DNS:coderaft-vault-pkcs11-sidecar\nbasicConstraints=CA:FALSE' > /tmp/pkcs11.ext
+openssl x509 -req -days 3650 -sha256 \
+    -in pkcs11-sidecar.csr -CA client-ca.crt -CAkey client-ca.key -CAcreateserial \
+    -out pkcs11-sidecar.crt -extfile /tmp/pkcs11.ext 2>/dev/null
+rm -f pkcs11-sidecar.csr /tmp/pkcs11.ext
+chmod 600 pkcs11-sidecar.key pkcs11-sidecar.crt
+'@
+    $scriptFile = Join-Path $env:TEMP "coderaft-cert-selfheal-$(Get-Random).sh"
+    $scriptLF = $script -replace "`r`n", "`n"
+    [System.IO.File]::WriteAllText($scriptFile, $scriptLF, [System.Text.UTF8Encoding]::new($false))
+
+    $runStdout = Join-Path $env:TEMP "coderaft-cert-selfheal-out-$(Get-Random).log"
+    $runStderr = Join-Path $env:TEMP "coderaft-cert-selfheal-err-$(Get-Random).log"
+    $proc = Start-Process -FilePath "docker" -ArgumentList @(
+        "run","--rm",
+        "-v","${scriptFile}:/script.sh:ro",
+        "-v","${tlsDir}:/work",
+        "alpine:3.20","sh","/script.sh"
+    ) -NoNewWindow -Wait -PassThru `
+        -RedirectStandardOutput $runStdout `
+        -RedirectStandardError $runStderr `
+        -ErrorAction SilentlyContinue
+    Remove-Item -Path $runStdout, $runStderr, $scriptFile -ErrorAction SilentlyContinue
+    if (-not $proc -or $proc.ExitCode -ne 0 -or -not (Test-Path $certPath)) {
+        Write-DetailLog "[install] Cert self-heal: pkcs11-sidecar generation failed (non-fatal, retried next run)"
+    }
+}
+
 Invoke-VaultBootstrap
 
 # ── FalconOne mTLS PKI + ACL self-heal (#170 / #172 / #226) ──────────────────
@@ -1668,6 +1761,7 @@ Invoke-RedfoxAclSelfHeal -AclPath (Join-Path (Get-Location).Path "vault-config\a
 Invoke-VaultClientCertSelfHeal -Name "falconone" -San "falconone.coderaft.local"
 Invoke-VaultClientCertSelfHeal -Name "cve-proxy" -San "cve-proxy.coderaft.local"
 Invoke-CveProxyAclSelfHeal -AclPath (Join-Path (Get-Location).Path "vault-config\acl.yaml")
+Invoke-VaultServerCertSelfHeal
 Write-Host "  ✓ Vault ACL / PKI provisioning OK (detail: $INSTALL_LOG)"
 
 # Append CODERAFT_VAULT_* env vars if not already present
@@ -2094,6 +2188,42 @@ services:
     cpus: 1
     restart: unless-stopped
 
+  # ── coderaft-vault-pkcs11-sidecar (AUDIT-SECU-2026-11-17 Vault H2) ──────
+  # The ONLY thing that speaks real PKCS#11 to a hardware token (a YubiKey
+  # PIV slot, in practice) — see coderaft-vault's internal/pkcs11sidecar
+  # package doc for why this is a separate process/image instead of code
+  # inside coderaft-vault itself (cgo, which that binary's CLAUDE.md forbids).
+  # `profiles: ["pkcs11"]` — same pattern as self-update-runner below: never
+  # started by a plain `docker compose up -d` (this installer included —
+  # fresh installs always default to keys.provider: shamir). update.ps1/.sh
+  # read keys.provider from vault-config/config.yaml and run
+  # `docker compose --profile pkcs11 up -d coderaft-vault-pkcs11-sidecar`
+  # only when it says "pkcs11". Confirmed empirically: a profile-gated
+  # service's `secrets:` file is NOT validated by `docker compose up -d`/
+  # `pull` when that profile isn't active — so declaring pkcs11_pin below
+  # does not risk breaking compose for the shamir/azure_keyvault majority
+  # who never create that file.
+  coderaft-vault-pkcs11-sidecar:
+    image: ghcr.io/liamj74/coderaft-vault-pkcs11-sidecar:latest
+    profiles: ["pkcs11"]
+    networks:
+      - coderaft-vault-net
+    environment:
+      - CODERAFT_PKCS11_PIN_FILE=/run/secrets/pkcs11_pin
+    secrets:
+      - pkcs11_pin
+    volumes:
+      - ./vault-tls/pkcs11-sidecar.crt:/tls/pkcs11-sidecar.crt:ro
+      - ./vault-tls/pkcs11-sidecar.key:/tls/pkcs11-sidecar.key:ro
+      - ./vault-tls/client-ca.crt:/tls/client-ca.crt:ro
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    mem_limit: 256m
+    memswap_limit: 256m
+    mem_reservation: 64m
+    cpus: 1
+    restart: unless-stopped
+
   # ── self-update-runner ──────────────────────────────────────────────────
   # Root cause fix (2026-08-13, incident live chez Liam): dashboard-api's own
   # self-update (`docker compose up -d --force-recreate --no-deps
@@ -2304,6 +2434,15 @@ secrets:
   # `command:` above.
   redis_password:
     file: ./secrets/redis_password
+  # AUDIT-SECU-2026-11-17 (Vault H2 follow-up): only read by
+  # coderaft-vault-pkcs11-sidecar, which is profiles:-gated (see that
+  # service above) — confirmed empirically this file's absence does not
+  # affect `docker compose up -d`/`pull` for anyone not using keys.provider:
+  # pkcs11. No writer exists yet for this file (no Setup Wizard step) —
+  # tracked as a follow-up; until then, enabling pkcs11 mode requires
+  # creating ./secrets/pkcs11_pin by hand alongside the config.yaml edit.
+  pkcs11_pin:
+    file: ./secrets/pkcs11_pin
 '@
 # B-WINPATH (caddy internal-TLS reload): the caddy
 # service above declares ./caddy_certs and ./Caddyfile as short-form,
